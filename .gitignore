@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Database files
+*.db
+*.db-journal
+
+# System files
+nul
+.DS_Store
+
+# Application data
+.linkedin-networking-cli/

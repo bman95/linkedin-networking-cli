@@ -1,0 +1,701 @@
+import asyncio
+import logging
+import random
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional, Dict, Any, Callable
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    async_playwright,
+    Playwright,
+    TimeoutError,
+)
+from dataclasses import dataclass
+
+import sys
+from pathlib import Path
+import psutil
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+from database.models import Campaign, Contact
+from database.operations import DatabaseManager
+from config.settings import AppSettings
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("linkedin_automation")
+
+
+def force_close_chrome() -> None:
+    """Close Chrome processes forcefully before launching Playwright."""
+    try:
+        # Windows: Kill chrome.exe processes
+        subprocess.run(
+            ["taskkill", "/f", "/im", "chrome.exe"], capture_output=True, check=False
+        )
+
+        # Also kill any remaining Chrome processes
+        for proc in psutil.process_iter(["pid", "name"]):
+            if proc.info.get("name", "").lower().startswith("chrome"):
+                try:
+                    proc.kill()
+                    logger.debug("Killed Chrome process %d", proc.pid)
+                except psutil.NoSuchProcess:
+                    pass
+    except Exception as exc:
+        logger.warning("Error killing Chrome processes: %s", exc)
+
+    # Wait for processes to close
+    time.sleep(2)
+
+
+@dataclass
+class LinkedInProfile:
+    """Data class for LinkedIn profile information"""
+
+    name: str
+    profile_url: str
+    headline: Optional[str] = None
+    location: Optional[str] = None
+    company: Optional[str] = None
+    mutual_connections: int = 0
+
+
+class LinkedInAutomation:
+    """LinkedIn automation engine for networking campaigns"""
+
+    BASE_URL = "https://www.linkedin.com"
+    SEARCH_URL = f"{BASE_URL}/search/people/"
+
+    def __init__(self, db_manager: DatabaseManager, settings: AppSettings):
+        self.db_manager = db_manager
+        self.settings = settings
+        self.playwright: Optional[Playwright] = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self.is_authenticated = False
+
+    async def __aenter__(self):
+        """Async context manager entry"""
+        await self.start_browser()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        """Async context manager exit"""
+        await self.close_browser()
+
+    async def start_browser(self):
+        """Initialize Playwright browser with enhanced session management"""
+        # Force close any existing Chrome processes
+        force_close_chrome()
+
+        self.playwright = await async_playwright().start()
+        browser_settings = self.settings.get_browser_settings()
+
+        launch_kwargs: Dict[str, Any] = {
+            "headless": browser_settings["headless"],
+            "timeout": 60_000,  # Increased timeout
+        }
+
+        browser_executable = browser_settings.get("executable_path")
+        browser_channel = browser_settings.get("channel")
+        user_data_dir = browser_settings.get("user_data_dir")
+
+        if user_data_dir:
+            user_data_path = Path(user_data_dir)
+            user_data_path.mkdir(parents=True, exist_ok=True)
+
+            # Check if profile directory exists
+            if user_data_path.exists():
+                logger.info(f"Profile directory found: {user_data_path}")
+            else:
+                logger.warning("Profile directory not found, using a temporary one.")
+                user_data_dir = None
+
+        if browser_executable:
+            launch_kwargs["executable_path"] = browser_executable
+            logger.info("Launching Chrome using executable at %s", browser_executable)
+        elif browser_channel:
+            launch_kwargs["channel"] = browser_channel
+            logger.info("Launching Chrome via Playwright channel '%s'", browser_channel)
+        else:
+            logger.info("Launching default Playwright Chromium browser")
+
+        use_persistent = bool(
+            browser_executable
+            or (browser_channel and browser_channel.lower() == "chrome")
+        )
+
+        if use_persistent and user_data_dir:
+            persistent_kwargs = launch_kwargs.copy()
+            persistent_kwargs["viewport"] = browser_settings["viewport"]
+            logger.info("Using persistent context with user data dir %s", user_data_dir)
+            try:
+                logger.info("Launching persistent Chrome…")
+                self.context = await self.playwright.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    channel="chrome",
+                    **persistent_kwargs,
+                )
+                self.browser = self.context.browser
+            except Exception as persistent_error:
+                logger.exception(
+                    "Failed persistent context, falling back to transient browser…"
+                )
+                use_persistent = False
+
+        if not self.context:
+            try:
+                self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+            except Exception as launch_error:
+                if browser_channel and "channel" in launch_kwargs:
+                    logger.warning(
+                        "Falling back to bundled Chromium after Chrome launch failed (%s)",
+                        launch_error,
+                    )
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=browser_settings["headless"]
+                    )
+                else:
+                    raise
+
+            # Try to load existing session
+            session_path = self.settings.session_path
+            if session_path.exists():
+                try:
+                    self.context = await self.browser.new_context(
+                        storage_state=str(session_path),
+                        viewport=browser_settings["viewport"],
+                    )
+                    logger.info("Loaded existing LinkedIn session")
+                except Exception as session_error:
+                    logger.warning("Failed to load session state: %s", session_error)
+                    self.context = await self.browser.new_context(
+                        viewport=browser_settings["viewport"]
+                    )
+                    logger.info("Starting fresh LinkedIn session")
+            else:
+                self.context = await self.browser.new_context(
+                    viewport=browser_settings["viewport"]
+                )
+                logger.info("Starting fresh LinkedIn session")
+
+        self.page = await self.context.new_page()
+
+    async def close_browser(self):
+        """Close browser and cleanup"""
+        if self.context:
+            # Save session state
+            await self.context.storage_state(path=str(self.settings.session_path))
+            await self.context.close()
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+    async def login(self, progress_callback: Optional[Callable] = None) -> bool:
+        """Login to LinkedIn with enhanced session detection"""
+        try:
+            if progress_callback:
+                progress_callback("Checking LinkedIn session...")
+
+            # First check if already logged in by trying to access LinkedIn home
+            try:
+                await self.page.goto(f"{self.BASE_URL}/feed", timeout=10_000)
+                if await self.page.is_visible("img.global-nav__me-photo", timeout=3000):
+                    self.is_authenticated = True
+                    if progress_callback:
+                        progress_callback("Session already active on LinkedIn!")
+                    return True
+            except TimeoutError:
+                if progress_callback:
+                    progress_callback("No active session found, proceeding with login...")
+
+            # Navigate to login page
+            if progress_callback:
+                progress_callback("Navigating to LinkedIn login...")
+
+            await self.page.goto(f"{self.BASE_URL}/login", timeout=30000)
+
+            # Handle login with or without stored credentials
+            email = self.settings.linkedin_email
+            password = self.settings.linkedin_password
+
+            if email and password:
+                if progress_callback:
+                    progress_callback("Entering credentials...")
+
+                await self.page.fill("input#username", email)
+                await self.page.fill("input#password", password)
+
+                # Submit login
+                await self.page.click("button[type=submit]")
+
+                # Wait for login success
+                if progress_callback:
+                    progress_callback("Waiting for login confirmation...")
+
+                await self.page.wait_for_selector(
+                    "img.global-nav__me-photo", timeout=30000
+                )
+            else:
+                if progress_callback:
+                    progress_callback(
+                        "No credentials configured. Complete the login manually in the Chrome window."
+                    )
+
+                try:
+                    await self.page.wait_for_selector(
+                        "img.global-nav__me-photo", timeout=300000
+                    )
+                except Exception as wait_error:
+                    logger.error(f"Manual login timed out: {wait_error}")
+                    if progress_callback:
+                        progress_callback("Manual login timed out before confirmation.")
+                    return False
+
+            self.is_authenticated = True
+            if progress_callback:
+                progress_callback("Login completed successfully!")
+
+            # Save session state
+            try:
+                await self.context.storage_state(path=str(self.settings.session_path))
+                logger.info("Session state saved successfully")
+            except Exception as save_error:
+                logger.warning("Failed to save session state: %s", save_error)
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Login failed: {str(e)}")
+            if progress_callback:
+                progress_callback(f"Login failed: {str(e)}")
+            return False
+
+    async def search_profiles(
+        self,
+        campaign: Campaign,
+        limit: int = 100,
+        progress_callback: Optional[Callable] = None,
+    ) -> List[LinkedInProfile]:
+        """Search for LinkedIn profiles based on campaign criteria"""
+
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        profiles = []
+
+        try:
+            # Build search URL
+            search_params = self._build_search_params(campaign)
+            search_url = f"{self.SEARCH_URL}?{search_params}"
+
+            if progress_callback:
+                progress_callback("Starting profile search...")
+
+            await self.page.goto(search_url, timeout=30000)
+            await self.page.wait_for_selector(
+                ".search-results-container", timeout=10000
+            )
+
+            page_count = 0
+            max_pages = 10  # Limit to prevent infinite loops
+
+            while len(profiles) < limit and page_count < max_pages:
+                page_count += 1
+
+                if progress_callback:
+                    progress_callback(
+                        f"Scanning page {page_count}... Found {len(profiles)} profiles"
+                    )
+
+                # Wait for profiles to load
+                await self.page.wait_for_selector(
+                    ".reusable-search__result-container", timeout=10000
+                )
+
+                # Extract profile information
+                profile_elements = await self.page.query_selector_all(
+                    ".reusable-search__result-container"
+                )
+
+                for element in profile_elements:
+                    try:
+                        profile = await self._extract_profile_info(element)
+                        if profile and len(profiles) < limit:
+                            profiles.append(profile)
+                    except Exception as e:
+                        logger.warning(f"Failed to extract profile info: {e}")
+                        continue
+
+                # Check for next page
+                next_button = await self.page.query_selector(
+                    "button[aria-label='Next']"
+                )
+                if next_button and not await next_button.is_disabled():
+                    await next_button.click()
+                    await self.page.wait_for_timeout(2000)  # Wait for page load
+                else:
+                    break
+
+            if progress_callback:
+                progress_callback(f"Search complete! Found {len(profiles)} profiles")
+
+            return profiles
+
+        except Exception as e:
+            logger.error(f"Search failed: {str(e)}")
+            if progress_callback:
+                progress_callback(f"Search failed: {str(e)}")
+            return profiles
+
+    async def send_connection_requests(
+        self,
+        campaign: Campaign,
+        profiles: List[LinkedInProfile],
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict[str, int]:
+        """Send connection requests to profiles"""
+
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        automation_settings = self.settings.get_automation_settings()
+        sent_count = 0
+        failed_count = 0
+        existing_count = 0
+
+        for i, profile in enumerate(profiles):
+            try:
+                if progress_callback:
+                    progress_callback(
+                        f"Processing {profile.name} ({i + 1}/{len(profiles)})"
+                    )
+
+                # Check if contact already exists
+                with self.db_manager.get_session() as session:
+                    from sqlmodel import select
+
+                    existing_contact = session.exec(
+                        select(Contact).where(
+                            Contact.profile_url == profile.profile_url
+                        )
+                    ).first()
+
+                if existing_contact:
+                    existing_count += 1
+                    continue
+
+                # Navigate to profile
+                await self.page.goto(profile.profile_url, timeout=30000)
+                await self.page.wait_for_timeout(2000)
+
+                # Look for connect button
+                connect_button = await self.page.query_selector(
+                    "button:has-text('Connect')"
+                )
+                if not connect_button:
+                    # Try alternative selectors
+                    connect_button = await self.page.query_selector(
+                        "button[aria-label*='Invite'][aria-label*='connect']"
+                    )
+
+                if connect_button:
+                    await connect_button.click()
+                    await self.page.wait_for_timeout(1000)
+
+                    # Handle personalized message modal
+                    send_button = await self.page.query_selector(
+                        "button:has-text('Send without a note')"
+                    )
+                    if not send_button:
+                        send_button = await self.page.query_selector(
+                            "button:has-text('Send')"
+                        )
+
+                    if send_button:
+                        # Add personalized message if template exists
+                        if (
+                            campaign.message_template
+                            and campaign.message_template.strip()
+                        ):
+                            note_button = await self.page.query_selector(
+                                "button:has-text('Add a note')"
+                            )
+                            if note_button:
+                                await note_button.click()
+                                message = campaign.message_template.format(
+                                    name=profile.name
+                                )
+                                await self.page.fill("textarea", message)
+
+                        await send_button.click()
+
+                        # Create contact record
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "sent",
+                            "connection_sent_at": datetime.now(timezone.utc),
+                        }
+
+                        self.db_manager.create_contact(contact_data)
+                        sent_count += 1
+
+                        if progress_callback:
+                            progress_callback(
+                                f"✅ Sent connection request to {profile.name}"
+                            )
+
+                    else:
+                        failed_count += 1
+                        if progress_callback:
+                            progress_callback(
+                                f"❌ Failed to send request to {profile.name}"
+                            )
+                else:
+                    # Save as found but not sent
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "No connect button available",
+                    }
+
+                    self.db_manager.create_contact(contact_data)
+                    failed_count += 1
+
+                # Random delay between connections
+                delay = random.randint(
+                    automation_settings["connection_delay_min"],
+                    automation_settings["connection_delay_max"],
+                )
+                await self.page.wait_for_timeout(delay * 1000)
+
+                # Check daily limits
+                if sent_count >= automation_settings["daily_connection_limit"]:
+                    if progress_callback:
+                        progress_callback("Daily connection limit reached")
+                    break
+
+            except Exception as e:
+                logger.error(f"Failed to process {profile.name}: {str(e)}")
+                failed_count += 1
+                continue
+
+        # Update campaign statistics
+        self.db_manager.update_campaign_stats(campaign.id)
+
+        return {
+            "sent": sent_count,
+            "failed": failed_count,
+            "existing": existing_count,
+            "total_processed": sent_count + failed_count + existing_count,
+        }
+
+    def _build_search_params(self, campaign: Campaign) -> str:
+        """Build LinkedIn search parameters from campaign criteria"""
+        params = []
+
+        if campaign.keywords:
+            params.append(f"keywords={campaign.keywords}")
+
+        if campaign.location:
+            params.append(f"geoUrn=['{campaign.location}']")
+
+        if campaign.industry:
+            params.append(f"industry=['{campaign.industry}']")
+
+        # Add default connection filters
+        params.append("network=['F','S']")  # 1st and 2nd connections
+        params.append("origin=GLOBAL_SEARCH_HEADER")
+
+        return "&".join(params)
+
+    async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
+        """Extract profile information from search result element"""
+        try:
+            # Get profile link
+            link_element = await element.query_selector(
+                "a[data-control-name='search_srp_result']"
+            )
+            if not link_element:
+                return None
+
+            profile_url = await link_element.get_attribute("href")
+            if not profile_url.startswith("http"):
+                profile_url = self.BASE_URL + profile_url
+
+            # Extract name
+            name_element = await element.query_selector(
+                ".entity-result__title-text a span[aria-hidden='true']"
+            )
+            if not name_element:
+                return None
+            name = await name_element.inner_text()
+
+            # Extract headline
+            headline_element = await element.query_selector(
+                ".entity-result__primary-subtitle"
+            )
+            headline = await headline_element.inner_text() if headline_element else None
+
+            # Extract location
+            location_element = await element.query_selector(
+                ".entity-result__secondary-subtitle"
+            )
+            location = await location_element.inner_text() if location_element else None
+
+            return LinkedInProfile(
+                name=name.strip(),
+                profile_url=profile_url,
+                headline=headline.strip() if headline else None,
+                location=location.strip() if location else None,
+            )
+
+        except Exception as e:
+            logger.warning(f"Failed to extract profile info: {e}")
+            return None
+
+    async def check_connection_status(
+        self, contacts: List[Contact], progress_callback: Optional[Callable] = None
+    ) -> int:
+        """Check status of pending connection requests using enhanced checker"""
+        from .checker import check_specific_contacts
+
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        # Filter to only sent contacts and get their IDs
+        sent_contacts = [contact for contact in contacts if contact.status == "sent"]
+        contact_ids = [contact.id for contact in sent_contacts]
+
+        if not contact_ids:
+            if progress_callback:
+                progress_callback("No pending connections to check")
+            return 0
+
+        # Use the enhanced checker
+        stats = await check_specific_contacts(self, contact_ids, progress_callback)
+        return stats["newly_accepted"]
+
+    async def smart_connection_checker(
+        self, campaign_id: int, progress_callback: Optional[Callable] = None
+    ) -> Dict[str, int]:
+        """Smart checker that monitors LinkedIn connections page for newly accepted connections"""
+        from .checker import smart_connection_checker
+
+        return await smart_connection_checker(self, campaign_id, progress_callback)
+
+    async def extract_detailed_profile(
+        self, profile_url: str, progress_callback: Optional[Callable] = None
+    ) -> Dict[str, Any]:
+        """Extract comprehensive profile data using enhanced scraping"""
+        from .scraping import collect_public_information, get_contact_info, get_open_to_work_status
+
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        try:
+            if progress_callback:
+                progress_callback(f"Extracting detailed profile data...")
+
+            await self.page.goto(profile_url, timeout=30000)
+            await self.page.wait_for_timeout(2000)
+
+            # Collect comprehensive profile information
+            profession, location, experience, education = collect_public_information(self.page)
+
+            # Get contact information
+            contact_info = get_contact_info(self.page)
+
+            # Check open to work status
+            open_to_work = get_open_to_work_status(self.page)
+
+            profile_data = {
+                "profile_url": profile_url,
+                "profession": profession,
+                "location": location,
+                "experience": experience,
+                "education": education,
+                "contact_info": contact_info,
+                "open_to_work": open_to_work,
+                "extracted_at": datetime.now(timezone.utc),
+            }
+
+            if progress_callback:
+                progress_callback(f"✅ Extracted profile data successfully")
+
+            return profile_data
+
+        except Exception as e:
+            logger.error(f"Failed to extract profile data: {str(e)}")
+            if progress_callback:
+                progress_callback(f"❌ Failed to extract profile data: {str(e)}")
+            return {}
+
+    async def send_connection_with_retry(
+        self,
+        profile_url: str,
+        candidate_name: str,
+        message_template: Optional[str] = None,
+        max_retries: int = 3,
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict[str, Any]:
+        """Send connection request with enhanced error handling and retries"""
+        from .interactions import send_connection_request, LimitReachedException
+
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        for attempt in range(max_retries):
+            try:
+                if progress_callback:
+                    progress_callback(f"Attempt {attempt + 1}: Connecting with {candidate_name}")
+
+                # Navigate to profile
+                await self.page.goto(profile_url, timeout=30000)
+
+                # Send connection request using enhanced interactions
+                result = await send_connection_request(
+                    self.page,
+                    candidate_name,
+                    message_template,
+                    progress_callback
+                )
+
+                if result["success"]:
+                    return result
+                else:
+                    logger.warning(f"Connection attempt {attempt + 1} failed: {result['message']}")
+                    if attempt < max_retries - 1:
+                        await self.page.wait_for_timeout(random.randint(3000, 6000))
+
+            except LimitReachedException:
+                # Don't retry on limit reached
+                raise
+            except Exception as e:
+                logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    await self.page.wait_for_timeout(random.randint(5000, 10000))
+
+        return {
+            "success": False,
+            "status": "max_retries_exceeded",
+            "message": f"Failed after {max_retries} attempts"
+        }

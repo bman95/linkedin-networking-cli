@@ -1,0 +1,167 @@
+/* LinkedIn Networking CLI Styles */
+
+/* Main containers */
+.dashboard-container {
+    background: $surface;
+    height: 100%;
+}
+
+.dashboard-content {
+    padding: 1;
+    height: 100%;
+}
+
+/* Title styling */
+.title {
+    text-align: center;
+    text-style: bold;
+    color: $primary;
+    margin-bottom: 1;
+    content-align: center middle;
+    height: 3;
+}
+
+/* Stats cards */
+.stats-row {
+    height: 6;
+    margin-bottom: 1;
+}
+
+.stats-card {
+    border: solid $primary;
+    text-align: center;
+    padding: 1;
+    margin: 0 1;
+    background: $surface-lighten-1;
+    color: $text;
+}
+
+.stats-card:first-child {
+    margin-left: 0;
+}
+
+.stats-card:last-child {
+    margin-right: 0;
+}
+
+/* Action buttons */
+.actions-row {
+    height: 4;
+    margin-bottom: 1;
+}
+
+Button {
+    margin: 0 1;
+    min-width: 20;
+}
+
+Button:first-child {
+    margin-left: 0;
+}
+
+Button:last-child {
+    margin-right: 0;
+}
+
+/* Form styling */
+.form-container, .select-container, .execute-container, .analytics-container {
+    background: $surface;
+    height: 100%;
+}
+
+.form-content, .select-content, .execute-content, .analytics-content {
+    padding: 1;
+    height: 100%;
+}
+
+.form-actions, .select-actions, .execute-actions, .analytics-actions {
+    height: 4;
+    margin-top: 1;
+}
+
+/* Data tables */
+DataTable {
+    margin: 1 0;
+}
+
+/* Progress bars */
+ProgressBar {
+    margin: 1 0;
+}
+
+/* Logs */
+Log {
+    border: solid $primary;
+    background: $surface-darken-1;
+    height: 15;
+    margin: 1 0;
+}
+
+/* Labels */
+Label {
+    text-style: bold;
+    color: $accent;
+    margin-top: 1;
+}
+
+/* Campaign info */
+.campaign-info {
+    height: 3;
+    margin-bottom: 1;
+}
+
+.info-item {
+    border: solid $primary;
+    text-align: center;
+    padding: 0 1;
+    margin: 0 1;
+    background: $surface-lighten-1;
+    color: $text;
+}
+
+.info-item:first-child {
+    margin-left: 0;
+}
+
+.info-item:last-child {
+    margin-right: 0;
+}
+
+/* Form grids */
+.form-grid {
+    grid-size: 2;
+    grid-gutter: 1;
+    margin: 1 0;
+}
+
+.form-label {
+    text-style: bold;
+    color: $accent;
+    content-align: left middle;
+}
+
+.section-title {
+    text-style: bold;
+    color: $primary;
+    text-align: center;
+    margin: 1 0;
+    content-align: center middle;
+}
+
+/* Input styling */
+Input {
+    margin-bottom: 1;
+}
+
+TextArea {
+    height: 4;
+    margin-bottom: 1;
+}
+
+Select {
+    margin-bottom: 1;
+}
+
+Switch {
+    margin-bottom: 1;
+}

@@ -1,0 +1,17 @@
+[project]
+name = "linkedin-networking-cli"
+version = "0.1.0"
+description = "Interactive CLI tool for LinkedIn networking automation"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "playwright>=1.40.0",
+    "sqlmodel>=0.0.14",
+    "rich>=13.7.0",
+    "pydantic>=2.5.0",
+    "inquirerpy>=0.3.4",
+    "psutil>=5.9.0",
+]
+
+[project.scripts]
+linkedin-cli = "linkedin_cli:main"
