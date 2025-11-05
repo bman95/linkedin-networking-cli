@@ -9,7 +9,8 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(git clone:*)",
       "Bash(nul)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": [],
     "ask": []
