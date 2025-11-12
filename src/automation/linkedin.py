@@ -552,6 +552,77 @@ class LinkedInAutomation:
 
         return "&".join(params)
 
+    async def search_location(self, query: str) -> List[Dict[str, str]]:
+        """
+        Search for locations using LinkedIn Voyager API typeahead
+
+        Args:
+            query: Location search query (e.g., "San Francisco", "London", "Tokyo")
+
+        Returns:
+            List of dicts with keys: 'name' (display name) and 'geoUrn' (code)
+
+        Raises:
+            Exception: If not authenticated or request fails
+        """
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        if not query or not query.strip():
+            return []
+
+        try:
+            # Build Voyager API typeahead URL
+            query_encoded = urllib.parse.quote(query.strip())
+            url = (
+                f"{self.BASE_URL}/voyager/api/typeahead/hitsV2"
+                f"?keywords={query_encoded}"
+                "&origin=OTHER"
+                "&q=type"
+                "&queryContext=List(geoVersion->3,bingGeoSubTypeFilters->MARKET_AREA|COUNTRY_REGION|ADMIN_DIVISION_1|CITY)"
+                "&type=GEO"
+            )
+
+            logger.info(f"Searching location: {query}")
+
+            # Make request using Playwright's page context (uses existing cookies/auth)
+            response = await self.page.request.get(url)
+
+            if not response.ok:
+                logger.warning(f"Location search failed with status: {response.status}")
+                return []
+
+            data = await response.json()
+
+            # Parse results
+            results = []
+            elements = data.get("data", {}).get("elements", [])
+
+            for element in elements:
+                # Extract geoUrn from targetUrn (format: "urn:li:fs_geo:90000084")
+                target_urn = element.get("targetUrn", "")
+                if ":" in target_urn:
+                    geo_urn = target_urn.split(":")[-1]
+                else:
+                    geo_urn = target_urn
+
+                # Extract display name
+                text_obj = element.get("text", {})
+                name = text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj)
+
+                if name and geo_urn:
+                    results.append({
+                        "name": name.strip(),
+                        "geoUrn": geo_urn.strip()
+                    })
+
+            logger.info(f"Found {len(results)} locations for '{query}'")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error searching location: {e}")
+            return []
+
     async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
         """Extract profile information from search result element"""
         try:

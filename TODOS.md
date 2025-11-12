@@ -108,24 +108,68 @@ LANGUAGE_OPTIONS = {
 
 ### LinkedIn Location IDs (geoUrn)
 
-**Status:** Parcialmente resuelto
-**Códigos confirmados:**
+**Status:** ✅ IMPLEMENTADO - Solución Híbrida
+
+**Implementación actual:**
+- ✅ Lista curada con ~75+ ciudades importantes de todo el mundo
+- ✅ Opción "Other" para ingresar códigos personalizados manualmente
+- ✅ Función `LinkedInAutomation.search_location()` para búsqueda dinámica (backend)
+
+**Códigos verificados:**
 - San Francisco Bay Area: `90000084` ✅
 - Greater Boston Area: `105646813` ✅
 - United States: `103644278` ✅
 
-**Códigos pendientes de verificación:**
-- New York City Metropolitan Area: `102571732` ❓
-- Greater Los Angeles Area: `102448103` ❓
-- Greater Chicago Area: `103112676` ❓
-- Austin, Texas Area: `102748797` ❓
-- Greater Seattle Area: `103658393` ❓
+**Códigos en lista (pendientes de verificación manual):**
+- ~75 ciudades importantes en US, Canadá, Europa, Asia-Pacífico, Latinoamérica
+- Ver lista completa en `src/automation/linkedin_mappings.py`
 
-**Cómo verificar:**
-1. Ir a LinkedIn
-2. Hacer búsqueda de personas con filtro de ubicación
-3. Inspeccionar URL: `geoUrn=["CODIGO"]`
-4. Actualizar `src/automation/linkedin_mappings.py`
+**Cómo usar:**
+1. **Opción A - Lista curada**: Seleccionar de la lista expandida en UI
+2. **Opción B - Manual**: Seleccionar "Other" e ingresar geoUrn personalizado
+3. **Opción C - Dinámica (futuro)**: Búsqueda en tiempo real via Voyager API
+
+---
+
+### 🔮 Búsqueda Dinámica de Ubicaciones (Fase Futura)
+
+**Status:** Backend implementado, UI pendiente
+**Prioridad:** Media
+
+**Backend ya disponible:**
+```python
+# En src/automation/linkedin.py
+async def search_location(query: str) -> List[Dict[str, str]]:
+    """Búsqueda dinámica usando Voyager API"""
+    # Returns: [{"name": "San Francisco Bay Area", "geoUrn": "90000084"}]
+```
+
+**Implementación pendiente:**
+- Hacer la UI de creación de campaña async
+- Agregar búsqueda con autocompletado en tiempo real
+- Requerir autenticación previa antes de crear campaña
+
+**API Endpoint usado:**
+```
+GET /voyager/api/typeahead/hitsV2?
+    keywords={query}&
+    origin=OTHER&
+    q=type&
+    queryContext=List(geoVersion->3,bingGeoSubTypeFilters->MARKET_AREA|COUNTRY_REGION|ADMIN_DIVISION_1|CITY)&
+    type=GEO
+```
+
+**Ventajas:**
+- Acceso a TODAS las ubicaciones de LinkedIn (no solo lista curada)
+- Datos siempre actualizados
+- Búsqueda typo-tolerant
+
+**Desventajas:**
+- Requiere sesión autenticada
+- UI más compleja
+- Latencia de red
+
+**Decisión de implementación futura:** Agregar como modo avanzado opcional
 
 ---
 

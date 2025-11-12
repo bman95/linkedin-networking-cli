@@ -185,12 +185,38 @@ class LinkedInCLI:
         ).execute()
 
         # Location filter with proper geoUrn mapping
+        # Note: Dynamic location search available via LinkedInAutomation.search_location()
+        # for future UI improvements (requires authenticated session)
         location_choices = get_location_display_names()
+        location_choices.append("Other (enter custom geoUrn)")  # Add custom option
+
         location_display = inquirer.select(
             message="Target location:",
             choices=location_choices,
             default="Any",
         ).execute()
+
+        # Handle custom geoUrn input
+        custom_geo_urn = None
+        if location_display == "Other (enter custom geoUrn)":
+            self.console.print()
+            self.console.print("[yellow]💡 Tip: Find geoUrn codes by:[/yellow]")
+            self.console.print("[dim]   1. Search on LinkedIn with location filter[/dim]")
+            self.console.print("[dim]   2. Look at URL: geoUrn=[\"CODE\"][/dim]")
+            self.console.print("[dim]   3. Use the CODE in the URL[/dim]")
+            self.console.print()
+
+            custom_geo_urn = inquirer.text(
+                message="Enter geoUrn code (e.g., '90000084'):",
+                validate=lambda x: x.strip().isdigit() or "Must be a numeric code",
+            ).execute()
+
+            custom_location_name = inquirer.text(
+                message="Enter location name (for display):",
+                default=f"Custom Location ({custom_geo_urn})",
+            ).execute()
+
+            location_display = custom_location_name
 
         # Network filter (connection degree)
         network_choices = get_network_display_names()
@@ -224,7 +250,13 @@ class LinkedInCLI:
         ).execute()
 
         # Get the actual values from display names
-        geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+        if custom_geo_urn:
+            # User entered a custom geoUrn
+            geo_urn = custom_geo_urn.strip()
+        else:
+            # Use mapped location
+            geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+
         network_value = get_network_value(network_display)
         industry_id = get_industry_id(industry_display) if industry_display != "Any" else None
 

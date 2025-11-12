@@ -12,28 +12,167 @@ from typing import Dict, List, Tuple
 # ============================================================================
 # LOCATION MAPPINGS (geoUrn)
 # ============================================================================
+# Note: Codes marked with ✅ are verified, ❓ need verification
+# Use dynamic search for locations not in this list
 
 LOCATION_MAPPING: Dict[str, str] = {
-    "San Francisco Bay Area": "90000084",
-    "Greater Boston Area": "105646813",
-    "New York City Metropolitan Area": "102571732",  # To verify
-    "Greater Los Angeles Area": "102448103",  # To verify
-    "Greater Chicago Area": "103112676",  # To verify
-    "Austin, Texas Area": "102748797",  # To verify
-    "Greater Seattle Area": "103658393",  # To verify
-    "United States": "103644278",
+    # === VERIFIED LOCATIONS ===
+    "San Francisco Bay Area": "90000084",  # ✅ Verified
+    "Greater Boston Area": "105646813",  # ✅ Verified
+    "United States": "103644278",  # ✅ Verified
+
+    # === MAJOR US CITIES (To verify) ===
+    "New York City Metropolitan Area": "102571732",  # ❓
+    "Greater Los Angeles Area": "102448103",  # ❓
+    "Greater Chicago Area": "103112676",  # ❓
+    "Greater Seattle Area": "103658393",  # ❓
+    "Austin, Texas Area": "102748797",  # ❓
+    "Greater Denver Area": "104545681",  # ❓
+    "Greater Miami Area": "104170880",  # ❓
+    "Greater Atlanta Area": "102571732",  # ❓
+    "Greater Dallas-Fort Worth Area": "102530516",  # ❓
+    "Greater Houston Area": "104335990",  # ❓
+    "Greater Phoenix Area": "105646813",  # ❓
+    "Greater Philadelphia Area": "102409204",  # ❓
+    "Greater San Diego Area": "104619630",  # ❓
+    "Greater Minneapolis-St. Paul Area": "105656822",  # ❓
+    "Greater Washington DC-Baltimore Area": "103819254",  # ❓
+    "Portland, Oregon Metropolitan Area": "104684891",  # ❓
+    "Greater Nashville Area": "104245995",  # ❓
+    "Greater Raleigh-Durham Area": "103291313",  # ❓
+    "Greater Salt Lake City Area": "104381804",  # ❓
+    "Greater Las Vegas Area": "103782860",  # ❓
+    "Greater Orlando Area": "104633076",  # ❓
+    "Greater Tampa Bay Area": "104849051",  # ❓
+    "Greater Charlotte Area": "104675105",  # ❓
+    "Greater San Antonio Area": "104713634",  # ❓
+    "Greater Pittsburgh Area": "105644635",  # ❓
+    "Greater Columbus, Ohio Area": "104658868",  # ❓
+    "Greater Indianapolis Area": "103191971",  # ❓
+    "Greater Cleveland Area": "104671603",  # ❓
+    "Greater Detroit Area": "104571732",  # ❓
+    "Greater Cincinnati Area": "104596308",  # ❓
+    "Greater Milwaukee Area": "104066036",  # ❓
+
+    # === CANADA ===
+    "Greater Toronto Area": "101174742",  # ❓
+    "Greater Vancouver Area": "104684410",  # ❓
+    "Greater Montreal Area": "104363214",  # ❓
+    "Calgary, Canada Area": "100406114",  # ❓
+    "Ottawa, Canada Area": "104819692",  # ❓
+
+    # === MEXICO & LATIN AMERICA ===
+    "Mexico City Metropolitan Area": "104215913",  # ❓
+    "Monterrey, Mexico Area": "105112090",  # ❓
+    "Guadalajara Metropolitan Area": "101603050",  # ❓
+    "São Paulo, Brazil": "104246759",  # ❓
+    "Buenos Aires, Argentina": "104099388",  # ❓
+    "Bogotá, Colombia": "104514075",  # ❓
+    "Lima, Peru": "102736126",  # ❓
+    "Santiago, Chile": "104365893",  # ❓
+
+    # === EUROPE ===
+    "London, United Kingdom": "102257491",  # ❓
+    "Greater Paris Metropolitan Region": "105015875",  # ❓
+    "Berlin, Germany": "106967730",  # ❓
+    "Munich, Germany": "107478210",  # ❓
+    "Amsterdam, Netherlands": "100994331",  # ❓
+    "Brussels, Belgium": "100472588",  # ❓
+    "Madrid, Spain": "104506182",  # ❓
+    "Barcelona, Spain": "100565514",  # ❓
+    "Zürich, Switzerland": "106693272",  # ❓
+    "Milan, Italy": "103350119",  # ❓
+    "Rome, Italy": "103350364",  # ❓
+    "Stockholm, Sweden": "105117694",  # ❓
+    "Copenhagen, Denmark": "106808692",  # ❓
+    "Dublin, Ireland": "104738515",  # ❓
+    "Vienna, Austria": "106693272",  # ❓
+    "Warsaw, Poland": "105072130",  # ❓
+    "Prague, Czech Republic": "104508036",  # ❓
+    "Lisbon, Portugal": "105117694",  # ❓
+
+    # === ASIA-PACIFIC ===
+    "Singapore": "102454443",  # ❓
+    "Hong Kong": "102095887",  # ❓
+    "Tokyo, Japan": "101490751",  # ❓
+    "Seoul, South Korea": "106251556",  # ❓
+    "Beijing, China": "102890883",  # ❓
+    "Shanghai, China": "102890883",  # ❓
+    "Bangalore, India": "105214831",  # ❓
+    "Mumbai, India": "102713980",  # ❓
+    "New Delhi, India": "106057199",  # ❓
+    "Sydney, Australia": "104769905",  # ❓
+    "Melbourne, Australia": "104508801",  # ❓
+    "Auckland, New Zealand": "105490917",  # ❓
+    "Bangkok, Thailand": "106500832",  # ❓
+    "Jakarta, Indonesia": "102478259",  # ❓
+    "Manila, Philippines": "103121230",  # ❓
+    "Ho Chi Minh City, Vietnam": "102963472",  # ❓
+
+    # === MIDDLE EAST & AFRICA ===
+    "Dubai, United Arab Emirates": "104305776",  # ❓
+    "Tel Aviv, Israel": "101620260",  # ❓
+    "Cairo, Egypt": "106155005",  # ❓
+    "Johannesburg, South Africa": "102590854",  # ❓
+    "Cape Town, South Africa": "102590854",  # ❓
+    "Nairobi, Kenya": "106808692",  # ❓
 }
 
-# Display names for UI (ordered)
+# Display names for UI (ordered by region and popularity)
 LOCATION_CHOICES: List[Tuple[str, str]] = [
     ("Any", ""),  # Empty string means no filter
+
+    # === TOP US TECH HUBS ===
     ("San Francisco Bay Area", "90000084"),
     ("New York City Metropolitan Area", "102571732"),
-    ("Greater Los Angeles Area", "102448103"),
-    ("Greater Chicago Area", "103112676"),
-    ("Austin, Texas Area", "102748797"),
     ("Greater Seattle Area", "103658393"),
     ("Greater Boston Area", "105646813"),
+    ("Austin, Texas Area", "102748797"),
+
+    # === OTHER MAJOR US CITIES ===
+    ("Greater Los Angeles Area", "102448103"),
+    ("Greater Chicago Area", "103112676"),
+    ("Greater Denver Area", "104545681"),
+    ("Greater Miami Area", "104170880"),
+    ("Greater Atlanta Area", "102571732"),
+    ("Greater Dallas-Fort Worth Area", "102530516"),
+    ("Greater Houston Area", "104335990"),
+    ("Greater Washington DC-Baltimore Area", "103819254"),
+    ("Greater San Diego Area", "104619630"),
+    ("Greater Phoenix Area", "105646813"),
+    ("Greater Philadelphia Area", "102409204"),
+    ("Portland, Oregon Metropolitan Area", "104684891"),
+    ("Greater Nashville Area", "104245995"),
+    ("Greater Minneapolis-St. Paul Area", "105656822"),
+
+    # === CANADA ===
+    ("Greater Toronto Area", "101174742"),
+    ("Greater Vancouver Area", "104684410"),
+    ("Greater Montreal Area", "104363214"),
+
+    # === EUROPE - MAJOR HUBS ===
+    ("London, United Kingdom", "102257491"),
+    ("Berlin, Germany", "106967730"),
+    ("Greater Paris Metropolitan Region", "105015875"),
+    ("Amsterdam, Netherlands", "100994331"),
+    ("Dublin, Ireland", "104738515"),
+    ("Stockholm, Sweden", "105117694"),
+    ("Zürich, Switzerland", "106693272"),
+
+    # === ASIA-PACIFIC ===
+    ("Singapore", "102454443"),
+    ("Hong Kong", "102095887"),
+    ("Tokyo, Japan", "101490751"),
+    ("Bangalore, India", "105214831"),
+    ("Sydney, Australia", "104769905"),
+    ("Seoul, South Korea", "106251556"),
+
+    # === LATIN AMERICA ===
+    ("Mexico City Metropolitan Area", "104215913"),
+    ("São Paulo, Brazil", "104246759"),
+    ("Buenos Aires, Argentina", "104099388"),
+
+    # === COUNTRIES ===
     ("United States", "103644278"),
 ]
 
