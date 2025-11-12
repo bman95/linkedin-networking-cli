@@ -318,14 +318,14 @@ class LinkedInAutomation:
                         f"Scanning page {page_count}... Found {len(profiles)} profiles"
                     )
 
-                # Wait for profiles to load
+                # Wait for profiles to load (use data-chameleon-result-urn attribute)
                 await self.page.wait_for_selector(
-                    ".reusable-search__result-container", timeout=10000
+                    "[data-chameleon-result-urn]", timeout=10000
                 )
 
                 # Extract profile information
                 profile_elements = await self.page.query_selector_all(
-                    ".reusable-search__result-container"
+                    "[data-chameleon-result-urn]"
                 )
 
                 for element in profile_elements:
@@ -626,36 +626,82 @@ class LinkedInAutomation:
     async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
         """Extract profile information from search result element"""
         try:
-            # Get profile link
-            link_element = await element.query_selector(
-                "a[data-control-name='search_srp_result']"
-            )
+            # Get profile link - LinkedIn profile links contain "/in/"
+            link_element = await element.query_selector("a[href*='/in/']")
+            if not link_element:
+                # Try alternative selector
+                link_element = await element.query_selector("a.app-aware-link")
+
             if not link_element:
                 return None
 
             profile_url = await link_element.get_attribute("href")
+            if not profile_url:
+                return None
+
+            # Clean up URL (remove query parameters)
+            if "?" in profile_url:
+                profile_url = profile_url.split("?")[0]
+
             if not profile_url.startswith("http"):
                 profile_url = self.BASE_URL + profile_url
 
-            # Extract name
-            name_element = await element.query_selector(
-                ".entity-result__title-text a span[aria-hidden='true']"
-            )
-            if not name_element:
+            # Extract name - try multiple strategies
+            name = None
+
+            # Strategy 1: Get from link text
+            name_text = await link_element.inner_text()
+            if name_text and name_text.strip():
+                name = name_text.strip()
+
+            # Strategy 2: Try aria-label attribute
+            if not name:
+                aria_label = await link_element.get_attribute("aria-label")
+                if aria_label:
+                    name = aria_label.strip()
+
+            # Strategy 3: Look for span with name
+            if not name:
+                name_span = await element.query_selector("span[aria-hidden='true']")
+                if name_span:
+                    name_text = await name_span.inner_text()
+                    if name_text and name_text.strip():
+                        name = name_text.strip()
+
+            if not name:
+                logger.warning("Could not extract name from profile")
                 return None
-            name = await name_element.inner_text()
 
-            # Extract headline
-            headline_element = await element.query_selector(
-                ".entity-result__primary-subtitle"
-            )
-            headline = await headline_element.inner_text() if headline_element else None
+            # Extract headline - look for any div that might contain headline info
+            headline = None
+            try:
+                # Try to find elements that might contain headline
+                text_elements = await element.query_selector_all("div")
+                for text_elem in text_elements:
+                    text = await text_elem.inner_text()
+                    # Headline is usually 1-3 lines of text describing role
+                    if text and len(text) > 10 and len(text) < 200 and text != name:
+                        # Check if it looks like a headline (contains job-related keywords)
+                        if any(keyword in text.lower() for keyword in ["engineer", "manager", "developer", "designer", "director", "founder", "consultant", "analyst", "specialist", "lead", "senior", "junior", "intern", "at ", "•"]):
+                            headline = text.strip()
+                            break
+            except Exception as e:
+                logger.debug(f"Could not extract headline: {e}")
 
-            # Extract location
-            location_element = await element.query_selector(
-                ".entity-result__secondary-subtitle"
-            )
-            location = await location_element.inner_text() if location_element else None
+            # Extract location - usually appears after headline
+            location = None
+            try:
+                text_elements = await element.query_selector_all("div")
+                for text_elem in text_elements:
+                    text = await text_elem.inner_text()
+                    # Location is usually short and might contain city/country names
+                    if text and len(text) > 2 and len(text) < 100:
+                        # Check if it looks like a location
+                        if any(keyword in text for keyword in [", ", " Area", "United States", "Canada", "UK", "London", "New York", "San Francisco", "Remote"]):
+                            location = text.strip()
+                            break
+            except Exception as e:
+                logger.debug(f"Could not extract location: {e}")
 
             return LinkedInProfile(
                 name=name.strip(),
