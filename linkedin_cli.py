@@ -36,8 +36,8 @@ class LinkedInCLI:
         self.console = Console()
         # Initialize real components
         try:
-            self.db_manager = DatabaseManager()
             self.settings = AppSettings()
+            self.db_manager = DatabaseManager(str(self.settings.db_path))
         except Exception as e:
             self.console.print(f"[red]Error initializing components: {e}[/red]")
             self.console.print("[yellow]Running in demo mode with mock data[/yellow]")
