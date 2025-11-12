@@ -19,6 +19,14 @@ from database.operations import DatabaseManager
 from database.models import Campaign
 from config.settings import AppSettings
 from automation.linkedin import LinkedInAutomation
+from automation.linkedin_mappings import (
+    get_location_display_names,
+    get_location_urn,
+    get_network_display_names,
+    get_network_value,
+    get_industry_display_names,
+    get_industry_id,
+)
 
 
 class LinkedInCLI:
@@ -173,38 +181,30 @@ class LinkedInCLI:
 
         # Targeting criteria
         keywords = inquirer.text(
-            message="Target keywords (comma-separated, optional):",
+            message="Target keywords (e.g., 'software engineer', optional):",
         ).execute()
 
-        location = inquirer.select(
+        # Location filter with proper geoUrn mapping
+        location_choices = get_location_display_names()
+        location_display = inquirer.select(
             message="Target location:",
-            choices=[
-                "Any",
-                "San Francisco, CA",
-                "New York, NY",
-                "Los Angeles, CA",
-                "Chicago, IL",
-                "Austin, TX",
-                "Seattle, WA",
-                "Boston, MA",
-                "Other",
-            ],
+            choices=location_choices,
             default="Any",
         ).execute()
 
-        industry = inquirer.select(
+        # Network filter (connection degree)
+        network_choices = get_network_display_names()
+        network_display = inquirer.select(
+            message="Connection degree:",
+            choices=network_choices,
+            default="1st + 2nd degree connections",
+        ).execute()
+
+        # Industry filter with proper ID mapping
+        industry_choices = get_industry_display_names()
+        industry_display = inquirer.select(
             message="Target industry:",
-            choices=[
-                "Any",
-                "Technology",
-                "Finance",
-                "Healthcare",
-                "Education",
-                "Marketing",
-                "Sales",
-                "Consulting",
-                "Other",
-            ],
+            choices=industry_choices,
             default="Any",
         ).execute()
 
@@ -223,6 +223,11 @@ class LinkedInCLI:
             or "Message must contain {name} placeholder",
         ).execute()
 
+        # Get the actual values from display names
+        geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+        network_value = get_network_value(network_display)
+        industry_id = get_industry_id(industry_display) if industry_display != "Any" else None
+
         # Show campaign summary
         self.console.print(
             Panel(
@@ -230,8 +235,9 @@ class LinkedInCLI:
                 f"[cyan]Name:[/cyan] {name}\n"
                 f"[cyan]Description:[/cyan] {description or 'None'}\n"
                 f"[cyan]Keywords:[/cyan] {keywords or 'Any'}\n"
-                f"[cyan]Location:[/cyan] {location}\n"
-                f"[cyan]Industry:[/cyan] {industry}\n"
+                f"[cyan]Location:[/cyan] {location_display}\n"
+                f"[cyan]Connection Degree:[/cyan] {network_display}\n"
+                f"[cyan]Industry:[/cyan] {industry_display}\n"
                 f"[cyan]Daily Limit:[/cyan] {daily_limit}\n"
                 f"[cyan]Message:[/cyan] {message_template}",
                 title="Campaign Created",
@@ -239,13 +245,19 @@ class LinkedInCLI:
             )
         )
 
-        # Create campaign data
+        # Create campaign data with new field structure
         campaign_data = {
             "name": name,
             "description": description or None,
             "keywords": keywords or None,
-            "location": location if location != "Any" else None,
-            "industry": industry if industry != "Any" else None,
+            # New fields
+            "geo_urn": geo_urn,
+            "location_display": location_display if location_display != "Any" else None,
+            "network": network_value,
+            "network_display": network_display,
+            "industry_ids": industry_id,  # Single ID for now (could be multiple in future)
+            "industry_display": industry_display if industry_display != "Any" else None,
+            # Settings
             "daily_limit": daily_limit,
             "message_template": message_template,
         }

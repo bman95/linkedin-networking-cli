@@ -10,10 +10,26 @@ class Campaign(SQLModel, table=True):
     name: str = Field(index=True)
     description: Optional[str] = None
 
-    # Targeting criteria
+    # Targeting criteria - Core filters
     keywords: Optional[str] = None
-    location: Optional[str] = None
-    industry: Optional[str] = None
+
+    # Location fields (new format)
+    geo_urn: Optional[str] = None  # LinkedIn geoUrn code (e.g., "90000084")
+    location_display: Optional[str] = None  # Human-readable location name
+
+    # Industry fields (new format)
+    industry_ids: Optional[str] = None  # Comma-separated industry IDs (e.g., "4,6,96")
+    industry_display: Optional[str] = None  # Human-readable industry names
+
+    # Network filter (connection degree)
+    network: Optional[str] = Field(default='["F","S"]')  # Default: 1st + 2nd connections
+    network_display: Optional[str] = Field(default="1st + 2nd degree connections")
+
+    # Legacy fields (deprecated, kept for backward compatibility)
+    location: Optional[str] = None  # DEPRECATED: Use geo_urn instead
+    industry: Optional[str] = None  # DEPRECATED: Use industry_ids instead
+
+    # Other filters (not implemented yet)
     company_size: Optional[str] = None
     experience_level: Optional[str] = None
 

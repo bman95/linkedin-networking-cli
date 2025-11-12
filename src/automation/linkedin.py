@@ -3,6 +3,7 @@ import logging
 import random
 import subprocess
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
@@ -25,6 +26,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
+from automation.linkedin_mappings import format_ids_for_url
 
 
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +72,7 @@ class LinkedInAutomation:
     """LinkedIn automation engine for networking campaigns"""
 
     BASE_URL = "https://www.linkedin.com"
-    SEARCH_URL = f"{BASE_URL}/search/people/"
+    SEARCH_URL = f"{BASE_URL}/search/results/people/"
 
     def __init__(self, db_manager: DatabaseManager, settings: AppSettings):
         self.db_manager = db_manager
@@ -512,18 +514,41 @@ class LinkedInAutomation:
         """Build LinkedIn search parameters from campaign criteria"""
         params = []
 
+        # Keywords - URL encode for safety
         if campaign.keywords:
-            params.append(f"keywords={campaign.keywords}")
+            keywords_encoded = urllib.parse.quote(campaign.keywords)
+            params.append(f"keywords={keywords_encoded}")
 
-        if campaign.location:
-            params.append(f"geoUrn=['{campaign.location}']")
+        # Location - use new geo_urn field, fallback to legacy location field
+        geo_urn = campaign.geo_urn if hasattr(campaign, 'geo_urn') and campaign.geo_urn else None
+        if not geo_urn and campaign.location:
+            # Legacy support: if old location field exists but no geo_urn
+            # This shouldn't happen in new campaigns, but keeps backward compatibility
+            geo_urn = campaign.location
 
-        if campaign.industry:
-            params.append(f"industry=['{campaign.industry}']")
+        if geo_urn:
+            # Correct format: geoUrn=["105646813"]
+            params.append(f'geoUrn=["{geo_urn}"]')
 
-        # Add default connection filters
-        params.append("network=['F','S']")  # 1st and 2nd connections
-        params.append("origin=GLOBAL_SEARCH_HEADER")
+        # Industry - use new industry_ids field (comma-separated), fallback to legacy industry field
+        industry_ids = campaign.industry_ids if hasattr(campaign, 'industry_ids') and campaign.industry_ids else None
+        if not industry_ids and campaign.industry:
+            # Legacy support
+            industry_ids = campaign.industry
+
+        if industry_ids:
+            # Convert comma-separated IDs to LinkedIn format: industry=["4","6"]
+            formatted = format_ids_for_url(industry_ids)
+            if formatted:
+                params.append(f"industry={formatted}")
+
+        # Network - use new network field with default
+        network = campaign.network if hasattr(campaign, 'network') and campaign.network else '["F","S"]'
+        if network:
+            params.append(f"network={network}")
+
+        # Origin - use FACETED_SEARCH as per LinkedIn's current format
+        params.append("origin=FACETED_SEARCH")
 
         return "&".join(params)
 
