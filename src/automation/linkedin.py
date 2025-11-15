@@ -208,8 +208,9 @@ class LinkedInAutomation:
 
             # Check if already logged in by attempting to access feed
             # If redirected to login, we need to authenticate
-            await self.page.goto(f"{self.BASE_URL}/feed", timeout=30_000)
-            await self.page.wait_for_load_state("networkidle", timeout=10_000)
+            await self.page.goto(f"{self.BASE_URL}/feed", timeout=30_000, wait_until="domcontentloaded")
+            # Give a moment for redirect to happen if not logged in
+            await self.page.wait_for_timeout(2000)
 
             current_url = self.page.url
 
