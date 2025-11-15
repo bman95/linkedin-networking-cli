@@ -408,28 +408,49 @@ class LinkedInAutomation:
                 await self.page.goto(profile.profile_url, timeout=30000)
                 await self.page.wait_for_timeout(2000)
 
-                # Look for connect button
-                connect_button = await self.page.query_selector(
-                    "button:has-text('Connect')"
-                )
-                if not connect_button:
-                    # Try alternative selectors
-                    connect_button = await self.page.query_selector(
-                        "button[aria-label*='Invite'][aria-label*='connect']"
-                    )
+                # Look for connect button with multiple selectors
+                logger.info(f"Looking for Connect button for {profile.name}")
+                connect_button = None
+
+                # Try multiple selectors in order of specificity
+                selectors = [
+                    "button:has-text('Connect')",
+                    "button:has-text('Conectar')",  # Spanish
+                    "button[aria-label*='Invite'][aria-label*='connect']",
+                    "button[aria-label*='Invitar']",  # Spanish
+                    "button.pvs-profile-actions__action:has-text('Connect')",
+                    "button.pvs-profile-actions__action:has-text('Conectar')",
+                ]
+
+                for selector in selectors:
+                    connect_button = await self.page.query_selector(selector)
+                    if connect_button:
+                        logger.info(f"Found Connect button using selector: {selector}")
+                        break
 
                 if connect_button:
                     await connect_button.click()
-                    await self.page.wait_for_timeout(1000)
+                    await self.page.wait_for_timeout(2000)  # Increased wait time for modal
+                    logger.info(f"Clicked Connect button, waiting for modal")
 
-                    # Handle personalized message modal
-                    send_button = await self.page.query_selector(
-                        "button:has-text('Send without a note')"
-                    )
-                    if not send_button:
-                        send_button = await self.page.query_selector(
-                            "button:has-text('Send')"
-                        )
+                    # Handle personalized message modal - try multiple selectors
+                    send_button = None
+                    send_selectors = [
+                        "button:has-text('Send without a note')",
+                        "button:has-text('Enviar sin nota')",  # Spanish
+                        "button[aria-label*='Send without']",
+                        "button[aria-label*='Enviar sin']",
+                        "button:has-text('Send')",
+                        "button:has-text('Enviar')",
+                        "button.artdeco-button--primary:has-text('Send')",
+                        "button.artdeco-button--primary:has-text('Enviar')",
+                    ]
+
+                    for selector in send_selectors:
+                        send_button = await self.page.query_selector(selector)
+                        if send_button:
+                            logger.info(f"Found Send button using selector: {selector}")
+                            break
 
                     if send_button:
                         # Add personalized message if template exists
@@ -442,12 +463,16 @@ class LinkedInAutomation:
                             )
                             if note_button:
                                 await note_button.click()
+                                await self.page.wait_for_timeout(500)
                                 message = campaign.message_template.format(
                                     name=profile.name
                                 )
                                 await self.page.fill("textarea", message)
+                                await self.page.wait_for_timeout(500)
 
                         await send_button.click()
+                        await self.page.wait_for_timeout(1000)
+                        logger.info(f"Successfully sent connection request to {profile.name}")
 
                         # Create contact record
                         contact_data = {
@@ -470,12 +495,27 @@ class LinkedInAutomation:
                             )
 
                     else:
+                        logger.warning(f"Send button not found for {profile.name}")
                         failed_count += 1
                         if progress_callback:
                             progress_callback(
-                                f"❌ Failed to send request to {profile.name}"
+                                f"❌ Send button not found for {profile.name}"
                             )
+
+                        # Save as found but couldn't send
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "found",
+                            "notes": "Send button not found after clicking Connect",
+                        }
+                        self.db_manager.create_contact(contact_data)
                 else:
+                    logger.warning(f"Connect button not found for {profile.name}")
                     # Save as found but not sent
                     contact_data = {
                         "campaign_id": campaign.id,
@@ -490,6 +530,11 @@ class LinkedInAutomation:
 
                     self.db_manager.create_contact(contact_data)
                     failed_count += 1
+
+                    if progress_callback:
+                        progress_callback(
+                            f"⚠️ No Connect button for {profile.name}"
+                        )
 
                 # Random delay between connections
                 delay = random.randint(
