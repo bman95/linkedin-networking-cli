@@ -141,8 +141,7 @@ class LinkedInAutomation:
             try:
                 logger.info("Launching persistent Chrome…")
                 self.context = await self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=user_data_dir,
-                    channel="chrome",
+                    user_data_dir,
                     **persistent_kwargs,
                 )
                 self.browser = self.context.browser
@@ -207,23 +206,28 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback("Checking LinkedIn session...")
 
-            # First check if already logged in by trying to access LinkedIn home
-            try:
-                await self.page.goto(f"{self.BASE_URL}/feed", timeout=10_000)
-                if await self.page.is_visible("img.global-nav__me-photo", timeout=3000):
-                    self.is_authenticated = True
-                    if progress_callback:
-                        progress_callback("Session already active on LinkedIn!")
-                    return True
-            except TimeoutError:
+            # Check if already logged in by attempting to access feed
+            # If redirected to login, we need to authenticate
+            await self.page.goto(f"{self.BASE_URL}/feed", timeout=30_000, wait_until="domcontentloaded")
+            # Give a moment for redirect to happen if not logged in
+            await self.page.wait_for_timeout(2000)
+
+            current_url = self.page.url
+
+            # If we're NOT on a login page, we're already logged in
+            if "/login" not in current_url and "/uas/login" not in current_url:
+                self.is_authenticated = True
                 if progress_callback:
-                    progress_callback("No active session found, proceeding with login...")
+                    progress_callback("Session already active on LinkedIn!")
+                return True
 
-            # Navigate to login page
+            # We were redirected to login, proceed with authentication
             if progress_callback:
-                progress_callback("Navigating to LinkedIn login...")
+                progress_callback("Not logged in, proceeding with login...")
 
-            await self.page.goto(f"{self.BASE_URL}/login", timeout=30000)
+            # Ensure we're on the login page
+            if "/login" not in current_url:
+                await self.page.goto(f"{self.BASE_URL}/login", timeout=30000)
 
             # Handle login with or without stored credentials
             email = self.settings.linkedin_email
