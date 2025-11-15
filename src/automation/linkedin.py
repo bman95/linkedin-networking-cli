@@ -3,6 +3,7 @@ import logging
 import random
 import subprocess
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
@@ -25,6 +26,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
+from automation.linkedin_mappings import format_ids_for_url
 
 
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +72,7 @@ class LinkedInAutomation:
     """LinkedIn automation engine for networking campaigns"""
 
     BASE_URL = "https://www.linkedin.com"
-    SEARCH_URL = f"{BASE_URL}/search/people/"
+    SEARCH_URL = f"{BASE_URL}/search/results/people/"
 
     def __init__(self, db_manager: DatabaseManager, settings: AppSettings):
         self.db_manager = db_manager
@@ -316,14 +318,14 @@ class LinkedInAutomation:
                         f"Scanning page {page_count}... Found {len(profiles)} profiles"
                     )
 
-                # Wait for profiles to load
+                # Wait for profiles to load (use data-chameleon-result-urn attribute)
                 await self.page.wait_for_selector(
-                    ".reusable-search__result-container", timeout=10000
+                    "[data-chameleon-result-urn]", timeout=10000
                 )
 
                 # Extract profile information
                 profile_elements = await self.page.query_selector_all(
-                    ".reusable-search__result-container"
+                    "[data-chameleon-result-urn]"
                 )
 
                 for element in profile_elements:
@@ -512,54 +514,194 @@ class LinkedInAutomation:
         """Build LinkedIn search parameters from campaign criteria"""
         params = []
 
+        # Keywords - URL encode for safety
         if campaign.keywords:
-            params.append(f"keywords={campaign.keywords}")
+            keywords_encoded = urllib.parse.quote(campaign.keywords)
+            params.append(f"keywords={keywords_encoded}")
 
-        if campaign.location:
-            params.append(f"geoUrn=['{campaign.location}']")
+        # Location - use new geo_urn field, fallback to legacy location field
+        geo_urn = campaign.geo_urn if hasattr(campaign, 'geo_urn') and campaign.geo_urn else None
+        if not geo_urn and campaign.location:
+            # Legacy support: if old location field exists but no geo_urn
+            # This shouldn't happen in new campaigns, but keeps backward compatibility
+            geo_urn = campaign.location
 
-        if campaign.industry:
-            params.append(f"industry=['{campaign.industry}']")
+        if geo_urn:
+            # Correct format: geoUrn=["105646813"]
+            params.append(f'geoUrn=["{geo_urn}"]')
 
-        # Add default connection filters
-        params.append("network=['F','S']")  # 1st and 2nd connections
-        params.append("origin=GLOBAL_SEARCH_HEADER")
+        # Industry - use new industry_ids field (comma-separated), fallback to legacy industry field
+        industry_ids = campaign.industry_ids if hasattr(campaign, 'industry_ids') and campaign.industry_ids else None
+        if not industry_ids and campaign.industry:
+            # Legacy support
+            industry_ids = campaign.industry
+
+        if industry_ids:
+            # Convert comma-separated IDs to LinkedIn format: industry=["4","6"]
+            formatted = format_ids_for_url(industry_ids)
+            if formatted:
+                params.append(f"industry={formatted}")
+
+        # Network - use new network field with default
+        network = campaign.network if hasattr(campaign, 'network') and campaign.network else '["F","S"]'
+        if network:
+            params.append(f"network={network}")
+
+        # Origin - use FACETED_SEARCH as per LinkedIn's current format
+        params.append("origin=FACETED_SEARCH")
 
         return "&".join(params)
+
+    async def search_location(self, query: str) -> List[Dict[str, str]]:
+        """
+        Search for locations using LinkedIn Voyager API typeahead
+
+        Args:
+            query: Location search query (e.g., "San Francisco", "London", "Tokyo")
+
+        Returns:
+            List of dicts with keys: 'name' (display name) and 'geoUrn' (code)
+
+        Raises:
+            Exception: If not authenticated or request fails
+        """
+        if not self.is_authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
+        if not query or not query.strip():
+            return []
+
+        try:
+            # Build Voyager API typeahead URL
+            query_encoded = urllib.parse.quote(query.strip())
+            url = (
+                f"{self.BASE_URL}/voyager/api/typeahead/hitsV2"
+                f"?keywords={query_encoded}"
+                "&origin=OTHER"
+                "&q=type"
+                "&queryContext=List(geoVersion->3,bingGeoSubTypeFilters->MARKET_AREA|COUNTRY_REGION|ADMIN_DIVISION_1|CITY)"
+                "&type=GEO"
+            )
+
+            logger.info(f"Searching location: {query}")
+
+            # Make request using Playwright's page context (uses existing cookies/auth)
+            response = await self.page.request.get(url)
+
+            if not response.ok:
+                logger.warning(f"Location search failed with status: {response.status}")
+                return []
+
+            data = await response.json()
+
+            # Parse results
+            results = []
+            elements = data.get("data", {}).get("elements", [])
+
+            for element in elements:
+                # Extract geoUrn from targetUrn (format: "urn:li:fs_geo:90000084")
+                target_urn = element.get("targetUrn", "")
+                if ":" in target_urn:
+                    geo_urn = target_urn.split(":")[-1]
+                else:
+                    geo_urn = target_urn
+
+                # Extract display name
+                text_obj = element.get("text", {})
+                name = text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj)
+
+                if name and geo_urn:
+                    results.append({
+                        "name": name.strip(),
+                        "geoUrn": geo_urn.strip()
+                    })
+
+            logger.info(f"Found {len(results)} locations for '{query}'")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error searching location: {e}")
+            return []
 
     async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
         """Extract profile information from search result element"""
         try:
-            # Get profile link
-            link_element = await element.query_selector(
-                "a[data-control-name='search_srp_result']"
-            )
+            # Get profile link - LinkedIn profile links contain "/in/"
+            link_element = await element.query_selector("a[href*='/in/']")
+            if not link_element:
+                # Try alternative selector
+                link_element = await element.query_selector("a.app-aware-link")
+
             if not link_element:
                 return None
 
             profile_url = await link_element.get_attribute("href")
+            if not profile_url:
+                return None
+
+            # Clean up URL (remove query parameters)
+            if "?" in profile_url:
+                profile_url = profile_url.split("?")[0]
+
             if not profile_url.startswith("http"):
                 profile_url = self.BASE_URL + profile_url
 
-            # Extract name
-            name_element = await element.query_selector(
-                ".entity-result__title-text a span[aria-hidden='true']"
-            )
-            if not name_element:
+            # Extract name - try multiple strategies
+            name = None
+
+            # Strategy 1: Get from link text
+            name_text = await link_element.inner_text()
+            if name_text and name_text.strip():
+                name = name_text.strip()
+
+            # Strategy 2: Try aria-label attribute
+            if not name:
+                aria_label = await link_element.get_attribute("aria-label")
+                if aria_label:
+                    name = aria_label.strip()
+
+            # Strategy 3: Look for span with name
+            if not name:
+                name_span = await element.query_selector("span[aria-hidden='true']")
+                if name_span:
+                    name_text = await name_span.inner_text()
+                    if name_text and name_text.strip():
+                        name = name_text.strip()
+
+            if not name:
+                logger.warning("Could not extract name from profile")
                 return None
-            name = await name_element.inner_text()
 
-            # Extract headline
-            headline_element = await element.query_selector(
-                ".entity-result__primary-subtitle"
-            )
-            headline = await headline_element.inner_text() if headline_element else None
+            # Extract headline - look for any div that might contain headline info
+            headline = None
+            try:
+                # Try to find elements that might contain headline
+                text_elements = await element.query_selector_all("div")
+                for text_elem in text_elements:
+                    text = await text_elem.inner_text()
+                    # Headline is usually 1-3 lines of text describing role
+                    if text and len(text) > 10 and len(text) < 200 and text != name:
+                        # Check if it looks like a headline (contains job-related keywords)
+                        if any(keyword in text.lower() for keyword in ["engineer", "manager", "developer", "designer", "director", "founder", "consultant", "analyst", "specialist", "lead", "senior", "junior", "intern", "at ", "•"]):
+                            headline = text.strip()
+                            break
+            except Exception as e:
+                logger.debug(f"Could not extract headline: {e}")
 
-            # Extract location
-            location_element = await element.query_selector(
-                ".entity-result__secondary-subtitle"
-            )
-            location = await location_element.inner_text() if location_element else None
+            # Extract location - usually appears after headline
+            location = None
+            try:
+                text_elements = await element.query_selector_all("div")
+                for text_elem in text_elements:
+                    text = await text_elem.inner_text()
+                    # Location is usually short and might contain city/country names
+                    if text and len(text) > 2 and len(text) < 100:
+                        # Check if it looks like a location
+                        if any(keyword in text for keyword in [", ", " Area", "United States", "Canada", "UK", "London", "New York", "San Francisco", "Remote"]):
+                            location = text.strip()
+                            break
+            except Exception as e:
+                logger.debug(f"Could not extract location: {e}")
 
             return LinkedInProfile(
                 name=name.strip(),
