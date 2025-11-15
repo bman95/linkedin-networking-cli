@@ -408,8 +408,35 @@ class LinkedInAutomation:
                 await self.page.goto(profile.profile_url, timeout=30000)
                 await self.page.wait_for_timeout(2000)
 
-                # Look for connect button with multiple selectors
+                # First check if Connect button is in a "More" dropdown
                 logger.info(f"Looking for Connect button for {profile.name}")
+
+                # Try to find and click "More" button first (Connect might be hidden there)
+                more_button_selectors = [
+                    "button[aria-label='More actions']",
+                    "button[aria-label='Más acciones']",  # Spanish
+                    "button:has-text('More')",
+                    "button:has-text('Más')",
+                    "button.artdeco-dropdown__trigger",
+                ]
+
+                more_button_found = False
+                for selector in more_button_selectors:
+                    more_button = await self.page.query_selector(selector)
+                    if more_button:
+                        try:
+                            is_visible = await more_button.is_visible()
+                            if is_visible:
+                                logger.info(f"Found More button, clicking to reveal additional actions")
+                                await more_button.click()
+                                await self.page.wait_for_timeout(1000)
+                                more_button_found = True
+                                break
+                        except Exception as e:
+                            logger.debug(f"More button not clickable: {e}")
+                            continue
+
+                # Look for connect button with multiple selectors
                 connect_button = None
 
                 # Try multiple selectors in order of specificity
@@ -420,13 +447,25 @@ class LinkedInAutomation:
                     "button[aria-label*='Invitar']",  # Spanish
                     "button.pvs-profile-actions__action:has-text('Connect')",
                     "button.pvs-profile-actions__action:has-text('Conectar')",
+                    # Also try in dropdown menus
+                    "div[role='menu'] button:has-text('Connect')",
+                    "div[role='menu'] button:has-text('Conectar')",
                 ]
 
                 for selector in selectors:
                     connect_button = await self.page.query_selector(selector)
                     if connect_button:
-                        logger.info(f"Found Connect button using selector: {selector}")
-                        break
+                        # Check if button is visible
+                        try:
+                            is_visible = await connect_button.is_visible()
+                            if is_visible:
+                                logger.info(f"Found visible Connect button using selector: {selector}")
+                                break
+                            else:
+                                logger.debug(f"Connect button found but not visible with selector: {selector}")
+                                connect_button = None
+                        except Exception:
+                            connect_button = None
 
                 if connect_button:
                     await connect_button.click()
