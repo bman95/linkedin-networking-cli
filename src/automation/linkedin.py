@@ -318,9 +318,7 @@ class LinkedInAutomation:
                 page_count += 1
 
                 if progress_callback:
-                    progress_callback(
-                        f"Scanning page {page_count}... Found {len(profiles)} profiles"
-                    )
+                    progress_callback(f"Scanning page {page_count}...")
 
                 # Wait for profiles to load (use data-chameleon-result-urn attribute)
                 await self.page.wait_for_selector(
@@ -332,14 +330,21 @@ class LinkedInAutomation:
                     "[data-chameleon-result-urn]"
                 )
 
+                profiles_on_page = 0
                 for element in profile_elements:
                     try:
                         profile = await self._extract_profile_info(element)
                         if profile and len(profiles) < limit:
                             profiles.append(profile)
+                            profiles_on_page += 1
                     except Exception as e:
                         logger.warning(f"Failed to extract profile info: {e}")
                         continue
+
+                if progress_callback:
+                    progress_callback(
+                        f"Found {profiles_on_page} profiles on page {page_count} (Total: {len(profiles)})"
+                    )
 
                 # Check for next page
                 next_button = await self.page.query_selector(
