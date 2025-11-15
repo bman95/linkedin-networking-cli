@@ -136,6 +136,8 @@ class LinkedInAutomation:
 
         if use_persistent and user_data_dir:
             persistent_kwargs = launch_kwargs.copy()
+            # Remove 'channel' to avoid duplicate when we explicitly set it below
+            persistent_kwargs.pop("channel", None)
             persistent_kwargs["viewport"] = browser_settings["viewport"]
             logger.info("Using persistent context with user data dir %s", user_data_dir)
             try:
