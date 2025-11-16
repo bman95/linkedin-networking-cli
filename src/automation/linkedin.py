@@ -56,6 +56,35 @@ def force_close_chrome() -> None:
     time.sleep(2)
 
 
+async def random_wait(
+    page: Page, *, min_ms: int = 3_000, max_ms: int = 7_000, verbose: bool = True
+) -> None:
+    """Wait a random time to simulate human latency."""
+    timeout = random.randint(min_ms, max_ms)
+    if verbose:
+        logger.info("Waiting random time of %.2fs", timeout / 1_000)
+    await page.wait_for_timeout(timeout)
+
+
+def _is_true_limit(modal) -> bool:
+    """Check if the modal indicates a true invitation limit."""
+    # 1) Robust signal by icon
+    if modal.query_selector("svg[data-test-icon='locked']"):
+        return True
+    # 2) Fallback by heading text (in case they change the icon)
+    header_el = modal.query_selector(
+        "#ip-fuse-limit-alert__header, h2.ip-fuse-limit-alert__header"
+    )
+    header = header_el.inner_text().strip().lower() if header_el else ""
+    true_texts = {
+        "has alcanzado el límite semanal de invitaciones",
+        "has alcanzado el límite semanal de invitaciones.",  # with period
+        "you've reached the weekly invitation limit",
+        "you've reached the weekly invitation limit",
+    }
+    return any(t in header for t in true_texts)
+
+
 @dataclass
 class LinkedInProfile:
     """Data class for LinkedIn profile information"""
@@ -145,6 +174,9 @@ class LinkedInAutomation:
                     **persistent_kwargs,
                 )
                 self.browser = self.context.browser
+                # Persistent context already has a page, use it instead of creating a new one
+                self.page = self.context.pages[0]
+                logger.info("Using existing page from persistent context")
             except Exception as persistent_error:
                 logger.exception(
                     "Failed persistent context, falling back to transient browser…"
@@ -187,7 +219,9 @@ class LinkedInAutomation:
                 )
                 logger.info("Starting fresh LinkedIn session")
 
-        self.page = await self.context.new_page()
+            # Only create a new page for non-persistent contexts
+            self.page = await self.context.new_page()
+            logger.info("Created new page for browser context")
 
     async def close_browser(self):
         """Close browser and cleanup"""
@@ -406,156 +440,14 @@ class LinkedInAutomation:
 
                 # Navigate to profile
                 await self.page.goto(profile.profile_url, timeout=30000)
-                await self.page.wait_for_timeout(2000)
+                await random_wait(self.page, min_ms=2000, max_ms=3000)
 
-                # First check if Connect button is in a "More" dropdown
+                # Check if profile is accessible
                 logger.info(f"Looking for Connect button for {profile.name}")
+                sel_container = await self.page.query_selector("div.pvs-sticky-header-profile-actions")
 
-                # Try to find and click "More" button first (Connect might be hidden there)
-                more_button_selectors = [
-                    "button[aria-label='More actions']",
-                    "button[aria-label='Más acciones']",  # Spanish
-                    "button:has-text('More')",
-                    "button:has-text('Más')",
-                    "button.artdeco-dropdown__trigger",
-                ]
-
-                more_button_found = False
-                for selector in more_button_selectors:
-                    more_button = await self.page.query_selector(selector)
-                    if more_button:
-                        try:
-                            is_visible = await more_button.is_visible()
-                            if is_visible:
-                                logger.info(f"Found More button, clicking to reveal additional actions")
-                                await more_button.click()
-                                await self.page.wait_for_timeout(1000)
-                                more_button_found = True
-                                break
-                        except Exception as e:
-                            logger.debug(f"More button not clickable: {e}")
-                            continue
-
-                # Look for connect button with multiple selectors
-                connect_button = None
-
-                # Try multiple selectors in order of specificity
-                selectors = [
-                    "button:has-text('Connect')",
-                    "button:has-text('Conectar')",  # Spanish
-                    "button[aria-label*='Invite'][aria-label*='connect']",
-                    "button[aria-label*='Invitar']",  # Spanish
-                    "button.pvs-profile-actions__action:has-text('Connect')",
-                    "button.pvs-profile-actions__action:has-text('Conectar')",
-                    # Also try in dropdown menus
-                    "div[role='menu'] button:has-text('Connect')",
-                    "div[role='menu'] button:has-text('Conectar')",
-                ]
-
-                for selector in selectors:
-                    connect_button = await self.page.query_selector(selector)
-                    if connect_button:
-                        # Check if button is visible
-                        try:
-                            is_visible = await connect_button.is_visible()
-                            if is_visible:
-                                logger.info(f"Found visible Connect button using selector: {selector}")
-                                break
-                            else:
-                                logger.debug(f"Connect button found but not visible with selector: {selector}")
-                                connect_button = None
-                        except Exception:
-                            connect_button = None
-
-                if connect_button:
-                    await connect_button.click()
-                    await self.page.wait_for_timeout(2000)  # Increased wait time for modal
-                    logger.info(f"Clicked Connect button, waiting for modal")
-
-                    # Handle personalized message modal - try multiple selectors
-                    send_button = None
-                    send_selectors = [
-                        "button:has-text('Send without a note')",
-                        "button:has-text('Enviar sin nota')",  # Spanish
-                        "button[aria-label*='Send without']",
-                        "button[aria-label*='Enviar sin']",
-                        "button:has-text('Send')",
-                        "button:has-text('Enviar')",
-                        "button.artdeco-button--primary:has-text('Send')",
-                        "button.artdeco-button--primary:has-text('Enviar')",
-                    ]
-
-                    for selector in send_selectors:
-                        send_button = await self.page.query_selector(selector)
-                        if send_button:
-                            logger.info(f"Found Send button using selector: {selector}")
-                            break
-
-                    if send_button:
-                        # Add personalized message if template exists
-                        if (
-                            campaign.message_template
-                            and campaign.message_template.strip()
-                        ):
-                            note_button = await self.page.query_selector(
-                                "button:has-text('Add a note')"
-                            )
-                            if note_button:
-                                await note_button.click()
-                                await self.page.wait_for_timeout(500)
-                                message = campaign.message_template.format(
-                                    name=profile.name
-                                )
-                                await self.page.fill("textarea", message)
-                                await self.page.wait_for_timeout(500)
-
-                        await send_button.click()
-                        await self.page.wait_for_timeout(1000)
-                        logger.info(f"Successfully sent connection request to {profile.name}")
-
-                        # Create contact record
-                        contact_data = {
-                            "campaign_id": campaign.id,
-                            "name": profile.name,
-                            "profile_url": profile.profile_url,
-                            "headline": profile.headline,
-                            "location": profile.location,
-                            "company": profile.company,
-                            "status": "sent",
-                            "connection_sent_at": datetime.now(timezone.utc),
-                        }
-
-                        self.db_manager.create_contact(contact_data)
-                        sent_count += 1
-
-                        if progress_callback:
-                            progress_callback(
-                                f"✅ Sent connection request to {profile.name}"
-                            )
-
-                    else:
-                        logger.warning(f"Send button not found for {profile.name}")
-                        failed_count += 1
-                        if progress_callback:
-                            progress_callback(
-                                f"❌ Send button not found for {profile.name}"
-                            )
-
-                        # Save as found but couldn't send
-                        contact_data = {
-                            "campaign_id": campaign.id,
-                            "name": profile.name,
-                            "profile_url": profile.profile_url,
-                            "headline": profile.headline,
-                            "location": profile.location,
-                            "company": profile.company,
-                            "status": "found",
-                            "notes": "Send button not found after clicking Connect",
-                        }
-                        self.db_manager.create_contact(contact_data)
-                else:
-                    logger.warning(f"Connect button not found for {profile.name}")
-                    # Save as found but not sent
+                if not sel_container:
+                    logger.warning(f"Profile actions container not found for {profile.name} - profile may be private or inaccessible")
                     contact_data = {
                         "campaign_id": campaign.id,
                         "name": profile.name,
@@ -564,18 +456,246 @@ class LinkedInAutomation:
                         "location": profile.location,
                         "company": profile.company,
                         "status": "found",
-                        "notes": "No connect button available",
+                        "notes": "Profile not accessible or private",
                     }
-
                     self.db_manager.create_contact(contact_data)
                     failed_count += 1
+                    continue
 
-                    if progress_callback:
-                        progress_callback(
-                            f"⚠️ No Connect button for {profile.name}"
+                # Try to find "More actions" button first
+                mas_btn = await sel_container.query_selector("button[aria-label='Más acciones']")
+                if not mas_btn:
+                    mas_btn = await sel_container.query_selector("button[aria-label='More actions']")
+
+                connect_button = None
+
+                if mas_btn:
+                    logger.debug("Clicking 'More' button to reveal connection options")
+                    await mas_btn.click()
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+
+                    logger.info("Looking for 'Connect' button in dropdown menu")
+                    connect_button = await self.page.query_selector(
+                        'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Conectar")'
+                    )
+                    if not connect_button:
+                        connect_button = await self.page.query_selector(
+                            'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Connect")'
                         )
 
-                # Random delay between connections
+                    if not connect_button:
+                        logger.debug("'Connect' button not found in 'More', searching in container...")
+                        connect_button = await sel_container.query_selector("button:has-text('Conectar')")
+                        if not connect_button:
+                            connect_button = await sel_container.query_selector("button:has-text('Connect')")
+                else:
+                    logger.debug("'More' button not found, searching for 'Connect' button directly")
+                    connect_button = await self.page.query_selector(
+                        "main button:has(span.artdeco-button__text:has-text('Conectar'))"
+                    )
+                    if not connect_button:
+                        connect_button = await self.page.query_selector(
+                            "main button:has(span.artdeco-button__text:has-text('Connect'))"
+                        )
+
+                if not connect_button:
+                    # Check if already pending
+                    pending_btn = await self.page.query_selector(
+                        "main button:has(span.artdeco-button__text:has-text('Pendiente'))"
+                    )
+                    if not pending_btn:
+                        pending_btn = await self.page.query_selector(
+                            "main button:has(span.artdeco-button__text:has-text('Pending'))"
+                        )
+
+                    if pending_btn:
+                        logger.info(f"Pending invitation already exists for {profile.name}")
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "pending",
+                            "notes": "Already sent (found Pending button)",
+                        }
+                        self.db_manager.create_contact(contact_data)
+                        existing_count += 1
+                        if progress_callback:
+                            progress_callback(f"⚠️ Already pending for {profile.name}")
+                        continue
+                    else:
+                        logger.info(f"No 'Connect' or 'Pending' button found for {profile.name}, probably already connected")
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "found",
+                            "notes": "No connect button available - likely already connected",
+                        }
+                        self.db_manager.create_contact(contact_data)
+                        failed_count += 1
+                        if progress_callback:
+                            progress_callback(f"⚠️ No Connect button for {profile.name}")
+                        continue
+
+                # Click Connect button
+                logger.info("Clicking 'Connect' button")
+                await connect_button.click()
+                await random_wait(self.page, min_ms=3000, max_ms=4500)
+
+                # Check if email is required
+                email_label = await self.page.query_selector('label[for="email"]')
+                if email_label:
+                    logger.info(f"Email request modal detected for {profile.name}. Dismissing...")
+                    dismiss_btn = await self.page.query_selector('button[aria-label="Descartar"]')
+                    if not dismiss_btn:
+                        dismiss_btn = await self.page.query_selector('button[aria-label="Dismiss"]')
+                    if dismiss_btn:
+                        await dismiss_btn.click()
+
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "Email required for connection",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    failed_count += 1
+                    if progress_callback:
+                        progress_callback(f"❌ Email required for {profile.name}")
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    continue
+
+                # Handle message modal
+                send_button = None
+                if campaign.message_template and campaign.message_template.strip():
+                    # Try to add a note
+                    add_note_btn = await self.page.query_selector(
+                        "button:has(span.artdeco-button__text:has-text('Añadir una nota'))"
+                    )
+                    if not add_note_btn:
+                        add_note_btn = await self.page.query_selector(
+                            "button:has(span.artdeco-button__text:has-text('Add a note'))"
+                        )
+
+                    if add_note_btn:
+                        logger.info("Clicking 'Add a note' button")
+                        await add_note_btn.click()
+                        await random_wait(self.page, min_ms=1000, max_ms=1500)
+
+                        try:
+                            await self.page.wait_for_selector("textarea", timeout=5000)
+                            first_name = profile.name.split()[0]
+                            logger.info("Writing personalized message")
+                            message = campaign.message_template.format(name=first_name.lower().title())
+                            await self.page.fill("textarea", message)
+                            await random_wait(self.page, min_ms=1000, max_ms=1500)
+                        except Exception as msg_error:
+                            logger.warning(f"Failed to add note: {msg_error}")
+
+                    # Look for Send button
+                    send_button = await self.page.query_selector("button:has-text('Enviar')")
+                    if not send_button:
+                        send_button = await self.page.query_selector("button:has-text('Send')")
+                else:
+                    # Send without note
+                    send_button = await self.page.query_selector(
+                        "button:has(span.artdeco-button__text:has-text('Enviar sin nota'))"
+                    )
+                    if not send_button:
+                        send_button = await self.page.query_selector(
+                            "button:has(span.artdeco-button__text:has-text('Send without a note'))"
+                        )
+                    if not send_button:
+                        # Fallback to generic Send
+                        send_button = await self.page.query_selector("button:has-text('Enviar')")
+                    if not send_button:
+                        send_button = await self.page.query_selector("button:has-text('Send')")
+
+                if not send_button:
+                    logger.warning(f"Send button not found for {profile.name}")
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "Send button not found after clicking Connect",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    failed_count += 1
+                    if progress_callback:
+                        progress_callback(f"❌ Send button not found for {profile.name}")
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    continue
+
+                # Click Send button
+                logger.info("Clicking 'Send' button")
+                await send_button.click()
+                await random_wait(self.page, min_ms=2000, max_ms=3000)
+
+                # Check for invitation limit modal
+                modal = await self.page.query_selector("div.artdeco-modal.ip-fuse-limit-alert")
+                if modal:
+                    if _is_true_limit(modal):
+                        # Real limit reached
+                        logger.warning(f"Weekly invitation limit reached. Connection not sent to {profile.name}")
+
+                        # Close the modal
+                        try:
+                            close_btn = await modal.query_selector("button.ip-fuse-limit-alert__primary-action")
+                            if close_btn:
+                                logger.info("Closing limit reached modal")
+                                await close_btn.click()
+                                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                        except Exception:
+                            logger.debug("Could not close limit modal (non-blocking)")
+
+                        # Stop processing
+                        if progress_callback:
+                            progress_callback("❌ LinkedIn weekly invitation limit reached!")
+                        break
+                    else:
+                        # Just a warning (near limit)
+                        logger.info(f"'Near limit' warning for {profile.name}. Closing modal and continuing.")
+                        try:
+                            close_btn = await modal.query_selector("button.ip-fuse-limit-alert__primary-action")
+                            if close_btn:
+                                await close_btn.click()
+                                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                        except Exception:
+                            logger.debug("Could not close warning modal (non-blocking)")
+
+                # Success - connection sent
+                contact_data = {
+                    "campaign_id": campaign.id,
+                    "name": profile.name,
+                    "profile_url": profile.profile_url,
+                    "headline": profile.headline,
+                    "location": profile.location,
+                    "company": profile.company,
+                    "status": "sent",
+                    "connection_sent_at": datetime.now(timezone.utc),
+                }
+                self.db_manager.create_contact(contact_data)
+                sent_count += 1
+                logger.info(f"Successfully sent connection request to {profile.name}")
+
+                if progress_callback:
+                    progress_callback(f"✅ Sent connection request to {profile.name}")
+
+                # Random delay between connections (human-like behavior)
                 delay = random.randint(
                     automation_settings["connection_delay_min"],
                     automation_settings["connection_delay_max"],
