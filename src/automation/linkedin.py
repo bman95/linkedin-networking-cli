@@ -462,66 +462,77 @@ class LinkedInAutomation:
                     failed_count += 1
                     continue
 
-                # Try to find "More actions" button first
-                mas_btn = await sel_container.query_selector("button[aria-label='Más acciones']")
-                if not mas_btn:
-                    mas_btn = await sel_container.query_selector("button[aria-label='More actions']")
-
+                # Strategy: Try to find Connect button directly first, then try More dropdown
                 connect_button = None
 
-                if mas_btn:
-                    logger.info("Clicking 'More' button to reveal connection options")
-                    await mas_btn.click()
+                # First, try to find Connect button directly visible on the profile
+                logger.info("Looking for Connect button directly on profile")
+                direct_selectors = [
+                    "button:has(span.artdeco-button__text:has-text('Conectar'))",
+                    "button:has(span.artdeco-button__text:has-text('Connect'))",
+                ]
 
-                    # Wait for dropdown to appear and be ready
-                    try:
-                        await self.page.wait_for_selector('div.artdeco-dropdown__content-inner', timeout=5000, state='visible')
-                        logger.info("Dropdown menu is visible")
-                    except Exception as e:
-                        logger.warning(f"Dropdown didn't appear after clicking More: {e}")
-
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-
-                    logger.info("Looking for 'Connect' button in dropdown menu")
-
-                    # Try multiple selectors for the Connect button in dropdown
-                    dropdown_selectors = [
-                        'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Conectar")',
-                        'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Connect")',
-                        'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Conectar")',
-                        'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Connect")',
-                        'div[aria-label*="conectar"]',
-                        'div[aria-label*="connect"]',
-                    ]
-
-                    for selector in dropdown_selectors:
-                        connect_button = await self.page.query_selector(selector)
-                        if connect_button:
-                            try:
-                                is_visible = await connect_button.is_visible()
-                                if is_visible:
-                                    logger.info(f"Found Connect button in dropdown using selector: {selector}")
-                                    break
-                                else:
-                                    logger.debug(f"Connect button found but not visible: {selector}")
-                                    connect_button = None
-                            except Exception:
+                for selector in direct_selectors:
+                    connect_button = await sel_container.query_selector(selector)
+                    if connect_button:
+                        try:
+                            is_visible = await connect_button.is_visible()
+                            if is_visible:
+                                logger.info(f"Found Connect button directly visible using selector: {selector}")
+                                break
+                            else:
+                                logger.debug(f"Connect button found but not visible: {selector}")
                                 connect_button = None
+                        except Exception:
+                            connect_button = None
 
-                    if not connect_button:
-                        logger.debug("'Connect' button not found in dropdown, searching in container...")
-                        connect_button = await sel_container.query_selector("button:has-text('Conectar')")
-                        if not connect_button:
-                            connect_button = await sel_container.query_selector("button:has-text('Connect')")
-                else:
-                    logger.debug("'More' button not found, searching for 'Connect' button directly")
-                    connect_button = await self.page.query_selector(
-                        "main button:has(span.artdeco-button__text:has-text('Conectar'))"
-                    )
-                    if not connect_button:
-                        connect_button = await self.page.query_selector(
-                            "main button:has(span.artdeco-button__text:has-text('Connect'))"
-                        )
+                # If Connect button not found directly, try the "More actions" dropdown
+                if not connect_button:
+                    logger.info("Connect button not visible directly, looking for 'More actions' dropdown")
+                    mas_btn = await sel_container.query_selector("button[aria-label='Más acciones']")
+                    if not mas_btn:
+                        mas_btn = await sel_container.query_selector("button[aria-label='More actions']")
+
+                    if mas_btn:
+                        logger.info("Clicking 'More' button to reveal connection options")
+                        await mas_btn.click()
+
+                        # Wait for dropdown to appear and be ready
+                        try:
+                            await self.page.wait_for_selector('div.artdeco-dropdown__content-inner', timeout=5000, state='visible')
+                            logger.info("Dropdown menu is visible")
+                        except Exception as e:
+                            logger.warning(f"Dropdown didn't appear after clicking More: {e}")
+
+                        await random_wait(self.page, min_ms=1000, max_ms=2000)
+
+                        logger.info("Looking for 'Connect' button in dropdown menu")
+
+                        # Try multiple selectors for the Connect button in dropdown
+                        dropdown_selectors = [
+                            'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Conectar")',
+                            'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Connect")',
+                            'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Conectar")',
+                            'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Connect")',
+                            'div[aria-label*="Invita"][aria-label*="conectar"]',
+                            'div[aria-label*="Invite"][aria-label*="connect"]',
+                        ]
+
+                        for selector in dropdown_selectors:
+                            connect_button = await self.page.query_selector(selector)
+                            if connect_button:
+                                try:
+                                    is_visible = await connect_button.is_visible()
+                                    if is_visible:
+                                        logger.info(f"Found Connect button in dropdown using selector: {selector}")
+                                        break
+                                    else:
+                                        logger.debug(f"Connect button found but not visible: {selector}")
+                                        connect_button = None
+                                except Exception:
+                                    connect_button = None
+                    else:
+                        logger.debug("'More' button not found either")
 
                 if not connect_button:
                     # Check if already pending
