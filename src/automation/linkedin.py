@@ -494,6 +494,19 @@ class LinkedInAutomation:
                         mas_btn = await sel_container.query_selector("button[aria-label='More actions']")
 
                     if mas_btn:
+                        # Scroll button into view and check if visible
+                        try:
+                            await mas_btn.scroll_into_view_if_needed()
+                            await self.page.wait_for_timeout(500)  # Brief wait after scroll
+                            is_visible = await mas_btn.is_visible()
+                            if not is_visible:
+                                logger.warning(f"More button found but not visible for {profile.name}")
+                                mas_btn = None
+                        except Exception as e:
+                            logger.warning(f"Could not scroll to or verify More button: {e}")
+                            mas_btn = None
+
+                    if mas_btn:
                         logger.info("Clicking 'More' button to reveal connection options")
                         await mas_btn.click()
 
@@ -532,7 +545,7 @@ class LinkedInAutomation:
                                 except Exception:
                                     connect_button = None
                     else:
-                        logger.debug("'More' button not found either")
+                        logger.debug("'More' button not found or not visible")
 
                 if not connect_button:
                     # Check if already pending
