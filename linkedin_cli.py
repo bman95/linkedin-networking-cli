@@ -15,6 +15,12 @@ from pathlib import Path
 # Add src directory to path for imports
 sys.path.append(str(Path(__file__).parent / "src"))
 
+# Initialize logging system first
+from utils.logging import LoggerSetup, get_logger
+
+LoggerSetup.setup()
+logger = get_logger(__name__)
+
 from database.operations import DatabaseManager
 from database.models import Campaign
 from config.settings import AppSettings
@@ -34,11 +40,14 @@ class LinkedInCLI:
 
     def __init__(self):
         self.console = Console()
+        logger.info("Initializing LinkedIn CLI application")
         # Initialize real components
         try:
             self.settings = AppSettings()
             self.db_manager = DatabaseManager(str(self.settings.db_path))
+            logger.info("LinkedIn CLI components initialized successfully")
         except Exception as e:
+            logger.error(f"Error initializing components: {e}", exc_info=True)
             self.console.print(f"[red]Error initializing components: {e}[/red]")
             self.console.print("[yellow]Running in demo mode with mock data[/yellow]")
             self.db_manager = None
@@ -991,14 +1000,18 @@ class LinkedInCLI:
 
 def main():
     """Main entry point"""
+    console = Console()
     try:
+        logger.info("LinkedIn CLI application starting")
         cli = LinkedInCLI()
         cli.display_welcome()
         cli.main_menu()
     except KeyboardInterrupt:
-        print("\n[yellow]Goodbye! 👋[/yellow]")
+        logger.info("Application terminated by user (KeyboardInterrupt)")
+        console.print("\n[yellow]Goodbye! 👋[/yellow]")
     except Exception as e:
-        print(f"\n[red]Error: {e}[/red]")
+        logger.error(f"Unhandled exception in main: {e}", exc_info=True)
+        console.print(f"\n[red]Error: {e}[/red]")
 
 
 if __name__ == "__main__":

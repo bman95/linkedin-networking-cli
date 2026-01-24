@@ -4,7 +4,6 @@ Page interactions and connection management with human-like behavior.
 
 import math
 import random
-import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
 import sys
@@ -12,9 +11,10 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from utils.logging import get_logger
 from exceptions import RateLimitExceededException, CaptchaDetectedException
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def random_wait(

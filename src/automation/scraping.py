@@ -2,12 +2,17 @@
 Profile data extraction and contact information scraping from LinkedIn.
 """
 
-import logging
 import re
+import sys
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
+sys.path.append(str(Path(__file__).parent.parent))
+
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def get_contact_info(page) -> Dict[str, Optional[str]]:

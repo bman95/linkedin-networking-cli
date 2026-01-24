@@ -2,15 +2,19 @@
 Connection status monitoring and smart checking for LinkedIn automation.
 """
 
-import logging
 import random
+import sys
 from datetime import datetime, timezone
 from typing import List, Optional, Callable, Dict, Any
+from pathlib import Path
 
+sys.path.append(str(Path(__file__).parent.parent))
+
+from utils.logging import get_logger
 from .interactions import random_wait, scroll_down
 from .scraping import get_contact_info
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def smart_connection_checker(
