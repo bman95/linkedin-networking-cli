@@ -27,6 +27,13 @@ from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
+from exceptions import (
+    NotAuthenticatedException,
+    LoginFailedException,
+    SelectorNotFoundException,
+    RateLimitExceededException,
+    CaptchaDetectedException,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -229,6 +236,11 @@ class LinkedInAutomation:
             if "/login" not in current_url:
                 await self.page.goto(f"{self.BASE_URL}/login", timeout=30000)
 
+            # Check for CAPTCHA on login page
+            from .interactions import detect_captcha
+            if detect_captcha(self.page):
+                raise CaptchaDetectedException("CAPTCHA challenge detected on login page - manual verification required")
+
             # Handle login with or without stored credentials
             email = self.settings.linkedin_email
             password = self.settings.linkedin_password
@@ -242,6 +254,13 @@ class LinkedInAutomation:
 
                 # Submit login
                 await self.page.click("button[type=submit]")
+
+                # Wait a moment for the page to respond
+                await self.page.wait_for_timeout(2000)
+
+                # Check for CAPTCHA after login submission
+                if detect_captcha(self.page):
+                    raise CaptchaDetectedException("CAPTCHA challenge detected after login submission")
 
                 # Wait for login success
                 if progress_callback:
@@ -264,7 +283,7 @@ class LinkedInAutomation:
                     logger.error(f"Manual login timed out: {wait_error}")
                     if progress_callback:
                         progress_callback("Manual login timed out before confirmation.")
-                    return False
+                    raise LoginFailedException(f"Manual login timed out: {wait_error}")
 
             self.is_authenticated = True
             if progress_callback:
@@ -279,11 +298,13 @@ class LinkedInAutomation:
 
             return True
 
+        except LoginFailedException:
+            raise  # Re-raise login failed exceptions
         except Exception as e:
             logger.error(f"Login failed: {str(e)}")
             if progress_callback:
                 progress_callback(f"Login failed: {str(e)}")
-            return False
+            raise LoginFailedException(f"Login failed: {str(e)}")
 
     async def search_profiles(
         self,
@@ -294,7 +315,7 @@ class LinkedInAutomation:
         """Search for LinkedIn profiles based on campaign criteria"""
 
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         profiles = []
 
@@ -307,9 +328,16 @@ class LinkedInAutomation:
                 progress_callback("Starting profile search...")
 
             await self.page.goto(search_url, timeout=30000)
-            await self.page.wait_for_selector(
-                ".search-results-container", timeout=10000
-            )
+            try:
+                await self.page.wait_for_selector(
+                    ".search-results-container", timeout=10000
+                )
+            except TimeoutError:
+                raise SelectorNotFoundException(
+                    "Search results container not found - LinkedIn page structure may have changed",
+                    selector=".search-results-container",
+                    timeout=10000
+                )
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops
@@ -323,9 +351,16 @@ class LinkedInAutomation:
                     )
 
                 # Wait for profiles to load (use data-chameleon-result-urn attribute)
-                await self.page.wait_for_selector(
-                    "[data-chameleon-result-urn]", timeout=10000
-                )
+                try:
+                    await self.page.wait_for_selector(
+                        "[data-chameleon-result-urn]", timeout=10000
+                    )
+                except TimeoutError:
+                    raise SelectorNotFoundException(
+                        "Profile elements not found on search results page",
+                        selector="[data-chameleon-result-urn]",
+                        timeout=10000
+                    )
 
                 # Extract profile information
                 profile_elements = await self.page.query_selector_all(
@@ -371,7 +406,7 @@ class LinkedInAutomation:
         """Send connection requests to profiles"""
 
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         automation_settings = self.settings.get_automation_settings()
         sent_count = 0
@@ -570,7 +605,7 @@ class LinkedInAutomation:
             Exception: If not authenticated or request fails
         """
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         if not query or not query.strip():
             return []
@@ -725,7 +760,7 @@ class LinkedInAutomation:
         from .checker import check_specific_contacts
 
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         # Filter to only sent contacts and get their IDs
         sent_contacts = [contact for contact in contacts if contact.status == "sent"]
@@ -755,7 +790,7 @@ class LinkedInAutomation:
         from .scraping import collect_public_information, get_contact_info, get_open_to_work_status
 
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         try:
             if progress_callback:
@@ -804,10 +839,11 @@ class LinkedInAutomation:
         progress_callback: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """Send connection request with enhanced error handling and retries"""
-        from .interactions import send_connection_request, LimitReachedException
+        from .interactions import send_connection_request
+        # RateLimitExceededException is imported at the top from exceptions module
 
         if not self.is_authenticated:
-            raise Exception("Not authenticated. Please login first.")
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         for attempt in range(max_retries):
             try:
@@ -832,7 +868,7 @@ class LinkedInAutomation:
                     if attempt < max_retries - 1:
                         await self.page.wait_for_timeout(random.randint(3000, 6000))
 
-            except LimitReachedException:
+            except RateLimitExceededException:
                 # Don't retry on limit reached
                 raise
             except Exception as e:
