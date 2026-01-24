@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import random
 import subprocess
 import time
@@ -27,6 +26,7 @@ from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
+from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
     LoginFailedException,
@@ -36,8 +36,7 @@ from exceptions import (
 )
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("linkedin_automation")
+logger = get_logger(__name__)
 
 
 def force_close_chrome() -> None:
