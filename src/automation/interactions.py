@@ -7,13 +7,14 @@ import random
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+from exceptions import RateLimitExceededException, CaptchaDetectedException
 
 logger = logging.getLogger(__name__)
-
-
-class LimitReachedException(Exception):
-    """Exception raised when LinkedIn invitation limit is reached."""
-    pass
 
 
 def random_wait(
@@ -103,6 +104,47 @@ def check_connection_email_required(page) -> bool:
     return False
 
 
+def detect_captcha(page) -> bool:
+    """Detect if a CAPTCHA challenge is present on the page."""
+    try:
+        # Look for common CAPTCHA indicators
+        captcha_selectors = [
+            "iframe[src*='recaptcha']",
+            "iframe[title*='reCAPTCHA']",
+            ".g-recaptcha",
+            "#captcha",
+            "[data-test-id='captcha']",
+            ".captcha-container",
+        ]
+
+        for selector in captcha_selectors:
+            element = page.query_selector(selector)
+            if element and element.is_visible():
+                logger.warning(f"CAPTCHA detected: {selector}")
+                return True
+
+        # Also check for CAPTCHA-related text in the page
+        captcha_texts = [
+            "please verify you're not a robot",
+            "verify you are human",
+            "complete the captcha",
+            "security verification",
+            "prove you're not a robot",
+        ]
+
+        page_content = page.content().lower()
+        for text in captcha_texts:
+            if text in page_content:
+                logger.warning(f"CAPTCHA text detected: {text}")
+                return True
+
+        return False
+
+    except Exception as e:
+        logger.warning(f"Error detecting CAPTCHA: {e}")
+        return False
+
+
 def detect_invitation_limit(page) -> bool:
     """Detect if LinkedIn invitation limit has been reached."""
     try:
@@ -159,6 +201,10 @@ async def send_connection_request(
         # Wait for page to load
         random_wait(page, min_ms=2000, max_ms=4000)
 
+        # Check for CAPTCHA challenge
+        if detect_captcha(page):
+            raise CaptchaDetectedException("CAPTCHA challenge detected - manual verification required")
+
         # Check if email is required for connection
         if check_connection_email_required(page):
             return {
@@ -191,9 +237,16 @@ async def send_connection_request(
         connect_button.click()
         random_wait(page, min_ms=1000, max_ms=2000)
 
+        # Check for CAPTCHA after clicking
+        if detect_captcha(page):
+            raise CaptchaDetectedException("CAPTCHA challenge detected after clicking connect")
+
         # Check for invitation limit after clicking
         if detect_invitation_limit(page):
-            raise LimitReachedException("LinkedIn weekly invitation limit reached")
+            raise RateLimitExceededException(
+                "LinkedIn weekly invitation limit reached",
+                limit_type="weekly"
+            )
 
         # Handle connection modal
         send_button = None
@@ -231,7 +284,10 @@ async def send_connection_request(
 
             # Check again for invitation limit after sending
             if detect_invitation_limit(page):
-                raise LimitReachedException("LinkedIn weekly invitation limit reached")
+                raise RateLimitExceededException(
+                    "LinkedIn weekly invitation limit reached",
+                    limit_type="weekly"
+                )
 
             if progress_callback:
                 progress_callback(f"✅ Connection request sent to {candidate_name}")
@@ -248,7 +304,7 @@ async def send_connection_request(
                 "message": "No send button found in modal"
             }
 
-    except LimitReachedException:
+    except RateLimitExceededException:
         raise  # Re-raise limit exceptions
     except Exception as e:
         logger.error(f"Error sending connection request to {candidate_name}: {e}")
