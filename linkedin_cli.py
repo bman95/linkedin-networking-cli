@@ -7,9 +7,11 @@ from InquirerPy.separator import Separator
 from rich.console import Console
 from rich.panel import Panel
 from collections import namedtuple
-import asyncio
-import sys
+from datetime import datetime
 from pathlib import Path
+import asyncio
+import csv
+import sys
 
 # Add src directory to path for imports
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -27,10 +29,13 @@ from automation.linkedin import LinkedInAutomation
 from automation.linkedin_mappings import (
     get_location_display_names,
     get_location_urn,
+    get_location_name_from_urn,
     get_network_display_names,
     get_network_value,
+    get_network_name_from_value,
     get_industry_display_names,
     get_industry_id,
+    get_industry_name_from_id,
 )
 
 
@@ -366,6 +371,7 @@ class LinkedInCLI:
                 Choice(value="view", name="📊 View detailed statistics"),
                 Choice(value="toggle", name="🔄 Toggle active/inactive status"),
                 Choice(value="edit", name="📝 Edit campaign settings"),
+                Choice(value="export", name="📤 Export contacts to CSV"),
                 Choice(value="delete", name="🗑️ Delete campaign"),
                 Separator(),
                 Choice(value="back", name="🔙 Back to campaign list"),
@@ -378,6 +384,8 @@ class LinkedInCLI:
             self.toggle_campaign(selected)
         elif action == "edit":
             self.edit_campaign(selected)
+        elif action == "export":
+            self.export_contacts(selected)
         elif action == "delete":
             self.delete_campaign(selected)
 
@@ -425,6 +433,50 @@ class LinkedInCLI:
             default=self._campaign_get_field(campaign, "description", "") or "",
         ).execute()
 
+        # --- Targeting filters ---
+        keywords = inquirer.text(
+            message="Target keywords (optional):",
+            default=self._campaign_get_field(campaign, "keywords", "") or "",
+        ).execute()
+
+        # Location: preselect the current location based on the stored geo_urn.
+        current_geo_urn = self._campaign_get_field(campaign, "geo_urn", None)
+        current_location_name = (
+            get_location_name_from_urn(current_geo_urn) if current_geo_urn else "Any"
+        )
+        location_choices = get_location_display_names()
+        if current_location_name not in location_choices:
+            location_choices.append(current_location_name)
+        location_display = inquirer.select(
+            message="Target location:",
+            choices=location_choices,
+            default=current_location_name,
+        ).execute()
+
+        # Connection degree.
+        current_network = self._campaign_get_field(campaign, "network", '["F","S"]')
+        network_display = inquirer.select(
+            message="Connection degree:",
+            choices=get_network_display_names(),
+            default=get_network_name_from_value(current_network),
+        ).execute()
+
+        # Industry.
+        current_industry_id = self._campaign_get_field(campaign, "industry_ids", None)
+        current_industry_name = (
+            get_industry_name_from_id(current_industry_id)
+            if current_industry_id
+            else "Any"
+        )
+        industry_choices = get_industry_display_names()
+        if current_industry_name not in industry_choices:
+            industry_choices.append(current_industry_name)
+        industry_display = inquirer.select(
+            message="Target industry:",
+            choices=industry_choices,
+            default=current_industry_name,
+        ).execute()
+
         daily_limit = inquirer.number(
             message="Daily connection limit:",
             min_allowed=1,
@@ -441,9 +493,23 @@ class LinkedInCLI:
             or "Message must contain {name} placeholder",
         ).execute()
 
+        # Resolve display names back into stored values.
+        geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+        network_value = get_network_value(network_display)
+        industry_id = (
+            get_industry_id(industry_display) if industry_display != "Any" else None
+        )
+
         updates = {
             "name": name.strip(),
             "description": description.strip() or None,
+            "keywords": keywords.strip() or None,
+            "geo_urn": geo_urn,
+            "location_display": location_display if location_display != "Any" else None,
+            "network": network_value,
+            "network_display": network_display,
+            "industry_ids": industry_id,
+            "industry_display": industry_display if industry_display != "Any" else None,
             "daily_limit": int(daily_limit),
             "message_template": message_template,
         }
@@ -495,6 +561,79 @@ class LinkedInCLI:
                 )
         except Exception as e:
             self.console.print(f"[red]❌ Error deleting campaign: {e}[/red]")
+
+    def export_contacts(self, campaign):
+        """Export a campaign's contacts to a CSV file."""
+        if not self.db_manager:
+            self.console.print(
+                "[blue]💡 Demo mode: contact export requires a database.[/blue]"
+            )
+            return
+
+        try:
+            contacts = self.db_manager.get_contacts(campaign_id=campaign.id)
+        except Exception as e:
+            self.console.print(f"[red]❌ Error loading contacts: {e}[/red]")
+            return
+
+        if not contacts:
+            self.console.print(
+                f"[yellow]No contacts found for '{campaign.name}' yet.[/yellow]"
+            )
+            return
+
+        safe_name = "".join(
+            c if c.isalnum() or c in ("-", "_") else "_" for c in campaign.name
+        ).strip("_") or "campaign"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = str(Path.cwd() / f"{safe_name}_contacts_{timestamp}.csv")
+
+        output_path = inquirer.text(
+            message="Save CSV to:",
+            default=default_path,
+        ).execute()
+
+        fieldnames = [
+            "name",
+            "profile_url",
+            "headline",
+            "location",
+            "company",
+            "status",
+            "connection_sent_at",
+            "connection_accepted_at",
+            "notes",
+        ]
+
+        try:
+            path = Path(output_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for contact in contacts:
+                    writer.writerow(
+                        {
+                            field: self._csv_value(
+                                self._campaign_get_field(contact, field)
+                            )
+                            for field in fieldnames
+                        }
+                    )
+            self.console.print(
+                f"[green]✅ Exported {len(contacts)} contacts to {path}[/green]"
+            )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error writing CSV: {e}[/red]")
+
+    @staticmethod
+    def _csv_value(value):
+        """Normalize a value for CSV output."""
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
 
     def view_campaign_details(self, campaign):
         """View detailed campaign information"""
@@ -684,6 +823,7 @@ class LinkedInCLI:
                 Choice(value="browser", name="🌐 Browser automation settings"),
                 Choice(value="limits", name="⚡ Rate limiting settings"),
                 Choice(value="data", name="📁 Data directory information"),
+                Choice(value="location_lookup", name="🔎 Look up location code (online)"),
                 Separator(),
                 Choice(value="back", name="🔙 Back to main menu"),
             ],
@@ -739,9 +879,73 @@ class LinkedInCLI:
                     border_style="blue",
                 )
             )
+        elif setting == "location_lookup":
+            self.location_lookup()
 
         if setting != "back":
             inquirer.confirm(message="Press Enter to continue...").execute()
+
+    def location_lookup(self):
+        """Look up a LinkedIn location geoUrn code online via the Voyager API.
+
+        Requires an authenticated session. Useful for finding codes that are
+        not in the curated list so they can be pasted into a campaign's
+        "Other (enter custom geoUrn)" option.
+        """
+        if not self.db_manager or not self.settings:
+            self.console.print(
+                "[red]Location lookup requires database access and app settings.[/red]"
+            )
+            return
+
+        query = inquirer.text(
+            message="Search location (e.g. 'Madrid', 'Greater Tokyo'):",
+            validate=lambda x: len(x.strip()) > 0 or "Enter a search term",
+        ).execute()
+
+        self.console.print(
+            "[cyan]Opening LinkedIn to search locations (login may be required)...[/cyan]"
+        )
+
+        def progress_update(message: str) -> None:
+            self.console.print(f"[cyan]{message}[/cyan]")
+
+        async def run_lookup():
+            async with LinkedInAutomation(self.db_manager, self.settings) as automation:
+                login_ok = await automation.login(progress_update)
+                if not login_ok:
+                    return {"status": "login_failed"}
+                results = await automation.search_location(query.strip())
+                return {"status": "success", "results": results}
+
+        try:
+            result = asyncio.run(run_lookup())
+        except Exception as e:
+            self.console.print(f"[red]❌ Location lookup failed: {e}[/red]")
+            return
+
+        if result.get("status") == "login_failed":
+            self.console.print("[red]❌ Could not authenticate with LinkedIn.[/red]")
+            return
+
+        results = result.get("results", [])
+        if not results:
+            self.console.print(
+                f"[yellow]No locations found for '{query}'.[/yellow]"
+            )
+            return
+
+        lines = ["[bold]🔎 Location results[/bold]\n"]
+        for item in results:
+            lines.append(
+                f"[cyan]{item.get('name', '?')}[/cyan]  →  geoUrn [green]{item.get('geoUrn', '?')}[/green]"
+            )
+        lines.append(
+            "\n[dim]Use a code via Create/Edit Campaign → 'Other (enter custom geoUrn)'.[/dim]"
+        )
+        self.console.print(
+            Panel("\n".join(lines), title="Location Lookup", border_style="blue")
+        )
 
     def connection_checker(self):
         """Check pending connections using smart checker"""
