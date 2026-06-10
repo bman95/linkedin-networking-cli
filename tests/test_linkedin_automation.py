@@ -202,6 +202,9 @@ class TestLogin:
 
         # Visiting /feed redirects to /login -> credentials flow is triggered.
         mock_page.url = "https://www.linkedin.com/login"
+        # No CAPTCHA present on the page.
+        mock_page.query_selector = AsyncMock(return_value=None)
+        mock_page.content = AsyncMock(return_value="")
 
         result = await automation.login()
 

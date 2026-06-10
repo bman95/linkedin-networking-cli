@@ -1,5 +1,7 @@
 """
 Profile data extraction and contact information scraping from LinkedIn.
+
+All functions operate on an async Playwright ``Page`` and must be awaited.
 """
 
 import re
@@ -15,7 +17,7 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def get_contact_info(page) -> Dict[str, Optional[str]]:
+async def get_contact_info(page) -> Dict[str, Optional[str]]:
     """Extract contact information from LinkedIn profile."""
     contact_info = {
         "email": None,
@@ -26,18 +28,18 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
 
     try:
         # Click on "Contact info" section if available
-        contact_button = page.query_selector(
+        contact_button = await page.query_selector(
             "a[data-test-link-to-profile-contact-info], "
             "button[aria-label*='Contact info'], "
             "a:has-text('Contact info')"
         )
 
-        if contact_button and contact_button.is_visible():
-            contact_button.click()
-            page.wait_for_timeout(2000)
+        if contact_button and await contact_button.is_visible():
+            await contact_button.click()
+            await page.wait_for_timeout(2000)
 
             # Wait for contact info modal/section to load
-            contact_section = page.query_selector(
+            contact_section = await page.query_selector(
                 "#pv-contact-info, "
                 "[data-test-modal-id='contact-info'], "
                 ".pv-contact-info__contact-type"
@@ -52,9 +54,9 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
                 ]
 
                 for selector in email_selectors:
-                    email_element = page.query_selector(selector)
+                    email_element = await page.query_selector(selector)
                     if email_element:
-                        email_text = email_element.get_attribute("href") or email_element.inner_text()
+                        email_text = await email_element.get_attribute("href") or await email_element.inner_text()
                         if email_text:
                             email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', email_text)
                             if email_match:
@@ -69,9 +71,9 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
                 ]
 
                 for selector in phone_selectors:
-                    phone_element = page.query_selector(selector)
+                    phone_element = await page.query_selector(selector)
                     if phone_element:
-                        phone_text = phone_element.get_attribute("href") or phone_element.inner_text()
+                        phone_text = await phone_element.get_attribute("href") or await phone_element.inner_text()
                         if phone_text:
                             # Clean phone number
                             phone_clean = re.sub(r'[^\d+\-\(\)\s]', '', phone_text)
@@ -87,22 +89,22 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
                 ]
 
                 for selector in address_selectors:
-                    address_element = page.query_selector(selector)
+                    address_element = await page.query_selector(selector)
                     if address_element:
-                        address_text = address_element.inner_text()
+                        address_text = await address_element.inner_text()
                         if address_text and address_text.strip():
                             contact_info["address"] = address_text.strip()
                             break
 
             # Close contact info modal if it's a modal
-            close_button = page.query_selector(
+            close_button = await page.query_selector(
                 "button[aria-label='Dismiss'], "
                 ".artdeco-modal__dismiss, "
                 "button[data-test-modal-close-btn]"
             )
-            if close_button and close_button.is_visible():
-                close_button.click()
-                page.wait_for_timeout(1000)
+            if close_button and await close_button.is_visible():
+                await close_button.click()
+                await page.wait_for_timeout(1000)
 
         # Check if already connected (connection accepted date)
         connected_indicators = [
@@ -112,14 +114,14 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
         ]
 
         for selector in connected_indicators:
-            element = page.query_selector(selector)
-            if element and element.is_visible():
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
                 # Try to extract connection date
-                datetime_attr = element.get_attribute("datetime")
+                datetime_attr = await element.get_attribute("datetime")
                 if datetime_attr:
                     try:
                         contact_info["connection_accepted_date"] = datetime.fromisoformat(datetime_attr)
-                    except:
+                    except ValueError:
                         contact_info["connection_accepted_date"] = datetime.now()
                 else:
                     contact_info["connection_accepted_date"] = datetime.now()
@@ -131,7 +133,7 @@ def get_contact_info(page) -> Dict[str, Optional[str]]:
     return contact_info
 
 
-def get_profession(page) -> Optional[str]:
+async def get_profession(page) -> Optional[str]:
     """Extract profession/headline from LinkedIn profile."""
     try:
         profession_selectors = [
@@ -142,9 +144,9 @@ def get_profession(page) -> Optional[str]:
         ]
 
         for selector in profession_selectors:
-            element = page.query_selector(selector)
-            if element and element.is_visible():
-                profession = element.inner_text().strip()
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
+                profession = (await element.inner_text()).strip()
                 if profession and len(profession) > 3:
                     return profession
 
@@ -154,7 +156,7 @@ def get_profession(page) -> Optional[str]:
     return None
 
 
-def get_location(page) -> Optional[str]:
+async def get_location(page) -> Optional[str]:
     """Extract location from LinkedIn profile."""
     try:
         location_selectors = [
@@ -165,9 +167,9 @@ def get_location(page) -> Optional[str]:
         ]
 
         for selector in location_selectors:
-            element = page.query_selector(selector)
-            if element and element.is_visible():
-                location = element.inner_text().strip()
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
+                location = (await element.inner_text()).strip()
                 if location and len(location) > 2:
                     return location
 
@@ -177,24 +179,24 @@ def get_location(page) -> Optional[str]:
     return None
 
 
-def get_experience(page) -> List[Dict[str, Optional[str]]]:
+async def get_experience(page) -> List[Dict[str, Optional[str]]]:
     """Extract work experience from LinkedIn profile."""
     experience = []
 
     try:
         # Scroll to experience section
-        experience_section = page.query_selector(
+        experience_section = await page.query_selector(
             "#experience, "
             "[data-test-id='experience-section'], "
             ".pv-profile-section.experience-section"
         )
 
         if experience_section:
-            experience_section.scroll_into_view_if_needed()
-            page.wait_for_timeout(1000)
+            await experience_section.scroll_into_view_if_needed()
+            await page.wait_for_timeout(1000)
 
             # Extract experience items
-            experience_items = page.query_selector_all(
+            experience_items = await page.query_selector_all(
                 ".pv-entity__summary-info, "
                 ".pvs-entity, "
                 ".experience-item, "
@@ -218,9 +220,9 @@ def get_experience(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in title_selectors:
-                        title_element = item.query_selector(selector)
+                        title_element = await item.query_selector(selector)
                         if title_element:
-                            exp_data["title"] = title_element.inner_text().strip()
+                            exp_data["title"] = (await title_element.inner_text()).strip()
                             break
 
                     # Extract company name
@@ -231,9 +233,9 @@ def get_experience(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in company_selectors:
-                        company_element = item.query_selector(selector)
+                        company_element = await item.query_selector(selector)
                         if company_element:
-                            company_text = company_element.inner_text().strip()
+                            company_text = (await company_element.inner_text()).strip()
                             # Clean company name (remove "at" prefix if present)
                             if company_text.lower().startswith("at "):
                                 company_text = company_text[3:]
@@ -248,9 +250,9 @@ def get_experience(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in date_selectors:
-                        date_element = item.query_selector(selector)
+                        date_element = await item.query_selector(selector)
                         if date_element:
-                            date_text = date_element.inner_text().strip()
+                            date_text = (await date_element.inner_text()).strip()
                             if any(keyword in date_text.lower() for keyword in ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec", "present", "now", "current"]):
                                 exp_data["date_range"] = date_text
                                 break
@@ -262,9 +264,9 @@ def get_experience(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in location_selectors:
-                        location_element = item.query_selector(selector)
+                        location_element = await item.query_selector(selector)
                         if location_element:
-                            location_text = location_element.inner_text().strip()
+                            location_text = (await location_element.inner_text()).strip()
                             if location_text and len(location_text) > 2:
                                 exp_data["location"] = location_text
                                 break
@@ -283,24 +285,24 @@ def get_experience(page) -> List[Dict[str, Optional[str]]]:
     return experience
 
 
-def get_education(page) -> List[Dict[str, Optional[str]]]:
+async def get_education(page) -> List[Dict[str, Optional[str]]]:
     """Extract education from LinkedIn profile."""
     education = []
 
     try:
         # Scroll to education section
-        education_section = page.query_selector(
+        education_section = await page.query_selector(
             "#education, "
             "[data-test-id='education-section'], "
             ".pv-profile-section.education-section"
         )
 
         if education_section:
-            education_section.scroll_into_view_if_needed()
-            page.wait_for_timeout(1000)
+            await education_section.scroll_into_view_if_needed()
+            await page.wait_for_timeout(1000)
 
             # Extract education items
-            education_items = page.query_selector_all(
+            education_items = await page.query_selector_all(
                 ".pv-entity__summary-info, "
                 ".pvs-entity, "
                 ".education-item, "
@@ -323,9 +325,9 @@ def get_education(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in institution_selectors:
-                        institution_element = item.query_selector(selector)
+                        institution_element = await item.query_selector(selector)
                         if institution_element:
-                            edu_data["institution"] = institution_element.inner_text().strip()
+                            edu_data["institution"] = (await institution_element.inner_text()).strip()
                             break
 
                     # Extract degree
@@ -336,9 +338,9 @@ def get_education(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in degree_selectors:
-                        degree_element = item.query_selector(selector)
+                        degree_element = await item.query_selector(selector)
                         if degree_element:
-                            degree_text = degree_element.inner_text().strip()
+                            degree_text = (await degree_element.inner_text()).strip()
                             if degree_text and "·" not in degree_text:  # Avoid date ranges
                                 edu_data["degree"] = degree_text
                                 break
@@ -351,9 +353,9 @@ def get_education(page) -> List[Dict[str, Optional[str]]]:
                     ]
 
                     for selector in date_selectors:
-                        date_element = item.query_selector(selector)
+                        date_element = await item.query_selector(selector)
                         if date_element:
-                            date_text = date_element.inner_text().strip()
+                            date_text = (await date_element.inner_text()).strip()
                             # Check if it looks like a date range
                             if any(char in date_text for char in ["20", "19", "-", "–"]):
                                 edu_data["date_range"] = date_text
@@ -373,7 +375,7 @@ def get_education(page) -> List[Dict[str, Optional[str]]]:
     return education
 
 
-def get_open_to_work_status(page) -> bool:
+async def get_open_to_work_status(page) -> bool:
     """Check if candidate has 'Open to Work' badge."""
     try:
         open_to_work_indicators = [
@@ -385,12 +387,12 @@ def get_open_to_work_status(page) -> bool:
         ]
 
         for selector in open_to_work_indicators:
-            element = page.query_selector(selector)
-            if element and element.is_visible():
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
                 return True
 
         # Also check in profile text
-        page_content = page.content().lower()
+        page_content = (await page.content()).lower()
         if "open to work" in page_content or "opentowork" in page_content:
             return True
 
@@ -401,7 +403,7 @@ def get_open_to_work_status(page) -> bool:
         return False
 
 
-def collect_public_information(page) -> Tuple[Optional[str], Optional[str], List[Dict], List[Dict]]:
+async def collect_public_information(page) -> Tuple[Optional[str], Optional[str], List[Dict], List[Dict]]:
     """
     Collect comprehensive public profile information.
 
@@ -410,15 +412,15 @@ def collect_public_information(page) -> Tuple[Optional[str], Optional[str], List
     """
     try:
         # Wait for page to load
-        page.wait_for_timeout(2000)
+        await page.wait_for_timeout(2000)
 
         # Get basic info
-        profession = get_profession(page)
-        location = get_location(page)
+        profession = await get_profession(page)
+        location = await get_location(page)
 
         # Get detailed info (requires scrolling)
-        experience = get_experience(page)
-        education = get_education(page)
+        experience = await get_experience(page)
+        education = await get_education(page)
 
         logger.info(f"Collected profile data: profession={profession}, location={location}, "
                    f"experience_items={len(experience)}, education_items={len(education)}")
@@ -430,7 +432,7 @@ def collect_public_information(page) -> Tuple[Optional[str], Optional[str], List
         return None, None, [], []
 
 
-def open_public_profile(page):
+async def open_public_profile(page):
     """
     Navigate from LinkedIn Recruiter page to public profile.
     Returns the new page with public profile, or None if failed.
@@ -438,17 +440,17 @@ def open_public_profile(page):
     try:
         # Look for public profile trigger button
         trigger_selector = "button[data-test-public-profile-trigger]"
-        trigger_button = page.query_selector(trigger_selector)
+        trigger_button = await page.query_selector(trigger_selector)
 
-        if trigger_button and trigger_button.is_visible():
+        if trigger_button and await trigger_button.is_visible():
             logger.info("Clicking 'public profile' button")
-            trigger_button.click()
-            page.wait_for_timeout(2000)
+            await trigger_button.click()
+            await page.wait_for_timeout(2000)
 
             # Get the public profile link
-            link_element = page.query_selector("a[data-test-public-profile-link]")
+            link_element = await page.query_selector("a[data-test-public-profile-link]")
             if link_element:
-                profile_url = link_element.get_attribute("href")
+                profile_url = await link_element.get_attribute("href")
                 if profile_url:
                     # Ensure URL ends with /
                     if not profile_url.endswith("/"):
@@ -456,9 +458,9 @@ def open_public_profile(page):
 
                     # Open public profile in new page
                     context = page.context
-                    new_page = context.new_page()
-                    new_page.goto(profile_url, timeout=30000)
-                    new_page.wait_for_timeout(2000)
+                    new_page = await context.new_page()
+                    await new_page.goto(profile_url, timeout=30000)
+                    await new_page.wait_for_timeout(2000)
 
                     logger.info(f"Opened public profile: {profile_url}")
                     return new_page

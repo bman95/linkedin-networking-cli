@@ -237,7 +237,7 @@ class LinkedInAutomation:
 
             # Check for CAPTCHA on login page
             from .interactions import detect_captcha
-            if detect_captcha(self.page):
+            if await detect_captcha(self.page):
                 raise CaptchaDetectedException("CAPTCHA challenge detected on login page - manual verification required")
 
             # Handle login with or without stored credentials
@@ -258,7 +258,7 @@ class LinkedInAutomation:
                 await self.page.wait_for_timeout(2000)
 
                 # Check for CAPTCHA after login submission
-                if detect_captcha(self.page):
+                if await detect_captcha(self.page):
                     raise CaptchaDetectedException("CAPTCHA challenge detected after login submission")
 
                 # Wait for login success
@@ -799,13 +799,13 @@ class LinkedInAutomation:
             await self.page.wait_for_timeout(2000)
 
             # Collect comprehensive profile information
-            profession, location, experience, education = collect_public_information(self.page)
+            profession, location, experience, education = await collect_public_information(self.page)
 
             # Get contact information
-            contact_info = get_contact_info(self.page)
+            contact_info = await get_contact_info(self.page)
 
             # Check open to work status
-            open_to_work = get_open_to_work_status(self.page)
+            open_to_work = await get_open_to_work_status(self.page)
 
             profile_data = {
                 "profile_url": profile_url,
