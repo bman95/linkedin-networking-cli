@@ -157,13 +157,18 @@ class LinkedInCLI:
                 "acceptance_rate": 26.7,
             }
 
+        footer = (
+            "\n\n[dim]💡 Demo mode with mock data (database unavailable)[/dim]"
+            if not self.db_manager
+            else ""
+        )
         self.console.print(
             Panel(
                 f"[bold]📊 Dashboard Statistics[/bold]\n\n"
                 f"[cyan]Active Campaigns:[/cyan] {stats['active_campaigns']}/{stats['total_campaigns']}\n"
                 f"[cyan]Total Connections:[/cyan] {stats['total_sent']} sent, {stats['total_accepted']} accepted\n"
-                f"[cyan]Success Rate:[/cyan] {stats['acceptance_rate']}%\n\n"
-                f"[dim]💡 This is a demo with mock data[/dim]",
+                f"[cyan]Success Rate:[/cyan] {stats['acceptance_rate']}%"
+                f"{footer}",
                 title="LinkedIn Networking Dashboard",
                 border_style="blue",
             )
@@ -331,78 +336,89 @@ class LinkedInCLI:
         inquirer.confirm(message="Press Enter to continue...").execute()
 
     def manage_campaigns(self):
-        """Manage existing campaigns"""
-        if self.db_manager:
-            try:
-                campaigns = self.db_manager.get_campaigns(active_only=False)
-            except Exception as e:
-                self.console.print(f"[red]Error loading campaigns: {e}[/red]")
-                campaigns = []
-        else:
-            # Mock campaigns for demo
-            Campaign = namedtuple(
-                "Campaign",
-                ["id", "name", "active", "total_sent", "total_accepted", "daily_limit"],
-            )
-            campaigns = [
-                Campaign(1, "Tech Professionals", True, 25, 8, 20),
-                Campaign(2, "Marketing Leads", False, 20, 4, 15),
-                Campaign(3, "Sales Prospects", True, 30, 12, 25),
-            ]
-
-        # Select campaign to manage
-        campaign_choices = []
-        for campaign in campaigns:
-            status = "🟢 Active" if campaign.active else "🔴 Inactive"
-            acceptance_rate = (
-                (campaign.total_accepted / campaign.total_sent * 100)
-                if campaign.total_sent > 0
-                else 0
-            )
-            campaign_choices.append(
-                Choice(
-                    value=campaign,
-                    name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {acceptance_rate:.1f}% rate)",
+        """Manage existing campaigns (looped: stays here until you go back)."""
+        while True:
+            if self.db_manager:
+                try:
+                    campaigns = self.db_manager.get_campaigns(active_only=False)
+                except Exception as e:
+                    self.console.print(f"[red]Error loading campaigns: {e}[/red]")
+                    campaigns = []
+            else:
+                # Mock campaigns for demo
+                Campaign = namedtuple(
+                    "Campaign",
+                    ["id", "name", "active", "total_sent", "total_accepted", "daily_limit"],
                 )
-            )
+                campaigns = [
+                    Campaign(1, "Tech Professionals", True, 25, 8, 20),
+                    Campaign(2, "Marketing Leads", False, 20, 4, 15),
+                    Campaign(3, "Sales Prospects", True, 30, 12, 25),
+                ]
 
-        campaign_choices.append(Separator())
-        campaign_choices.append(Choice(value="back", name="🔙 Back to main menu"))
+            if not campaigns:
+                self.console.print(
+                    "[yellow]No campaigns yet. Use 'Create Campaign' to add one.[/yellow]"
+                )
+                inquirer.confirm(message="Press Enter to continue...").execute()
+                return
 
-        selected = inquirer.select(
-            message="Select campaign to manage:", choices=campaign_choices
-        ).execute()
+            # Select campaign to manage
+            campaign_choices = []
+            for campaign in campaigns:
+                status = "🟢 Active" if campaign.active else "🔴 Inactive"
+                acceptance_rate = (
+                    (campaign.total_accepted / campaign.total_sent * 100)
+                    if campaign.total_sent > 0
+                    else 0
+                )
+                campaign_choices.append(
+                    Choice(
+                        value=campaign,
+                        name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {acceptance_rate:.1f}% rate)",
+                    )
+                )
 
-        if selected == "back":
-            return
+            campaign_choices.append(Separator())
+            campaign_choices.append(Choice(value="back", name="🔙 Back to main menu"))
 
-        # Campaign actions
-        action = inquirer.select(
-            message=f"What would you like to do with '{selected.name}'?",
-            choices=[
-                Choice(value="view", name="📊 View detailed statistics"),
-                Choice(value="toggle", name="🔄 Toggle active/inactive status"),
-                Choice(value="edit", name="📝 Edit campaign settings"),
-                Choice(value="export", name="📤 Export contacts to CSV"),
-                Choice(value="delete", name="🗑️ Delete campaign"),
-                Separator(),
-                Choice(value="back", name="🔙 Back to campaign list"),
-            ],
-        ).execute()
+            selected = inquirer.select(
+                message="Select campaign to manage:", choices=campaign_choices
+            ).execute()
 
-        if action == "view":
-            self.view_campaign_details(selected)
-        elif action == "toggle":
-            self.toggle_campaign(selected)
-        elif action == "edit":
-            self.edit_campaign(selected)
-        elif action == "export":
-            self.export_contacts(selected)
-        elif action == "delete":
-            self.delete_campaign(selected)
+            if selected == "back":
+                return
 
-        if action != "back":
+            # Campaign actions
+            action = inquirer.select(
+                message=f"What would you like to do with '{selected.name}'?",
+                choices=[
+                    Choice(value="view", name="📊 View detailed statistics"),
+                    Choice(value="toggle", name="🔄 Toggle active/inactive status"),
+                    Choice(value="edit", name="📝 Edit campaign settings"),
+                    Choice(value="export", name="📤 Export contacts to CSV"),
+                    Choice(value="delete", name="🗑️ Delete campaign"),
+                    Separator(),
+                    Choice(value="back", name="🔙 Back to campaign list"),
+                ],
+            ).execute()
+
+            if action == "back":
+                # Return to the campaign list (loop reloads fresh data).
+                continue
+            elif action == "view":
+                self.view_campaign_details(selected)
+            elif action == "toggle":
+                self.toggle_campaign(selected)
+            elif action == "edit":
+                self.edit_campaign(selected)
+            elif action == "export":
+                self.export_contacts(selected)
+            elif action == "delete":
+                self.delete_campaign(selected)
+
             inquirer.confirm(message="Press Enter to continue...").execute()
+            # Loop continues -> reload the campaign list, reflecting any changes.
 
     def toggle_campaign(self, campaign):
         """Toggle a campaign's active/inactive status in the database."""
@@ -561,7 +577,7 @@ class LinkedInCLI:
             self.console.print(f"[red]❌ Error updating campaign: {e}[/red]")
 
     def delete_campaign(self, campaign):
-        """Delete a campaign (and its contacts) from the database."""
+        """Delete a campaign (and its contacts). Returns True if it was removed."""
         confirm = inquirer.confirm(
             message=f"⚠️  Are you sure you want to delete '{campaign.name}'? "
             "This also removes its contacts.",
@@ -570,12 +586,12 @@ class LinkedInCLI:
 
         if not confirm:
             self.console.print("[yellow]Deletion cancelled.[/yellow]")
-            return
+            return False
 
         if not self.db_manager:
             self.console.print(f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]")
             self.console.print("[blue]💡 Demo mode: Would delete from database[/blue]")
-            return
+            return False
 
         try:
             deleted = self.db_manager.delete_campaign(campaign.id)
@@ -583,12 +599,15 @@ class LinkedInCLI:
                 self.console.print(
                     f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]"
                 )
+                return True
             else:
                 self.console.print(
                     f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
                 )
+                return False
         except Exception as e:
             self.console.print(f"[red]❌ Error deleting campaign: {e}[/red]")
+            return False
 
     def export_contacts(self, campaign):
         """Export a campaign's contacts to a CSV file."""
@@ -685,8 +704,7 @@ class LinkedInCLI:
                 border_style="blue",
             )
         )
-
-        inquirer.confirm(message="Press Enter to continue...").execute()
+        # Note: the caller (manage_campaigns) prompts to continue.
 
     def execute_campaign(self):
         """Execute campaign selection"""
@@ -858,12 +876,37 @@ class LinkedInCLI:
         ).execute()
 
         if setting == "credentials":
+            self.show_credentials_settings()
+        elif setting == "browser":
+            self.show_browser_settings()
+        elif setting == "limits":
+            self.show_limits_settings()
+        elif setting == "data":
+            self.show_data_settings()
+        elif setting == "location_lookup":
+            self.location_lookup()
+
+        if setting != "back":
+            inquirer.confirm(message="Press Enter to continue...").execute()
+
+    @staticmethod
+    def _mask_email(email):
+        """Mask an email for display, e.g. 'joh***@example.com'."""
+        if not email:
+            return "Not set"
+        if "@" in email:
+            local, domain = email.split("@", 1)
+            prefix = local[:3] if len(local) >= 3 else local
+            return f"{prefix}***@{domain}"
+        return f"{email[:3]}***"
+
+    def show_credentials_settings(self):
+        """Show real LinkedIn credential status from the environment."""
+        if not self.settings:
             self.console.print(
                 Panel(
                     "[bold]🔐 LinkedIn Credentials[/bold]\n\n"
-                    "[cyan]Status:[/cyan] 🔴 Not configured (demo mode)\n"
-                    "[cyan]Email:[/cyan] Not set\n"
-                    "[cyan]Password:[/cyan] Not set\n\n"
+                    "[cyan]Status:[/cyan] 🔴 Not configured (demo mode)\n\n"
                     "[dim]Set via environment variables:\n"
                     'export LINKEDIN_EMAIL="your-email"\n'
                     'export LINKEDIN_PASSWORD="your-password"[/dim]',
@@ -871,47 +914,89 @@ class LinkedInCLI:
                     border_style="blue",
                 )
             )
-        elif setting == "browser":
-            self.console.print(
-                Panel(
-                    "[bold]🌐 Browser Settings[/bold]\n\n"
-                    "[cyan]Browser:[/cyan] Chromium (Playwright)\n"
-                    "[cyan]Headless Mode:[/cyan] True\n"
-                    "[cyan]Viewport:[/cyan] 1920x1080\n"
-                    "[cyan]User Data Dir:[/cyan] ~/.linkedin-networking-cli/browser_data/",
-                    title="Browser Configuration",
-                    border_style="blue",
-                )
-            )
-        elif setting == "limits":
-            self.console.print(
-                Panel(
-                    "[bold]⚡ Rate Limiting[/bold]\n\n"
-                    "[cyan]Connection Delay:[/cyan] 2-5 seconds\n"
-                    "[cyan]Daily Connection Limit:[/cyan] 20\n"
-                    "[cyan]Search Limit:[/cyan] 100\n"
-                    "[cyan]Retry Attempts:[/cyan] 3",
-                    title="Rate Limiting Settings",
-                    border_style="blue",
-                )
-            )
-        elif setting == "data":
-            self.console.print(
-                Panel(
-                    "[bold]📁 Data Storage[/bold]\n\n"
-                    "[cyan]App Directory:[/cyan] ~/.linkedin-networking-cli/\n"
-                    "[cyan]Database:[/cyan] linkedin_networking.db\n"
-                    "[cyan]Session Data:[/cyan] session.json\n"
-                    "[cyan]Browser Data:[/cyan] browser_data/",
-                    title="Data Directory Information",
-                    border_style="blue",
-                )
-            )
-        elif setting == "location_lookup":
-            self.location_lookup()
+            return
 
-        if setting != "back":
-            inquirer.confirm(message="Press Enter to continue...").execute()
+        email = self.settings.linkedin_email
+        has_password = bool(self.settings.linkedin_password)
+        configured = bool(email) and has_password
+        status = "🟢 Configured" if configured else "🔴 Not configured"
+
+        self.console.print(
+            Panel(
+                "[bold]🔐 LinkedIn Credentials[/bold]\n\n"
+                f"[cyan]Status:[/cyan] {status}\n"
+                f"[cyan]Email:[/cyan] {self._mask_email(email)}\n"
+                f"[cyan]Password:[/cyan] {'Set' if has_password else 'Not set'}\n\n"
+                "[dim]Set via environment variables:\n"
+                'export LINKEDIN_EMAIL="your-email"\n'
+                'export LINKEDIN_PASSWORD="your-password"[/dim]',
+                title="Credentials Status",
+                border_style="blue",
+            )
+        )
+
+    def show_browser_settings(self):
+        """Show the real browser configuration."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Browser settings unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        b = self.settings.get_browser_settings()
+        viewport = b.get("viewport", {})
+        self.console.print(
+            Panel(
+                "[bold]🌐 Browser Settings[/bold]\n\n"
+                f"[cyan]Channel:[/cyan] {b.get('channel') or 'bundled Chromium'}\n"
+                f"[cyan]Executable:[/cyan] {b.get('executable_path') or 'default'}\n"
+                f"[cyan]Headless Mode:[/cyan] {b.get('headless')}\n"
+                f"[cyan]Viewport:[/cyan] {viewport.get('width')}x{viewport.get('height')}\n"
+                f"[cyan]User Data Dir:[/cyan] {b.get('user_data_dir')}",
+                title="Browser Configuration",
+                border_style="blue",
+            )
+        )
+
+    def show_limits_settings(self):
+        """Show the real rate-limiting / automation configuration."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Rate limiting settings unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        a = self.settings.get_automation_settings()
+        self.console.print(
+            Panel(
+                "[bold]⚡ Rate Limiting[/bold]\n\n"
+                f"[cyan]Connection Delay:[/cyan] {a.get('connection_delay_min')}-{a.get('connection_delay_max')} seconds\n"
+                f"[cyan]Daily Connection Limit:[/cyan] {a.get('daily_connection_limit')}\n"
+                f"[cyan]Search Limit:[/cyan] {a.get('search_limit')}",
+                title="Rate Limiting Settings",
+                border_style="blue",
+            )
+        )
+
+    def show_data_settings(self):
+        """Show the real data storage locations."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Data directory information unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        self.console.print(
+            Panel(
+                "[bold]📁 Data Storage[/bold]\n\n"
+                f"[cyan]App Directory:[/cyan] {self.settings.app_dir}\n"
+                f"[cyan]Database:[/cyan] {self.settings.db_path}\n"
+                f"[cyan]Session Data:[/cyan] {self.settings.session_path}\n"
+                f"[cyan]Browser Data:[/cyan] {Path(self.settings.app_dir) / 'browser_data'}",
+                title="Data Directory Information",
+                border_style="blue",
+            )
+        )
 
     def location_lookup(self):
         """Look up a LinkedIn location geoUrn code online via the Voyager API.
