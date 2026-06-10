@@ -407,10 +407,17 @@ class LinkedInAutomation:
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
+        from .interactions import detect_captcha, detect_invitation_limit
+
         automation_settings = self.settings.get_automation_settings()
         sent_count = 0
         failed_count = 0
         existing_count = 0
+
+        # Backoff state: repeated failures may signal a restricted account.
+        consecutive_failures = 0
+        backoff_base_seconds = 5
+        backoff_cap_seconds = 300
 
         for i, profile in enumerate(profiles):
             try:
@@ -436,6 +443,16 @@ class LinkedInAutomation:
                 # Navigate to profile
                 await self.page.goto(profile.profile_url, timeout=30000)
                 await self.page.wait_for_timeout(2000)
+
+                # Stop early if LinkedIn challenges us — pushing through a
+                # CAPTCHA is the fastest way to get an account restricted.
+                if await detect_captcha(self.page):
+                    logger.warning("CAPTCHA detected during connection run; stopping")
+                    if progress_callback:
+                        progress_callback(
+                            "⚠️ CAPTCHA detected — stopping automation to protect the account"
+                        )
+                    break
 
                 # Look for connect button
                 connect_button = await self.page.query_selector(
@@ -477,6 +494,16 @@ class LinkedInAutomation:
                                 await self.page.fill("textarea", message)
 
                         await send_button.click()
+                        await self.page.wait_for_timeout(1000)
+
+                        # Stop if we just hit the weekly invitation limit.
+                        if await detect_invitation_limit(self.page):
+                            logger.warning("Weekly invitation limit reached; stopping")
+                            if progress_callback:
+                                progress_callback(
+                                    "⚠️ Weekly invitation limit reached — stopping"
+                                )
+                            break
 
                         # Create contact record
                         contact_data = {
@@ -492,6 +519,7 @@ class LinkedInAutomation:
 
                         self.db_manager.create_contact(contact_data)
                         sent_count += 1
+                        consecutive_failures = 0  # successful action resets backoff
 
                         if progress_callback:
                             progress_callback(
@@ -536,6 +564,27 @@ class LinkedInAutomation:
             except Exception as e:
                 logger.error(f"Failed to process {profile.name}: {str(e)}")
                 failed_count += 1
+                consecutive_failures += 1
+
+                # Exponential backoff after repeated failures: a burst of
+                # errors often means LinkedIn has started throttling or
+                # restricting the account, so we slow down instead of hammering.
+                if consecutive_failures >= 3:
+                    wait_seconds = min(
+                        backoff_base_seconds * (2 ** (consecutive_failures - 3)),
+                        backoff_cap_seconds,
+                    )
+                    logger.warning(
+                        "%d consecutive failures; backing off %ds (possible restriction)",
+                        consecutive_failures,
+                        wait_seconds,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            f"⚠️ {consecutive_failures} consecutive failures — "
+                            f"backing off {wait_seconds}s"
+                        )
+                    await self.page.wait_for_timeout(wait_seconds * 1000)
                 continue
 
         # Update campaign statistics

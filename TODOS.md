@@ -417,9 +417,21 @@ Guardar configuraciones comunes como templates:
 - Eliminado el "File Editor Demo" (andamiaje ajeno al producto).
 - Suite de tests en verde: **269 passed**.
 
-### Pendiente real (futuras versiones)
-- Verificar los geoUrn/industry IDs marcados con `❓` contra búsquedas reales de LinkedIn.
-- Integrar la búsqueda dinámica de ubicaciones directamente en el flujo de creación (hoy es una
-  utilidad separada en Settings).
-- Subir cobertura de `checker.py` y `session.py` (aún ~0%).
-- Backoff automático ante cuenta restringida; packaging a PyPI.
+### Completado (segunda tanda de pendientes)
+- **Búsqueda dinámica de ubicaciones integrada en el flujo de creación Y edición** de campañas
+  (opción "🔎 Search location online"), además de la utilidad en Settings. Helper compartido
+  `_run_location_search` / `_search_location_online`.
+- **Backoff exponencial ante cuenta restringida** en `send_connection_requests`: se detiene ante
+  CAPTCHA o límite semanal de invitaciones y aplica backoff exponencial (5s→…→300s) tras fallos
+  consecutivos.
+- **Cobertura subida**: `session.py` 0%→97%, `checker.py` 0%→41% (tests nuevos). Total 49%→58%,
+  **294 tests**.
+- **Packaging a PyPI**: añadido `[build-system]` (hatchling) + metadata (license, classifiers,
+  keywords, urls); `uv build` genera wheel/sdist y el wheel instala e importa correctamente en un
+  entorno Python 3.13 limpio (entry point `linkedin-cli` funcional).
+
+### Pendiente real (requiere cuenta de LinkedIn / fuera de este entorno)
+- Verificar los geoUrn/industry IDs marcados con `❓` contra búsquedas reales (mitigado: usar el
+  lookup online integrado o geoUrn custom; los `❓` están claramente marcados como no verificados).
+- Tests de integración end-to-end contra LinkedIn real (login, search, send) — requieren credenciales
+  y navegador; el resto de la lógica ya está cubierta con mocks.

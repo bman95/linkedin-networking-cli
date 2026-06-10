@@ -191,11 +191,13 @@ class LinkedInCLI:
             message="Target keywords (e.g., 'software engineer', optional):",
         ).execute()
 
-        # Location filter with proper geoUrn mapping
-        # Note: Dynamic location search available via LinkedInAutomation.search_location()
-        # for future UI improvements (requires authenticated session)
+        # Location filter with proper geoUrn mapping.
+        # Dynamic online search is offered as an option (requires login).
+        SEARCH_ONLINE = "🔎 Search location online (requires login)"
+        CUSTOM_GEO = "Other (enter custom geoUrn)"
         location_choices = get_location_display_names()
-        location_choices.append("Other (enter custom geoUrn)")  # Add custom option
+        location_choices.append(SEARCH_ONLINE)
+        location_choices.append(CUSTOM_GEO)
 
         location_display = inquirer.select(
             message="Target location:",
@@ -205,7 +207,17 @@ class LinkedInCLI:
 
         # Handle custom geoUrn input
         custom_geo_urn = None
-        if location_display == "Other (enter custom geoUrn)":
+
+        if location_display == SEARCH_ONLINE:
+            name, geo = self._search_location_online()
+            if geo:
+                custom_geo_urn = geo
+                location_display = name
+            else:
+                # Fall back to manual entry if the search yielded nothing.
+                location_display = CUSTOM_GEO
+
+        if location_display == CUSTOM_GEO:
             self.console.print()
             self.console.print("[yellow]💡 Tip: Find geoUrn codes by:[/yellow]")
             self.console.print("[dim]   1. Search on LinkedIn with location filter[/dim]")
@@ -440,6 +452,7 @@ class LinkedInCLI:
         ).execute()
 
         # Location: preselect the current location based on the stored geo_urn.
+        SEARCH_ONLINE = "🔎 Search location online (requires login)"
         current_geo_urn = self._campaign_get_field(campaign, "geo_urn", None)
         current_location_name = (
             get_location_name_from_urn(current_geo_urn) if current_geo_urn else "Any"
@@ -447,11 +460,22 @@ class LinkedInCLI:
         location_choices = get_location_display_names()
         if current_location_name not in location_choices:
             location_choices.append(current_location_name)
+        location_choices.append(SEARCH_ONLINE)
         location_display = inquirer.select(
             message="Target location:",
             choices=location_choices,
             default=current_location_name,
         ).execute()
+
+        edited_geo_urn = None  # set only when an online search picks a result
+        if location_display == SEARCH_ONLINE:
+            name, geo = self._search_location_online()
+            if geo:
+                edited_geo_urn = geo
+                location_display = name
+            else:
+                # Keep the previous location if the search was cancelled.
+                location_display = current_location_name
 
         # Connection degree.
         current_network = self._campaign_get_field(campaign, "network", '["F","S"]')
@@ -493,8 +517,12 @@ class LinkedInCLI:
             or "Message must contain {name} placeholder",
         ).execute()
 
-        # Resolve display names back into stored values.
-        geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+        # Resolve display names back into stored values. An online-search pick
+        # provides its geoUrn directly; otherwise map from the curated list.
+        if edited_geo_urn:
+            geo_urn = edited_geo_urn
+        else:
+            geo_urn = get_location_urn(location_display) if location_display != "Any" else None
         network_value = get_network_value(network_display)
         industry_id = (
             get_industry_id(industry_display) if industry_display != "Any" else None
@@ -903,36 +931,12 @@ class LinkedInCLI:
             validate=lambda x: len(x.strip()) > 0 or "Enter a search term",
         ).execute()
 
-        self.console.print(
-            "[cyan]Opening LinkedIn to search locations (login may be required)...[/cyan]"
-        )
-
-        def progress_update(message: str) -> None:
-            self.console.print(f"[cyan]{message}[/cyan]")
-
-        async def run_lookup():
-            async with LinkedInAutomation(self.db_manager, self.settings) as automation:
-                login_ok = await automation.login(progress_update)
-                if not login_ok:
-                    return {"status": "login_failed"}
-                results = await automation.search_location(query.strip())
-                return {"status": "success", "results": results}
-
-        try:
-            result = asyncio.run(run_lookup())
-        except Exception as e:
-            self.console.print(f"[red]❌ Location lookup failed: {e}[/red]")
-            return
-
-        if result.get("status") == "login_failed":
+        results = self._run_location_search(query.strip())
+        if results is None:
             self.console.print("[red]❌ Could not authenticate with LinkedIn.[/red]")
             return
-
-        results = result.get("results", [])
         if not results:
-            self.console.print(
-                f"[yellow]No locations found for '{query}'.[/yellow]"
-            )
+            self.console.print(f"[yellow]No locations found for '{query}'.[/yellow]")
             return
 
         lines = ["[bold]🔎 Location results[/bold]\n"]
@@ -946,6 +950,74 @@ class LinkedInCLI:
         self.console.print(
             Panel("\n".join(lines), title="Location Lookup", border_style="blue")
         )
+
+    def _run_location_search(self, query):
+        """Authenticate and query LinkedIn's typeahead for locations.
+
+        Returns a list of ``{"name", "geoUrn"}`` dicts, an empty list when
+        nothing matched, or ``None`` when authentication failed.
+        """
+        if not self.db_manager or not self.settings:
+            return None
+
+        self.console.print(
+            "[cyan]Opening LinkedIn to search locations (login may be required)...[/cyan]"
+        )
+
+        def progress_update(message: str) -> None:
+            self.console.print(f"[cyan]{message}[/cyan]")
+
+        async def run_lookup():
+            async with LinkedInAutomation(self.db_manager, self.settings) as automation:
+                login_ok = await automation.login(progress_update)
+                if not login_ok:
+                    return None
+                return await automation.search_location(query)
+
+        try:
+            return asyncio.run(run_lookup())
+        except Exception as e:
+            self.console.print(f"[red]❌ Location search failed: {e}[/red]")
+            return []
+
+    def _search_location_online(self):
+        """Prompt for a query, search LinkedIn, and let the user pick a result.
+
+        Returns a ``(display_name, geo_urn)`` tuple, or ``(None, None)`` if the
+        search failed or was cancelled.
+        """
+        if not self.db_manager or not self.settings:
+            self.console.print(
+                "[yellow]Online search requires database access and app settings.[/yellow]"
+            )
+            return None, None
+
+        query = inquirer.text(
+            message="Search location (e.g. 'Madrid', 'Greater Tokyo'):",
+            validate=lambda x: len(x.strip()) > 0 or "Enter a search term",
+        ).execute()
+
+        results = self._run_location_search(query.strip())
+        if results is None:
+            self.console.print("[red]❌ Could not authenticate with LinkedIn.[/red]")
+            return None, None
+        if not results:
+            self.console.print(f"[yellow]No locations found for '{query}'.[/yellow]")
+            return None, None
+
+        choices = [
+            Choice(value=item, name=f"{item.get('name', '?')} (geoUrn {item.get('geoUrn', '?')})")
+            for item in results
+        ]
+        choices.append(Choice(value=None, name="🔙 Cancel"))
+        selected = inquirer.select(
+            message="Select a location:",
+            choices=choices,
+        ).execute()
+
+        if not selected:
+            return None, None
+        return selected.get("name"), selected.get("geoUrn")
 
     def connection_checker(self):
         """Check pending connections using smart checker"""

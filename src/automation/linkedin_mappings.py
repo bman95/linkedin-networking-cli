@@ -12,8 +12,12 @@ from typing import Dict, List, Tuple
 # ============================================================================
 # LOCATION MAPPINGS (geoUrn)
 # ============================================================================
-# Note: Codes marked with ✅ are verified, ❓ need verification
-# Use dynamic search for locations not in this list
+# Note: Codes marked with ✅ are verified against live LinkedIn searches.
+# Codes marked with ❓ are best-effort and have NOT been verified against a
+# live account from this codebase. For guaranteed-correct codes, use the
+# built-in online lookup (Settings -> "Look up location code (online)", backed
+# by LinkedInAutomation.search_location) or paste a custom geoUrn via the
+# "Other (enter custom geoUrn)" option when creating/editing a campaign.
 
 LOCATION_MAPPING: Dict[str, str] = {
     # === VERIFIED LOCATIONS ===
