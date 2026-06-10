@@ -29,10 +29,10 @@ LOCATION_MAPPING: Dict[str, str] = {
     "Austin, Texas Area": "102748797",  # ❓
     "Greater Denver Area": "104545681",  # ❓
     "Greater Miami Area": "104170880",  # ❓
-    "Greater Atlanta Area": "102571732",  # ❓
+    "Greater Atlanta Area": "90000052",  # ❓
     "Greater Dallas-Fort Worth Area": "102530516",  # ❓
     "Greater Houston Area": "104335990",  # ❓
-    "Greater Phoenix Area": "105646813",  # ❓
+    "Greater Phoenix Area": "90000049",  # ❓
     "Greater Philadelphia Area": "102409204",  # ❓
     "Greater San Diego Area": "104619630",  # ❓
     "Greater Minneapolis-St. Paul Area": "105656822",  # ❓
@@ -134,12 +134,12 @@ LOCATION_CHOICES: List[Tuple[str, str]] = [
     ("Greater Chicago Area", "103112676"),
     ("Greater Denver Area", "104545681"),
     ("Greater Miami Area", "104170880"),
-    ("Greater Atlanta Area", "102571732"),
+    ("Greater Atlanta Area", "90000052"),
     ("Greater Dallas-Fort Worth Area", "102530516"),
     ("Greater Houston Area", "104335990"),
     ("Greater Washington DC-Baltimore Area", "103819254"),
     ("Greater San Diego Area", "104619630"),
-    ("Greater Phoenix Area", "105646813"),
+    ("Greater Phoenix Area", "90000049"),
     ("Greater Philadelphia Area", "102409204"),
     ("Portland, Oregon Metropolitan Area", "104684891"),
     ("Greater Nashville Area", "104245995"),
@@ -243,7 +243,7 @@ INDUSTRY_MAPPING: Dict[str, str] = {
     "Accounting": "47",
     "Human Resources": "137",
     "Staffing & Recruiting": "104",
-    "Design": "27",
+    "Design": "99",
     "Entertainment": "28",
     "Media Production": "126",
     "Telecommunications": "8",
@@ -277,7 +277,7 @@ INDUSTRY_CHOICES: List[Tuple[str, str]] = [
     ("Accounting", "47"),
     ("Human Resources", "137"),
     ("Staffing & Recruiting", "104"),
-    ("Design", "27"),
+    ("Design", "99"),
     ("Entertainment", "28"),
     ("Telecommunications", "8"),
     ("Automotive", "53"),

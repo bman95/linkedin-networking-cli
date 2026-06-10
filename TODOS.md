@@ -245,14 +245,16 @@ Tesla: 15564
 
 ### Campaign Editing
 
-**Status:** No implementado
+**Status:** ✅ IMPLEMENTADO (CRUD básico)
 **Prioridad:** Alta
 
-Permitir editar campañas existentes:
-- Cambiar filtros sin crear nueva campaña
-- Pausar/resumir campañas
-- Ajustar daily limits on-the-fly
-- Modificar message templates
+Implementado en "Manage Campaigns" (cableado a SQLite vía `DatabaseManager`):
+- ✅ Editar nombre, descripción, daily limit y message template
+- ✅ Pausar/reanudar campañas (toggle active/inactive)
+- ✅ Eliminar campaña y sus contactos asociados
+
+**Pendiente (futuro):**
+- Editar filtros de targeting (keywords/location/industry) sin recrear la campaña
 
 ---
 
@@ -386,6 +388,21 @@ Guardar configuraciones comunes como templates:
 
 ---
 
-**Última actualización:** 2025-11-12
+**Última actualización:** 2026-06-10
 **Versión actual:** 0.1.0
 **Próxima versión planeada:** 0.2.0 (Fase 1 completada)
+
+---
+
+## ✅ Completado en esta iteración
+
+- Cableado de "Manage Campaigns" a la base de datos: toggle activar/desactivar, editar (nombre,
+  descripción, daily limit, message template) y eliminar campaña — antes eran stubs que solo
+  imprimían "In real app: Would...".
+- Corregido `record_daily_analytics`: `DetachedInstanceError` al actualizar un registro existente
+  (faltaba `session.refresh`).
+- Corregidos IDs duplicados en mappings: `LOCATION_CHOICES` (Atlanta/Phoenix) e
+  `INDUSTRY_CHOICES` (Design).
+- Actualizados los tests de login al esquema de detección por URL (antes esperaban `is_visible`).
+- Eliminado el "File Editor Demo" (andamiaje ajeno al producto).
+- Suite de tests en verde: **248 passed**.

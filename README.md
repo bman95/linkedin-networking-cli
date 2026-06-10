@@ -4,11 +4,11 @@ A professional command-line tool for LinkedIn networking automation with an inte
 
 ## Features
 
-- <¯ **Campaign Management**: Create and manage networking campaigns with targeting criteria
-- =€ **Automated Execution**: Send connection requests with smart rate limiting
-- =Ê **Analytics Dashboard**: Track campaign performance and success rates
-- <¨ **Beautiful CLI**: Interactive interface with progress tracking and real-time updates
-- =¾ **SQLite Database**: Local storage for campaigns, contacts, and analytics
+- <ï¿½ **Campaign Management**: Create and manage networking campaigns with targeting criteria
+- =ï¿½ **Automated Execution**: Send connection requests with smart rate limiting
+- =ï¿½ **Analytics Dashboard**: Track campaign performance and success rates
+- <ï¿½ **Beautiful CLI**: Interactive interface with progress tracking and real-time updates
+- =ï¿½ **SQLite Database**: Local storage for campaigns, contacts, and analytics
 - = **Session Management**: Persistent LinkedIn authentication
 
 ## Setup
@@ -35,10 +35,21 @@ A professional command-line tool for LinkedIn networking automation with an inte
 
 Run the application:
 ```bash
-uv run src/main.py
+uv run linkedin_cli.py
+# or, via the installed entry point
+linkedin-cli
 ```
 
 Navigate with arrow keys, Enter to select, Ctrl+C to exit.
+
+From the main menu you can:
+- **Dashboard** â€“ view aggregate campaign statistics
+- **Create Campaign** â€“ set up targeting (keywords, location, industry, connection degree)
+- **Manage Campaigns** â€“ view details, toggle active/inactive, edit settings, or delete a campaign (all persisted to SQLite)
+- **Execute Campaign** â€“ run the Playwright automation with rate limiting
+- **Check Connections** â€“ monitor pending connection status
+- **Extract Profile Data** â€“ pull detailed profile information
+- **Settings** â€“ inspect credentials, browser, and rate-limit configuration
 ## Browser configuration
 
 - Defaults to Chrome via Playwright channel `chrome`.

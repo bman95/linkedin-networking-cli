@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Simple InquirerPy CLI demonstration"""
+"""LinkedIn Networking CLI - interactive menu-driven interface."""
 
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 from collections import namedtuple
 import asyncio
 import sys
@@ -105,10 +104,6 @@ class LinkedInCLI:
                     Choice(
                         value="settings", name="🔧 Settings - Configure application"
                     ),
-                    Choice(
-                        value="file_editor",
-                        name="📝 File Editor Demo - Edit files with syntax highlighting",
-                    ),
                     Separator(),
                     Choice(value="exit", name="❌ Exit"),
                 ],
@@ -129,8 +124,6 @@ class LinkedInCLI:
                 self.extract_profile_data()
             elif choice == "settings":
                 self.show_settings()
-            elif choice == "file_editor":
-                self.file_editor_demo()
             elif choice == "exit":
                 self.console.print("[yellow]Goodbye! 👋[/yellow]")
                 break
@@ -382,27 +375,126 @@ class LinkedInCLI:
         if action == "view":
             self.view_campaign_details(selected)
         elif action == "toggle":
-            new_status = "activated" if not selected.active else "deactivated"
-            self.console.print(
-                f"[green]✅ Campaign '{selected.name}' {new_status}![/green]"
-            )
-            self.console.print("[blue]💡 In real app: Would update database[/blue]")
+            self.toggle_campaign(selected)
         elif action == "edit":
-            self.console.print(f"[blue]📝 Editing '{selected.name}'...[/blue]")
-            self.console.print("[blue]💡 In real app: Would show edit form[/blue]")
+            self.edit_campaign(selected)
         elif action == "delete":
-            confirm = inquirer.confirm(
-                message=f"⚠️  Are you sure you want to delete '{selected.name}'?",
-                default=False,
-            ).execute()
-            if confirm:
-                self.console.print(f"[red]🗑️ Campaign '{selected.name}' deleted.[/red]")
-                self.console.print(
-                    "[blue]💡 In real app: Would delete from database[/blue]"
-                )
+            self.delete_campaign(selected)
 
         if action != "back":
             inquirer.confirm(message="Press Enter to continue...").execute()
+
+    def toggle_campaign(self, campaign):
+        """Toggle a campaign's active/inactive status in the database."""
+        new_active = not campaign.active
+        new_status = "activated" if new_active else "deactivated"
+
+        if not self.db_manager:
+            self.console.print(
+                f"[green]✅ Campaign '{campaign.name}' {new_status}![/green]"
+            )
+            self.console.print("[blue]💡 Demo mode: Would update database[/blue]")
+            return
+
+        try:
+            updated = self.db_manager.update_campaign(campaign.id, {"active": new_active})
+            if updated:
+                self.console.print(
+                    f"[green]✅ Campaign '{campaign.name}' {new_status}![/green]"
+                )
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error updating campaign: {e}[/red]")
+
+    def edit_campaign(self, campaign):
+        """Edit an existing campaign's settings and persist the changes."""
+        self.console.print(f"[bold cyan]📝 Editing '{campaign.name}'[/bold cyan]\n")
+        self.console.print("[dim]Press Enter to keep the current value.[/dim]\n")
+
+        name = inquirer.text(
+            message="Campaign name:",
+            default=campaign.name or "",
+            validate=lambda x: len(x.strip()) > 0 or "Campaign name cannot be empty",
+        ).execute()
+
+        description = inquirer.text(
+            message="Description:",
+            default=self._campaign_get_field(campaign, "description", "") or "",
+        ).execute()
+
+        daily_limit = inquirer.number(
+            message="Daily connection limit:",
+            min_allowed=1,
+            max_allowed=100,
+            default=campaign.daily_limit,
+        ).execute()
+
+        message_template = inquirer.text(
+            message="Connection message template:",
+            default=self._campaign_get_field(
+                campaign, "message_template", "Hi {name}, I'd like to connect with you!"
+            ),
+            validate=lambda x: "{name}" in x
+            or "Message must contain {name} placeholder",
+        ).execute()
+
+        updates = {
+            "name": name.strip(),
+            "description": description.strip() or None,
+            "daily_limit": int(daily_limit),
+            "message_template": message_template,
+        }
+
+        if not self.db_manager:
+            self.console.print("[green]✅ Campaign updated![/green]")
+            self.console.print("[blue]💡 Demo mode: Would save to database[/blue]")
+            return
+
+        try:
+            updated = self.db_manager.update_campaign(campaign.id, updates)
+            if updated:
+                self.console.print(
+                    f"[green]✅ Campaign '{updated.name}' updated successfully![/green]"
+                )
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error updating campaign: {e}[/red]")
+
+    def delete_campaign(self, campaign):
+        """Delete a campaign (and its contacts) from the database."""
+        confirm = inquirer.confirm(
+            message=f"⚠️  Are you sure you want to delete '{campaign.name}'? "
+            "This also removes its contacts.",
+            default=False,
+        ).execute()
+
+        if not confirm:
+            self.console.print("[yellow]Deletion cancelled.[/yellow]")
+            return
+
+        if not self.db_manager:
+            self.console.print(f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]")
+            self.console.print("[blue]💡 Demo mode: Would delete from database[/blue]")
+            return
+
+        try:
+            deleted = self.db_manager.delete_campaign(campaign.id)
+            if deleted:
+                self.console.print(
+                    f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]"
+                )
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error deleting campaign: {e}[/red]")
 
     def view_campaign_details(self, campaign):
         """View detailed campaign information"""
@@ -650,61 +742,6 @@ class LinkedInCLI:
 
         if setting != "back":
             inquirer.confirm(message="Press Enter to continue...").execute()
-
-    def file_editor_demo(self):
-        """Demo file editor with syntax highlighting - recreating your original request"""
-        sample_code = '''def is_palindrome(text: str) -> bool:
-    """
-    Check if the given text is a palindrome.
-
-    Args:
-        text: The input string to check
-
-    Returns:
-        bool: True if the string is a palindrome, False otherwise
-    """
-    # Clean the text: convert to lowercase and keep only alphanumeric characters
-    cleaned_text = ''.join(char.lower() for char in text if char.isalnum())
-
-    # Check if the cleaned text reads the same forward and backward
-    return cleaned_text == cleaned_text[::-1]'''
-
-        # Display file content with syntax highlighting
-        syntax = Syntax(sample_code, "python", theme="monokai", line_numbers=True)
-
-        self.console.print(
-            Panel(syntax, title="📝 Edit file: palindrome.py", border_style="cyan")
-        )
-
-        # This recreates the interface from your original image
-        action = inquirer.select(
-            message="Do you want to make this edit to palindrome.py?",
-            choices=[
-                Choice(value="yes", name="1. Yes"),
-                Choice(
-                    value="yes_auto",
-                    name="2. Yes, and don't ask again this session (shift+tab)",
-                ),
-                Choice(
-                    value="no",
-                    name="3. No, and tell Claude what to do differently (esc)",
-                ),
-            ],
-        ).execute()
-
-        if action in ["yes", "yes_auto"]:
-            # Write the file
-            with open("palindrome.py", "w", encoding="utf-8") as f:
-                f.write(sample_code)
-
-            mode_text = " (auto-confirm enabled)" if action == "yes_auto" else ""
-            self.console.print(
-                f"[green]✅ File saved: palindrome.py{mode_text}[/green]"
-            )
-        else:
-            self.console.print("[yellow]Edit cancelled.[/yellow]")
-
-        inquirer.confirm(message="Press Enter to continue...").execute()
 
     def connection_checker(self):
         """Check pending connections using smart checker"""
