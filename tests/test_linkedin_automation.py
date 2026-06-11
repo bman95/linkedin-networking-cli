@@ -219,28 +219,18 @@ class TestLogin:
 
 @pytest.mark.unit
 class TestSearchLocation:
-    """Test location search via Voyager API."""
+    """Test location search via the search filter UI."""
 
     @pytest.mark.asyncio
     async def test_search_location_valid_query(self, mock_linkedin_automation):
         """Test searching for a location with valid query."""
-        # Mock response
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.json = AsyncMock(return_value={
-            "data": {
-                "elements": [
-                    {
-                        "targetUrn": "urn:li:fs_geo:90000084",
-                        "text": {"text": "San Francisco Bay Area"}
-                    }
-                ]
-            }
-        })
-
-        mock_linkedin_automation.page.request.get = AsyncMock(return_value=mock_response)
-
-        results = await mock_linkedin_automation.search_location("San Francisco")
+        with patch.object(
+            mock_linkedin_automation,
+            "_search_location_via_filter_ui",
+            new_callable=AsyncMock,
+            return_value=[{"name": "San Francisco Bay Area", "geoUrn": "90000084"}],
+        ):
+            results = await mock_linkedin_automation.search_location("San Francisco")
 
         assert len(results) == 1
         assert results[0]["name"] == "San Francisco Bay Area"
@@ -263,15 +253,15 @@ class TestSearchLocation:
             await automation.search_location("test")
 
     @pytest.mark.asyncio
-    async def test_search_location_api_error(self, mock_linkedin_automation):
-        """Test location search when API returns error."""
-        mock_response = AsyncMock()
-        mock_response.ok = False
-        mock_response.status = 404
-
-        mock_linkedin_automation.page.request.get = AsyncMock(return_value=mock_response)
-
-        results = await mock_linkedin_automation.search_location("test")
+    async def test_search_location_ui_error(self, mock_linkedin_automation):
+        """Test location search when driving the filter UI fails."""
+        with patch.object(
+            mock_linkedin_automation,
+            "_search_location_via_filter_ui",
+            new_callable=AsyncMock,
+            side_effect=Exception("UI structure changed"),
+        ):
+            results = await mock_linkedin_automation.search_location("test")
 
         assert results == []
 
@@ -422,6 +412,33 @@ class TestLinkedInProfile:
 
         # Dataclasses have __dataclass_fields__
         assert hasattr(LinkedInProfile, '__dataclass_fields__')
+
+
+# ============================================================================
+# Text Normalization Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestNormalize:
+    """Test the accent-insensitive text normalizer used for matching
+    profile names and the invitation-cooldown toast."""
+
+    def test_strips_accents(self):
+        # Accent stripping is what lets the cooldown toast ("invitación")
+        # match the plain marker ("invitacion").
+        assert LinkedInAutomation._normalize("invitación") == "invitacion"
+        assert LinkedInAutomation._normalize("Martí Altimira") == "marti altimira"
+
+    def test_casefolds_and_collapses_whitespace(self):
+        assert LinkedInAutomation._normalize("  Hello   WORLD  ") == "hello world"
+
+    def test_handles_none(self):
+        assert LinkedInAutomation._normalize(None) == ""
+
+    def test_name_substring_match_is_accent_insensitive(self):
+        name = LinkedInAutomation._normalize("Martí Altimira Cebrian")
+        aria = LinkedInAutomation._normalize("Invita a Martí Altimira Cebrian a conectar")
+        assert name in aria
 
 
 # ============================================================================

@@ -30,11 +30,21 @@ Automating interactions with LinkedIn may violate [LinkedIn's User Agreement and
    with `uv run python -m playwright install chromium` and set
    `PLAYWRIGHT_BROWSER_CHANNEL=chromium` (see [Browser configuration](#browser-configuration)).
 
-3. **Set your LinkedIn credentials** via environment variables:
-   ```bash
-   export LINKEDIN_EMAIL="your-linkedin-email@example.com"
-   export LINKEDIN_PASSWORD="your-password"
-   ```
+3. **Authenticate with LinkedIn** in one of two ways:
+
+   - **Automatic** – set your credentials via environment variables and the app
+     fills the login form for you:
+     ```bash
+     export LINKEDIN_EMAIL="your-linkedin-email@example.com"
+     export LINKEDIN_PASSWORD="your-password"
+     ```
+   - **Manual** – leave the variables unset. The first time you run a campaign a
+     Chrome window opens; sign in there yourself (including any 2FA / checkpoint
+     step). The app detects when you reach the feed and continues automatically.
+
+   Either way the session is saved to a persistent browser profile under
+   `~/.linkedin-networking-cli/browser_data/`, so **subsequent runs stay logged
+   in** and you won't need to authenticate again until the session expires.
 
 ## Usage
 
@@ -57,6 +67,12 @@ From the main menu you can:
 - **Check Connections** – monitor pending and accepted connection status.
 - **Extract Profile Data** – pull detailed profile information.
 - **Settings** – inspect credentials, browser, and rate-limit configuration.
+
+> **Note on connection messages:** LinkedIn restricts *personalized* invitation
+> notes to Premium accounts (free accounts get only a small monthly quota). When
+> a campaign defines a message template but a note can't be attached, the app
+> sends the invitation **without** a note so the connection request still goes
+> out. A campaign's message template is therefore best-effort, not guaranteed.
 
 ## Browser configuration
 

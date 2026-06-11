@@ -2,6 +2,7 @@ import asyncio
 import random
 import subprocess
 import time
+import unicodedata
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
+from automation.interactions import random_wait, _is_true_limit
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -268,23 +270,27 @@ class LinkedInAutomation:
                 if await detect_captcha(self.page):
                     raise CaptchaDetectedException("CAPTCHA challenge detected after login submission")
 
-                # Wait for login success
+                # Wait for login success (2FA may add a checkpoint step)
                 if progress_callback:
                     progress_callback("Waiting for login confirmation...")
 
-                await self.page.wait_for_selector(
-                    "img.global-nav__me-photo", timeout=30000
-                )
+                await self._wait_for_login_redirect(timeout_ms=60_000)
             else:
+                # Manual login needs a visible browser window.
+                if self.settings.get_browser_settings().get("headless"):
+                    raise LoginFailedException(
+                        "No credentials configured and the browser is headless, so "
+                        "manual login is impossible. Set LINKEDIN_EMAIL and "
+                        "LINKEDIN_PASSWORD, or run with HEADLESS=0."
+                    )
+
                 if progress_callback:
                     progress_callback(
                         "No credentials configured. Complete the login manually in the Chrome window."
                     )
 
                 try:
-                    await self.page.wait_for_selector(
-                        "img.global-nav__me-photo", timeout=300000
-                    )
+                    await self._wait_for_login_redirect(timeout_ms=600_000)
                 except Exception as wait_error:
                     logger.error(f"Manual login timed out: {wait_error}")
                     if progress_callback:
@@ -312,6 +318,20 @@ class LinkedInAutomation:
                 progress_callback(f"Login failed: {str(e)}")
             raise LoginFailedException(f"Login failed: {str(e)}")
 
+    async def _wait_for_login_redirect(self, timeout_ms: int) -> None:
+        """Wait until the page leaves the login/checkpoint flow.
+
+        URL-based detection survives LinkedIn UI redesigns better than
+        waiting for a specific nav element.
+        """
+        def logged_in(url) -> bool:
+            value = str(url)
+            return not any(
+                part in value for part in ("/login", "/uas/", "/checkpoint/")
+            )
+
+        await self.page.wait_for_url(logged_in, timeout=timeout_ms)
+
     async def search_profiles(
         self,
         campaign: Campaign,
@@ -334,15 +354,17 @@ class LinkedInAutomation:
                 progress_callback("Starting profile search...")
 
             await self.page.goto(search_url, timeout=30000)
+            # Legacy UI exposes .search-results-container; the SDUI rollout
+            # (2026) only renders profile links inside <main>.
             try:
                 await self.page.wait_for_selector(
-                    ".search-results-container", timeout=10000
+                    ".search-results-container, main a[href*='/in/']", timeout=15000
                 )
             except TimeoutError:
                 raise SelectorNotFoundException(
-                    "Search results container not found - LinkedIn page structure may have changed",
-                    selector=".search-results-container",
-                    timeout=10000
+                    "Search results not found - LinkedIn page structure may have changed",
+                    selector=".search-results-container, main a[href*='/in/']",
+                    timeout=15000
                 )
 
             page_count = 0
@@ -356,39 +378,55 @@ class LinkedInAutomation:
                         f"Scanning page {page_count}... Found {len(profiles)} profiles"
                     )
 
-                # Wait for profiles to load (use data-chameleon-result-urn attribute)
+                # Wait for profiles to load (legacy attribute or SDUI links)
                 try:
                     await self.page.wait_for_selector(
-                        "[data-chameleon-result-urn]", timeout=10000
+                        "[data-chameleon-result-urn], main a[href*='/in/']",
+                        timeout=10000,
                     )
                 except TimeoutError:
                     raise SelectorNotFoundException(
                         "Profile elements not found on search results page",
-                        selector="[data-chameleon-result-urn]",
+                        selector="[data-chameleon-result-urn], main a[href*='/in/']",
                         timeout=10000
                     )
 
-                # Extract profile information
+                # Legacy UI: structured result elements with a stable attribute
                 profile_elements = await self.page.query_selector_all(
                     "[data-chameleon-result-urn]"
                 )
 
-                for element in profile_elements:
-                    try:
-                        profile = await self._extract_profile_info(element)
-                        if profile and len(profiles) < limit:
+                if profile_elements:
+                    for element in profile_elements:
+                        try:
+                            profile = await self._extract_profile_info(element)
+                            if profile and len(profiles) < limit:
+                                profiles.append(profile)
+                        except Exception as e:
+                            logger.warning(f"Failed to extract profile info: {e}")
+                            continue
+                else:
+                    # SDUI layout (2026): extract result cards in one JS pass
+                    seen_urls = {p.profile_url for p in profiles}
+                    for profile in await self._extract_profiles_new_ui():
+                        if len(profiles) >= limit:
+                            break
+                        if profile.profile_url not in seen_urls:
                             profiles.append(profile)
-                    except Exception as e:
-                        logger.warning(f"Failed to extract profile info: {e}")
-                        continue
+                            seen_urls.add(profile.profile_url)
 
-                # Check for next page
+                # Check for next page (EN/ES aria-labels, then SDUI text button)
                 next_button = await self.page.query_selector(
-                    "button[aria-label='Next']"
+                    "button[aria-label='Next'], button[aria-label='Siguiente']"
                 )
+                if not next_button:
+                    next_button = await self.page.query_selector(
+                        "main button:has-text('Siguiente'), main button:has-text('Next')"
+                    )
                 if next_button and not await next_button.is_disabled():
+                    await next_button.scroll_into_view_if_needed()
                     await next_button.click()
-                    await self.page.wait_for_timeout(2000)  # Wait for page load
+                    await self.page.wait_for_timeout(3000)  # Wait for page load
                 else:
                     break
 
@@ -414,7 +452,7 @@ class LinkedInAutomation:
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
-        from .interactions import detect_captcha, random_wait, _is_true_limit
+        from .interactions import detect_captcha
 
         automation_settings = self.settings.get_automation_settings()
         sent_count = 0
@@ -461,22 +499,31 @@ class LinkedInAutomation:
                         )
                     break
 
-                # Locate the profile actions container. Prefer the sticky
-                # header variant; fall back to the top card, then to <main>.
-                sel_container = None
-                for container_selector in (
-                    "div.pvs-sticky-header-profile-actions",
-                    "main .ph5",
-                    "main",
-                ):
-                    sel_container = await self.page.query_selector(container_selector)
-                    if sel_container:
-                        break
+                # Find the Connect / Pending control for THIS profile.
+                connect_button, control_kind = await self._find_connect_control(profile)
 
-                if not sel_container:
-                    logger.warning(
-                        f"Profile actions container not found for {profile.name} - "
-                        "profile may be private or inaccessible"
+                if control_kind == "pending":
+                    logger.info(f"Pending invitation already exists for {profile.name}")
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "pending",
+                        "notes": "Already sent (found Pending button)",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    existing_count += 1
+                    if progress_callback:
+                        progress_callback(f"⚠️ Already pending for {profile.name}")
+                    continue
+
+                if control_kind != "connect" or not connect_button:
+                    logger.info(
+                        f"No 'Connect' button for {profile.name} - already connected, "
+                        "follow-only, or restricted profile"
                     )
                     contact_data = {
                         "campaign_id": campaign.id,
@@ -486,167 +533,40 @@ class LinkedInAutomation:
                         "location": profile.location,
                         "company": profile.company,
                         "status": "found",
-                        "notes": "Profile not accessible or private",
+                        "notes": "No connect button available - likely already connected",
                     }
                     self.db_manager.create_contact(contact_data)
                     failed_count += 1
+                    if progress_callback:
+                        progress_callback(f"⚠️ No Connect button for {profile.name}")
                     continue
 
-                # Strategy: try the directly-visible Connect button first,
-                # then fall back to the "More actions" dropdown.
-                connect_button = None
-                direct_selectors = [
-                    "button:has(span.artdeco-button__text:has-text('Conectar'))",
-                    "button:has(span.artdeco-button__text:has-text('Connect'))",
-                ]
-                for selector in direct_selectors:
-                    connect_button = await sel_container.query_selector(selector)
-                    if connect_button:
-                        try:
-                            if await connect_button.is_visible():
-                                logger.info(
-                                    f"Found Connect button directly visible using selector: {selector}"
-                                )
-                                break
-                            logger.debug(f"Connect button found but not visible: {selector}")
-                            connect_button = None
-                        except Exception:
-                            connect_button = None
-
-                if not connect_button:
-                    logger.info(
-                        "Connect button not visible directly, looking for 'More actions' dropdown"
-                    )
-                    mas_btn = await sel_container.query_selector(
-                        "button[aria-label='Más acciones']"
-                    )
-                    if not mas_btn:
-                        mas_btn = await sel_container.query_selector(
-                            "button[aria-label='More actions']"
-                        )
-
-                    if mas_btn:
-                        # Scroll button into view and check if visible
-                        try:
-                            await mas_btn.scroll_into_view_if_needed()
-                            await self.page.wait_for_timeout(500)
-                            if not await mas_btn.is_visible():
-                                logger.warning(
-                                    f"More button found but not visible for {profile.name}"
-                                )
-                                mas_btn = None
-                        except Exception as e:
-                            logger.warning(f"Could not scroll to or verify More button: {e}")
-                            mas_btn = None
-
-                    if mas_btn:
-                        logger.info("Clicking 'More' button to reveal connection options")
-                        await mas_btn.click()
-
-                        try:
-                            await self.page.wait_for_selector(
-                                "div.artdeco-dropdown__content-inner",
-                                timeout=5000,
-                                state="visible",
-                            )
-                        except Exception as e:
-                            logger.warning(f"Dropdown didn't appear after clicking More: {e}")
-
-                        await random_wait(self.page, min_ms=1000, max_ms=2000)
-
-                        dropdown_selectors = [
-                            'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Conectar")',
-                            'div.artdeco-dropdown__content-inner div.artdeco-dropdown__item:has-text("Connect")',
-                            'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Conectar")',
-                            'div.artdeco-dropdown__content-inner div[role="button"]:has-text("Connect")',
-                            'div[aria-label*="Invita"][aria-label*="conectar"]',
-                            'div[aria-label*="Invite"][aria-label*="connect"]',
-                        ]
-                        for selector in dropdown_selectors:
-                            connect_button = await self.page.query_selector(selector)
-                            if connect_button:
-                                try:
-                                    if await connect_button.is_visible():
-                                        logger.info(
-                                            f"Found Connect button in dropdown using selector: {selector}"
-                                        )
-                                        break
-                                    logger.debug(
-                                        f"Connect button found but not visible: {selector}"
-                                    )
-                                    connect_button = None
-                                except Exception:
-                                    connect_button = None
-                    else:
-                        logger.debug("'More' button not found or not visible")
-
-                if not connect_button:
-                    # Check if an invitation is already pending
-                    pending_btn = await self.page.query_selector(
-                        "main button:has(span.artdeco-button__text:has-text('Pendiente'))"
-                    )
-                    if not pending_btn:
-                        pending_btn = await self.page.query_selector(
-                            "main button:has(span.artdeco-button__text:has-text('Pending'))"
-                        )
-
-                    if pending_btn:
-                        logger.info(f"Pending invitation already exists for {profile.name}")
-                        contact_data = {
-                            "campaign_id": campaign.id,
-                            "name": profile.name,
-                            "profile_url": profile.profile_url,
-                            "headline": profile.headline,
-                            "location": profile.location,
-                            "company": profile.company,
-                            "status": "pending",
-                            "notes": "Already sent (found Pending button)",
-                        }
-                        self.db_manager.create_contact(contact_data)
-                        existing_count += 1
-                        if progress_callback:
-                            progress_callback(f"⚠️ Already pending for {profile.name}")
-                    else:
-                        logger.info(
-                            f"No 'Connect' or 'Pending' button found for {profile.name}, "
-                            "probably already connected"
-                        )
-                        contact_data = {
-                            "campaign_id": campaign.id,
-                            "name": profile.name,
-                            "profile_url": profile.profile_url,
-                            "headline": profile.headline,
-                            "location": profile.location,
-                            "company": profile.company,
-                            "status": "found",
-                            "notes": "No connect button available - likely already connected",
-                        }
-                        self.db_manager.create_contact(contact_data)
-                        failed_count += 1
-                        if progress_callback:
-                            progress_callback(f"⚠️ No Connect button for {profile.name}")
-                    continue
-
-                # Click Connect button
+                # Click Connect. The top-card control is already in view at
+                # scroll-top, so a real Playwright click reaches it and the
+                # SDUI opens the invitation modal (a JS click is a last resort
+                # for the rare case the control is still occluded).
                 logger.info("Clicking 'Connect' button")
-                await connect_button.click()
-                await random_wait(self.page, min_ms=3000, max_ms=4500)
+                try:
+                    await connect_button.click(timeout=5000)
+                except Exception as click_error:
+                    logger.info(f"Normal click intercepted ({click_error}); using JS click")
+                    await connect_button.evaluate("el => el.click()")
+                await random_wait(self.page, min_ms=2500, max_ms=4000)
 
-                # Check if email is required
+                # Check if email is required to connect (dismiss and skip)
                 email_label = await self.page.query_selector('label[for="email"]')
                 if email_label:
                     logger.info(
                         f"Email request modal detected for {profile.name}. Dismissing..."
                     )
-                    dismiss_btn = await self.page.query_selector(
-                        'button[aria-label="Descartar"]'
-                    )
-                    if not dismiss_btn:
-                        dismiss_btn = await self.page.query_selector(
-                            'button[aria-label="Dismiss"]'
-                        )
-                    if dismiss_btn:
-                        await dismiss_btn.click()
+                    for dismiss_sel in (
+                        'button[aria-label="Descartar"]',
+                        'button[aria-label="Dismiss"]',
+                    ):
+                        dismiss_btn = await self.page.query_selector(dismiss_sel)
+                        if dismiss_btn:
+                            await dismiss_btn.click()
+                            break
 
                     contact_data = {
                         "campaign_id": campaign.id,
@@ -665,62 +585,41 @@ class LinkedInAutomation:
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
 
-                # Handle message modal
-                send_button = None
-                if campaign.message_template and campaign.message_template.strip():
-                    # Try to add a note
-                    add_note_btn = await self.page.query_selector(
-                        "button:has(span.artdeco-button__text:has-text('Añadir una nota'))"
+                # The invitation modal renders a moment after the click and is
+                # not a standard <dialog>, so locate its buttons by text and
+                # poll until they appear. ":text-is" matches the exact label so
+                # "Enviar" never collides with "Enviar sin nota" / "Enviar mensaje".
+                note_loc = self.page.locator(
+                    "button:has-text('Añadir una nota'), button:has-text('Add a note')"
+                ).first
+                send_no_note_loc = self.page.locator(
+                    "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
+                ).first
+                send_exact_loc = self.page.locator(
+                    "button:text-is('Enviar'), button:text-is('Send')"
+                ).first
+
+                blocked = False
+                modal_ready = False
+                for _ in range(8):
+                    # LinkedIn blocks re-inviting for 3 weeks after a withdrawal;
+                    # clicking Connect then shows an error toast and no modal.
+                    if await self._invitation_blocked_toast():
+                        blocked = True
+                        break
+                    if (
+                        await note_loc.count()
+                        or await send_no_note_loc.count()
+                        or await send_exact_loc.count()
+                    ):
+                        modal_ready = True
+                        break
+                    await self.page.wait_for_timeout(1000)
+
+                if blocked:
+                    logger.info(
+                        f"Invitation to {profile.name} blocked (recently withdrawn / cooldown)"
                     )
-                    if not add_note_btn:
-                        add_note_btn = await self.page.query_selector(
-                            "button:has(span.artdeco-button__text:has-text('Add a note'))"
-                        )
-
-                    if add_note_btn:
-                        logger.info("Clicking 'Add a note' button")
-                        await add_note_btn.click()
-                        await random_wait(self.page, min_ms=1000, max_ms=1500)
-
-                        try:
-                            await self.page.wait_for_selector("textarea", timeout=5000)
-                            first_name = profile.name.split()[0]
-                            logger.info("Writing personalized message")
-                            message = campaign.message_template.format(
-                                name=first_name.lower().title()
-                            )
-                            await self.page.fill("textarea", message)
-                            await random_wait(self.page, min_ms=1000, max_ms=1500)
-                        except Exception as msg_error:
-                            logger.warning(f"Failed to add note: {msg_error}")
-
-                    send_button = await self.page.query_selector(
-                        "button:has-text('Enviar')"
-                    )
-                    if not send_button:
-                        send_button = await self.page.query_selector(
-                            "button:has-text('Send')"
-                        )
-                else:
-                    # Send without note
-                    send_button = await self.page.query_selector(
-                        "button:has(span.artdeco-button__text:has-text('Enviar sin nota'))"
-                    )
-                    if not send_button:
-                        send_button = await self.page.query_selector(
-                            "button:has(span.artdeco-button__text:has-text('Send without a note'))"
-                        )
-                    if not send_button:
-                        send_button = await self.page.query_selector(
-                            "button:has-text('Enviar')"
-                        )
-                    if not send_button:
-                        send_button = await self.page.query_selector(
-                            "button:has-text('Send')"
-                        )
-
-                if not send_button:
-                    logger.warning(f"Send button not found for {profile.name}")
                     contact_data = {
                         "campaign_id": campaign.id,
                         "name": profile.name,
@@ -729,57 +628,81 @@ class LinkedInAutomation:
                         "location": profile.location,
                         "company": profile.company,
                         "status": "found",
-                        "notes": "Send button not found after clicking Connect",
+                        "notes": "Invitation blocked (recently withdrawn / 3-week cooldown)",
                     }
                     self.db_manager.create_contact(contact_data)
                     failed_count += 1
                     if progress_callback:
-                        progress_callback(f"❌ Send button not found for {profile.name}")
+                        progress_callback(f"⚠️ Invitation blocked for {profile.name} (cooldown)")
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
 
-                # Click Send button
-                logger.info("Clicking 'Send' button")
-                await send_button.click()
+                if not modal_ready:
+                    logger.warning(f"Invitation modal did not appear for {profile.name}")
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "Invitation modal did not appear after clicking Connect",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    failed_count += 1
+                    if progress_callback:
+                        progress_callback(f"❌ Invitation modal not found for {profile.name}")
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    continue
+
+                # Send without a personalized note. LinkedIn gates custom notes
+                # behind Premium (and a small free quota); attempting "Add a note"
+                # leads to an upsell with no note field, so "Send without a note"
+                # is the reliable path that always delivers the invitation.
+                if campaign.message_template and campaign.message_template.strip():
+                    logger.info(
+                        "Campaign has a message template, but custom notes require "
+                        "LinkedIn Premium; sending without a note"
+                    )
+
+                send_no_note = self.page.locator(
+                    "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
+                ).first
+                send_exact = self.page.locator(
+                    "button:text-is('Enviar'), button:text-is('Send')"
+                ).first
+                send_target = send_no_note if await send_no_note.count() else send_exact
+
+                logger.info("Clicking 'Send without a note' button")
+                try:
+                    await send_target.click(timeout=5000)
+                except Exception as send_error:
+                    logger.warning(f"Send click failed for {profile.name}: {send_error}")
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "Send button not clickable after clicking Connect",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    failed_count += 1
+                    if progress_callback:
+                        progress_callback(f"❌ Send button not clickable for {profile.name}")
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    continue
                 await random_wait(self.page, min_ms=2000, max_ms=3000)
 
-                # Check for invitation limit modal, distinguishing the real
-                # weekly limit from the "near limit" warning.
-                modal = await self.page.query_selector(
-                    "div.artdeco-modal.ip-fuse-limit-alert"
-                )
-                if modal:
-                    if await _is_true_limit(modal):
-                        logger.warning(
-                            f"Weekly invitation limit reached. Connection not sent to {profile.name}"
-                        )
-                        try:
-                            close_btn = await modal.query_selector(
-                                "button.ip-fuse-limit-alert__primary-action"
-                            )
-                            if close_btn:
-                                logger.info("Closing limit reached modal")
-                                await close_btn.click()
-                                await random_wait(self.page, min_ms=1000, max_ms=2000)
-                        except Exception:
-                            logger.debug("Could not close limit modal (non-blocking)")
-
-                        if progress_callback:
-                            progress_callback("❌ LinkedIn weekly invitation limit reached!")
-                        break
-                    else:
-                        logger.info(
-                            f"'Near limit' warning for {profile.name}. Closing modal and continuing."
-                        )
-                        try:
-                            close_btn = await modal.query_selector(
-                                "button.ip-fuse-limit-alert__primary-action"
-                            )
-                            if close_btn:
-                                await close_btn.click()
-                                await random_wait(self.page, min_ms=1000, max_ms=2000)
-                        except Exception:
-                            logger.debug("Could not close warning modal (non-blocking)")
+                # Check for the weekly invitation limit, distinguishing the real
+                # limit from the "near limit" warning.
+                if await self._handle_invitation_limit_modal(profile):
+                    if progress_callback:
+                        progress_callback("❌ LinkedIn weekly invitation limit reached!")
+                    break
 
                 # Success - connection sent
                 contact_data = {
@@ -893,16 +816,20 @@ class LinkedInAutomation:
 
     async def search_location(self, query: str) -> List[Dict[str, str]]:
         """
-        Search for locations using LinkedIn Voyager API typeahead
+        Search for LinkedIn location geoUrn codes.
+
+        LinkedIn removed the public Voyager typeahead REST endpoint, so this
+        drives the people-search "Locations" filter UI and captures the
+        geoUrn each suggestion resolves to from the results page URL.
 
         Args:
-            query: Location search query (e.g., "San Francisco", "London", "Tokyo")
+            query: Location search query (e.g., "San Francisco", "Madrid")
 
         Returns:
             List of dicts with keys: 'name' (display name) and 'geoUrn' (code)
 
         Raises:
-            Exception: If not authenticated or request fails
+            NotAuthenticatedException: If not authenticated
         """
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
@@ -910,57 +837,287 @@ class LinkedInAutomation:
         if not query or not query.strip():
             return []
 
+        logger.info(f"Searching location: {query}")
         try:
-            # Build Voyager API typeahead URL
-            query_encoded = urllib.parse.quote(query.strip())
-            url = (
-                f"{self.BASE_URL}/voyager/api/typeahead/hitsV2"
-                f"?keywords={query_encoded}"
-                "&origin=OTHER"
-                "&q=type"
-                "&queryContext=List(geoVersion->3,bingGeoSubTypeFilters->MARKET_AREA|COUNTRY_REGION|ADMIN_DIVISION_1|CITY)"
-                "&type=GEO"
-            )
-
-            logger.info(f"Searching location: {query}")
-
-            # Make request using Playwright's page context (uses existing cookies/auth)
-            response = await self.page.request.get(url)
-
-            if not response.ok:
-                logger.warning(f"Location search failed with status: {response.status}")
-                return []
-
-            data = await response.json()
-
-            # Parse results
-            results = []
-            elements = data.get("data", {}).get("elements", [])
-
-            for element in elements:
-                # Extract geoUrn from targetUrn (format: "urn:li:fs_geo:90000084")
-                target_urn = element.get("targetUrn", "")
-                if ":" in target_urn:
-                    geo_urn = target_urn.split(":")[-1]
-                else:
-                    geo_urn = target_urn
-
-                # Extract display name
-                text_obj = element.get("text", {})
-                name = text_obj.get("text", "") if isinstance(text_obj, dict) else str(text_obj)
-
-                if name and geo_urn:
-                    results.append({
-                        "name": name.strip(),
-                        "geoUrn": geo_urn.strip()
-                    })
-
+            results = await self._search_location_via_filter_ui(query.strip())
             logger.info(f"Found {len(results)} locations for '{query}'")
             return results
-
         except Exception as e:
             logger.error(f"Error searching location: {e}")
             return []
+
+    async def _search_location_via_filter_ui(
+        self, query: str, max_options: int = 5
+    ) -> List[Dict[str, str]]:
+        """Resolve location names to geoUrn codes by driving the search filter UI.
+
+        Each suggestion is clicked and applied so its geoUrn appears in the
+        results URL, then the page is reset for the next suggestion.
+        """
+        base_url = f"{self.SEARCH_URL}?origin=FACETED_SEARCH"
+        results: List[Dict[str, str]] = []
+        total_options: Optional[int] = None
+        index = 0
+
+        while total_options is None or index < total_options:
+            await self.page.goto(base_url, timeout=30000)
+            await self.page.wait_for_timeout(3000)
+
+            # Open the Locations filter pill (ES/EN)
+            pill = self.page.locator("text=/^Ubicaciones$|^Locations$/").first
+            await pill.click(timeout=10000)
+            await self.page.wait_for_timeout(1500)
+
+            # The typeahead input renders inside the dropdown
+            box = self.page.locator("input:visible").last
+            await box.click(timeout=5000)
+            await box.type(query, delay=120)
+
+            options = self.page.locator("[role='option']")
+            await options.first.wait_for(state="visible", timeout=10000)
+            await self.page.wait_for_timeout(1500)  # let the list settle
+
+            if total_options is None:
+                total_options = min(await options.count(), max_options)
+                logger.info(
+                    f"Found {total_options} location suggestions for '{query}'"
+                )
+
+            option = options.nth(index)
+            name = (await option.inner_text()).strip().splitlines()[0]
+            await option.click(timeout=5000)
+            await self.page.wait_for_timeout(1500)  # let the checkbox register
+
+            # Apply the filter so the geoUrn shows up in the URL. The control
+            # is an <a> ("Mostrar resultados" / "Show results") in the SDUI
+            # filter dropdown, with a button fallback for older variants.
+            apply_control = self.page.locator(
+                "a:has-text('Mostrar resultados'), a:has-text('Show results'), "
+                "button:has-text('Mostrar resultados'), button:has-text('Show results')"
+            ).first
+            try:
+                await apply_control.click(timeout=5000)
+            except Exception as apply_error:
+                logger.debug(f"Apply button click failed: {apply_error}")
+
+            try:
+                await self.page.wait_for_url(
+                    lambda url: "geourn" in str(url).lower(), timeout=15000
+                )
+            except Exception:
+                logger.warning(
+                    f"No geoUrn in URL after selecting '{name}'; skipping suggestion"
+                )
+                index += 1
+                continue
+            geo_param = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.page.url).query
+            ).get("geoUrn", [""])[0]
+            geo_urn = "".join(ch for ch in geo_param if ch.isdigit())
+
+            if name and geo_urn:
+                results.append({"name": name, "geoUrn": geo_urn})
+            index += 1
+
+        return results
+
+    async def _extract_profiles_new_ui(self) -> List[LinkedInProfile]:
+        """Extract search results from LinkedIn's SDUI search layout (2026).
+
+        The new layout uses obfuscated class names, so result cards are
+        located via the stable ``SearchResults_FirstResult_people``
+        componentkey and parsed from their visible text in one JS pass.
+        """
+        raw = await self.page.evaluate(
+            """
+            () => {
+                const first = document.querySelector(
+                    '[componentkey="SearchResults_FirstResult_people"]'
+                );
+                let cards = [];
+                if (first && first.parentElement) {
+                    cards = [...first.parentElement.children];
+                } else {
+                    cards = [...document.querySelectorAll('main [componentkey]')];
+                }
+                const results = [];
+                const seen = new Set();
+                for (const card of cards) {
+                    const link = card.querySelector("a[href*='/in/']");
+                    if (!link) continue;
+                    const href = link.href.split('?')[0];
+                    if (seen.has(href)) continue;
+                    const lines = (card.innerText || '')
+                        .split('\\n').map(s => s.trim()).filter(Boolean);
+                    if (!lines.length) continue;
+                    seen.add(href);
+                    results.push({href, lines: lines.slice(0, 8)});
+                }
+                return results;
+            }
+            """
+        )
+        if not isinstance(raw, list):
+            return []
+
+        action_words = {
+            "conectar", "connect", "seguir", "follow",
+            "mensaje", "message", "pendiente", "pending",
+        }
+        profiles = []
+        for item in raw:
+            lines = item.get("lines") or []
+            if not lines:
+                continue
+            # First line is "Name • 2º" (degree marker after the bullet)
+            name = lines[0].split("•")[0].strip()
+            if not name:
+                continue
+            rest = [l for l in lines[1:] if l.lower() not in action_words]
+            profiles.append(
+                LinkedInProfile(
+                    name=name,
+                    profile_url=item["href"],
+                    headline=rest[0] if rest else None,
+                    location=rest[1] if len(rest) > 1 else None,
+                )
+            )
+        return profiles
+
+    @staticmethod
+    def _normalize(text: Optional[str]) -> str:
+        """Casefold, strip accents, and collapse whitespace for comparison."""
+        decomposed = unicodedata.normalize("NFKD", text or "")
+        no_marks = "".join(c for c in decomposed if not unicodedata.combining(c))
+        return " ".join(no_marks.casefold().split())
+
+    async def _find_connect_control(self, profile: "LinkedInProfile"):
+        """Find the Connect/Pending control for THIS profile (SDUI layout, 2026).
+
+        Both the top-card action button and the scroll-activated sticky header
+        carry the person's name in their ``aria-label`` (e.g. "Invita a
+        {Name} a conectar"), which disambiguates the real action from the
+        "People also viewed" sidebar that is full of other Connect buttons.
+
+        Returns ``(handle, kind)`` where kind is 'connect', 'pending' or 'none'.
+        """
+        name_norm = self._normalize(profile.name)
+        if not name_norm:
+            return None, "none"
+
+        # The profile's own primary action is an <a>, while the "People also
+        # viewed" sidebar uses <button>; query both (plus role=button). When
+        # the same control exists in both the top card and the scroll-only
+        # sticky header, prefer the lower one (the top card), which is never
+        # overlapped by the floating "Probar Premium" promo.
+        async def match(keywords) -> Optional[Any]:
+            controls = await self.page.query_selector_all(
+                "a[aria-label], button[aria-label], [role='button'][aria-label]"
+            )
+            best = None
+            best_y = -1.0
+            for ctrl in controls:
+                aria = self._normalize(await ctrl.get_attribute("aria-label"))
+                if name_norm in aria and any(k in aria for k in keywords):
+                    try:
+                        if not await ctrl.is_visible():
+                            continue
+                        box = await ctrl.bounding_box()
+                        y = box["y"] if box else 0.0
+                        if y > best_y:
+                            best, best_y = ctrl, y
+                    except Exception:
+                        continue
+            return best
+
+        # Stay at the top of the page so the top-card action (visible in a
+        # 1080px viewport) is used, with no sticky header / promo overlapping.
+        try:
+            await self.page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception:
+            pass
+
+        # SDUI action controls render shortly after load, so poll a few times.
+        for _ in range(5):
+            connect = await match(("conectar", "connect"))
+            if connect:
+                return connect, "connect"
+            pending = await match(("pendiente", "pending"))
+            if pending:
+                return pending, "pending"
+            await self.page.wait_for_timeout(1000)
+
+        return None, "none"
+
+    async def _invitation_blocked_toast(self) -> bool:
+        """Detect the error toast shown when an invitation can't be sent.
+
+        Covers LinkedIn's 3-week post-withdrawal cooldown and similar "not
+        sent" errors, in Spanish and English.
+        """
+        try:
+            text = await self.page.evaluate(
+                """
+                () => {
+                  const sel = "[role='alert'], [class*='toast' i], [class*='snackbar' i]";
+                  for (const e of document.querySelectorAll(sel)) {
+                    const t = (e.innerText || '').trim();
+                    if (t) return t;
+                  }
+                  return '';
+                }
+                """
+            )
+        except Exception:
+            return False
+
+        t = self._normalize(text)
+        markers = (
+            "no se ha enviado la invitacion",
+            "3 semanas despues de retirarla",
+            "couldn't send",
+            "could not send",
+            "weeks after you withdraw",
+        )
+        return any(m in t for m in markers)
+
+    async def _handle_invitation_limit_modal(self, profile: "LinkedInProfile") -> bool:
+        """Detect and dismiss the weekly invitation-limit modal.
+
+        Returns True only when the real weekly limit was hit (caller should
+        stop). A "near limit" warning is dismissed and returns False.
+        """
+        modal = await self.page.query_selector(
+            "div.artdeco-modal.ip-fuse-limit-alert, "
+            "[data-test-modal-id='ip-fuse-limit-alert'], "
+            "dialog:has-text('límite semanal'), dialog:has-text('weekly invitation limit')"
+        )
+        if not modal:
+            return False
+
+        is_true = await _is_true_limit(modal)
+        log_msg = (
+            f"Weekly invitation limit reached; not sent to {profile.name}"
+            if is_true
+            else f"'Near limit' warning for {profile.name}; continuing"
+        )
+        logger.warning(log_msg) if is_true else logger.info(log_msg)
+
+        for close_sel in (
+            "button.ip-fuse-limit-alert__primary-action",
+            "button[aria-label='Descartar']",
+            "button[aria-label='Dismiss']",
+        ):
+            try:
+                close_btn = await modal.query_selector(close_sel)
+                if close_btn and await close_btn.is_visible():
+                    await close_btn.click()
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    break
+            except Exception:
+                continue
+
+        return is_true
 
     async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
         """Extract profile information from search result element"""
