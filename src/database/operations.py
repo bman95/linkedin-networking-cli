@@ -193,6 +193,7 @@ class DatabaseManager:
                         setattr(existing, key, value)
                     existing.updated_at = datetime.now()
                     session.commit()
+                    session.refresh(existing)
                     logger.debug(f"Updated analytics for campaign {campaign_id} on {date_str}")
                     return existing
                 else:

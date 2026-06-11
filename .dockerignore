@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+htmlcov
+.coverage
+coverage.xml
+*.pyc
+.pytest_cache
+browser_data

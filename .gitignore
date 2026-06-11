@@ -19,3 +19,8 @@ nul
 
 # Application data
 .linkedin-networking-cli/
+
+# Coverage artifacts
+.coverage
+coverage.xml
+htmlcov/

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Simple InquirerPy CLI demonstration"""
+"""LinkedIn Networking CLI - interactive menu-driven interface."""
 
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
 from rich.console import Console
 from rich.panel import Panel
-from rich.syntax import Syntax
 from collections import namedtuple
-import asyncio
-import sys
+from datetime import datetime
 from pathlib import Path
+import asyncio
+import csv
+import sys
 
 # Add src directory to path for imports
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -28,10 +29,13 @@ from automation.linkedin import LinkedInAutomation
 from automation.linkedin_mappings import (
     get_location_display_names,
     get_location_urn,
+    get_location_name_from_urn,
     get_network_display_names,
     get_network_value,
+    get_network_name_from_value,
     get_industry_display_names,
     get_industry_id,
+    get_industry_name_from_id,
 )
 
 
@@ -105,10 +109,6 @@ class LinkedInCLI:
                     Choice(
                         value="settings", name="🔧 Settings - Configure application"
                     ),
-                    Choice(
-                        value="file_editor",
-                        name="📝 File Editor Demo - Edit files with syntax highlighting",
-                    ),
                     Separator(),
                     Choice(value="exit", name="❌ Exit"),
                 ],
@@ -129,8 +129,6 @@ class LinkedInCLI:
                 self.extract_profile_data()
             elif choice == "settings":
                 self.show_settings()
-            elif choice == "file_editor":
-                self.file_editor_demo()
             elif choice == "exit":
                 self.console.print("[yellow]Goodbye! 👋[/yellow]")
                 break
@@ -159,13 +157,18 @@ class LinkedInCLI:
                 "acceptance_rate": 26.7,
             }
 
+        footer = (
+            "\n\n[dim]💡 Demo mode with mock data (database unavailable)[/dim]"
+            if not self.db_manager
+            else ""
+        )
         self.console.print(
             Panel(
                 f"[bold]📊 Dashboard Statistics[/bold]\n\n"
                 f"[cyan]Active Campaigns:[/cyan] {stats['active_campaigns']}/{stats['total_campaigns']}\n"
                 f"[cyan]Total Connections:[/cyan] {stats['total_sent']} sent, {stats['total_accepted']} accepted\n"
-                f"[cyan]Success Rate:[/cyan] {stats['acceptance_rate']}%\n\n"
-                f"[dim]💡 This is a demo with mock data[/dim]",
+                f"[cyan]Success Rate:[/cyan] {stats['acceptance_rate']}%"
+                f"{footer}",
                 title="LinkedIn Networking Dashboard",
                 border_style="blue",
             )
@@ -193,11 +196,13 @@ class LinkedInCLI:
             message="Target keywords (e.g., 'software engineer', optional):",
         ).execute()
 
-        # Location filter with proper geoUrn mapping
-        # Note: Dynamic location search available via LinkedInAutomation.search_location()
-        # for future UI improvements (requires authenticated session)
+        # Location filter with proper geoUrn mapping.
+        # Dynamic online search is offered as an option (requires login).
+        SEARCH_ONLINE = "🔎 Search location online (requires login)"
+        CUSTOM_GEO = "Other (enter custom geoUrn)"
         location_choices = get_location_display_names()
-        location_choices.append("Other (enter custom geoUrn)")  # Add custom option
+        location_choices.append(SEARCH_ONLINE)
+        location_choices.append(CUSTOM_GEO)
 
         location_display = inquirer.select(
             message="Target location:",
@@ -207,7 +212,17 @@ class LinkedInCLI:
 
         # Handle custom geoUrn input
         custom_geo_urn = None
-        if location_display == "Other (enter custom geoUrn)":
+
+        if location_display == SEARCH_ONLINE:
+            loc_name, geo = self._search_location_online()
+            if geo:
+                custom_geo_urn = geo
+                location_display = loc_name
+            else:
+                # Fall back to manual entry if the search yielded nothing.
+                location_display = CUSTOM_GEO
+
+        if location_display == CUSTOM_GEO:
             self.console.print()
             self.console.print("[yellow]💡 Tip: Find geoUrn codes by:[/yellow]")
             self.console.print("[dim]   1. Search on LinkedIn with location filter[/dim]")
@@ -321,88 +336,351 @@ class LinkedInCLI:
         inquirer.confirm(message="Press Enter to continue...").execute()
 
     def manage_campaigns(self):
-        """Manage existing campaigns"""
-        if self.db_manager:
-            try:
-                campaigns = self.db_manager.get_campaigns(active_only=False)
-            except Exception as e:
-                self.console.print(f"[red]Error loading campaigns: {e}[/red]")
-                campaigns = []
-        else:
-            # Mock campaigns for demo
-            Campaign = namedtuple(
-                "Campaign",
-                ["id", "name", "active", "total_sent", "total_accepted", "daily_limit"],
-            )
-            campaigns = [
-                Campaign(1, "Tech Professionals", True, 25, 8, 20),
-                Campaign(2, "Marketing Leads", False, 20, 4, 15),
-                Campaign(3, "Sales Prospects", True, 30, 12, 25),
-            ]
-
-        # Select campaign to manage
-        campaign_choices = []
-        for campaign in campaigns:
-            status = "🟢 Active" if campaign.active else "🔴 Inactive"
-            acceptance_rate = (
-                (campaign.total_accepted / campaign.total_sent * 100)
-                if campaign.total_sent > 0
-                else 0
-            )
-            campaign_choices.append(
-                Choice(
-                    value=campaign,
-                    name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {acceptance_rate:.1f}% rate)",
+        """Manage existing campaigns (looped: stays here until you go back)."""
+        while True:
+            if self.db_manager:
+                try:
+                    campaigns = self.db_manager.get_campaigns(active_only=False)
+                except Exception as e:
+                    self.console.print(f"[red]Error loading campaigns: {e}[/red]")
+                    campaigns = []
+            else:
+                # Mock campaigns for demo
+                Campaign = namedtuple(
+                    "Campaign",
+                    ["id", "name", "active", "total_sent", "total_accepted", "daily_limit"],
                 )
+                campaigns = [
+                    Campaign(1, "Tech Professionals", True, 25, 8, 20),
+                    Campaign(2, "Marketing Leads", False, 20, 4, 15),
+                    Campaign(3, "Sales Prospects", True, 30, 12, 25),
+                ]
+
+            if not campaigns:
+                self.console.print(
+                    "[yellow]No campaigns yet. Use 'Create Campaign' to add one.[/yellow]"
+                )
+                inquirer.confirm(message="Press Enter to continue...").execute()
+                return
+
+            # Select campaign to manage
+            campaign_choices = []
+            for campaign in campaigns:
+                status = "🟢 Active" if campaign.active else "🔴 Inactive"
+                acceptance_rate = (
+                    (campaign.total_accepted / campaign.total_sent * 100)
+                    if campaign.total_sent > 0
+                    else 0
+                )
+                campaign_choices.append(
+                    Choice(
+                        value=campaign,
+                        name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {acceptance_rate:.1f}% rate)",
+                    )
+                )
+
+            campaign_choices.append(Separator())
+            campaign_choices.append(Choice(value="back", name="🔙 Back to main menu"))
+
+            selected = inquirer.select(
+                message="Select campaign to manage:", choices=campaign_choices
+            ).execute()
+
+            if selected == "back":
+                return
+
+            # Campaign actions
+            action = inquirer.select(
+                message=f"What would you like to do with '{selected.name}'?",
+                choices=[
+                    Choice(value="view", name="📊 View detailed statistics"),
+                    Choice(value="toggle", name="🔄 Toggle active/inactive status"),
+                    Choice(value="edit", name="📝 Edit campaign settings"),
+                    Choice(value="export", name="📤 Export contacts to CSV"),
+                    Choice(value="delete", name="🗑️ Delete campaign"),
+                    Separator(),
+                    Choice(value="back", name="🔙 Back to campaign list"),
+                ],
+            ).execute()
+
+            if action == "back":
+                # Return to the campaign list (loop reloads fresh data).
+                continue
+            elif action == "view":
+                self.view_campaign_details(selected)
+            elif action == "toggle":
+                self.toggle_campaign(selected)
+            elif action == "edit":
+                self.edit_campaign(selected)
+            elif action == "export":
+                self.export_contacts(selected)
+            elif action == "delete":
+                self.delete_campaign(selected)
+
+            inquirer.confirm(message="Press Enter to continue...").execute()
+            # Loop continues -> reload the campaign list, reflecting any changes.
+
+    def toggle_campaign(self, campaign):
+        """Toggle a campaign's active/inactive status in the database."""
+        new_active = not campaign.active
+        new_status = "activated" if new_active else "deactivated"
+
+        if not self.db_manager:
+            self.console.print(
+                f"[green]✅ Campaign '{campaign.name}' {new_status}![/green]"
             )
-
-        campaign_choices.append(Separator())
-        campaign_choices.append(Choice(value="back", name="🔙 Back to main menu"))
-
-        selected = inquirer.select(
-            message="Select campaign to manage:", choices=campaign_choices
-        ).execute()
-
-        if selected == "back":
+            self.console.print("[blue]💡 Demo mode: Would update database[/blue]")
             return
 
-        # Campaign actions
-        action = inquirer.select(
-            message=f"What would you like to do with '{selected.name}'?",
-            choices=[
-                Choice(value="view", name="📊 View detailed statistics"),
-                Choice(value="toggle", name="🔄 Toggle active/inactive status"),
-                Choice(value="edit", name="📝 Edit campaign settings"),
-                Choice(value="delete", name="🗑️ Delete campaign"),
-                Separator(),
-                Choice(value="back", name="🔙 Back to campaign list"),
-            ],
+        try:
+            updated = self.db_manager.update_campaign(campaign.id, {"active": new_active})
+            if updated:
+                self.console.print(
+                    f"[green]✅ Campaign '{campaign.name}' {new_status}![/green]"
+                )
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error updating campaign: {e}[/red]")
+
+    def edit_campaign(self, campaign):
+        """Edit an existing campaign's settings and persist the changes."""
+        self.console.print(f"[bold cyan]📝 Editing '{campaign.name}'[/bold cyan]\n")
+        self.console.print("[dim]Press Enter to keep the current value.[/dim]\n")
+
+        name = inquirer.text(
+            message="Campaign name:",
+            default=campaign.name or "",
+            validate=lambda x: len(x.strip()) > 0 or "Campaign name cannot be empty",
         ).execute()
 
-        if action == "view":
-            self.view_campaign_details(selected)
-        elif action == "toggle":
-            new_status = "activated" if not selected.active else "deactivated"
-            self.console.print(
-                f"[green]✅ Campaign '{selected.name}' {new_status}![/green]"
-            )
-            self.console.print("[blue]💡 In real app: Would update database[/blue]")
-        elif action == "edit":
-            self.console.print(f"[blue]📝 Editing '{selected.name}'...[/blue]")
-            self.console.print("[blue]💡 In real app: Would show edit form[/blue]")
-        elif action == "delete":
-            confirm = inquirer.confirm(
-                message=f"⚠️  Are you sure you want to delete '{selected.name}'?",
-                default=False,
-            ).execute()
-            if confirm:
-                self.console.print(f"[red]🗑️ Campaign '{selected.name}' deleted.[/red]")
-                self.console.print(
-                    "[blue]💡 In real app: Would delete from database[/blue]"
-                )
+        description = inquirer.text(
+            message="Description:",
+            default=self._campaign_get_field(campaign, "description", "") or "",
+        ).execute()
 
-        if action != "back":
-            inquirer.confirm(message="Press Enter to continue...").execute()
+        # --- Targeting filters ---
+        keywords = inquirer.text(
+            message="Target keywords (optional):",
+            default=self._campaign_get_field(campaign, "keywords", "") or "",
+        ).execute()
+
+        # Location: preselect the current location based on the stored geo_urn.
+        SEARCH_ONLINE = "🔎 Search location online (requires login)"
+        current_geo_urn = self._campaign_get_field(campaign, "geo_urn", None)
+        current_location_name = (
+            get_location_name_from_urn(current_geo_urn) if current_geo_urn else "Any"
+        )
+        location_choices = get_location_display_names()
+        if current_location_name not in location_choices:
+            location_choices.append(current_location_name)
+        location_choices.append(SEARCH_ONLINE)
+        location_display = inquirer.select(
+            message="Target location:",
+            choices=location_choices,
+            default=current_location_name,
+        ).execute()
+
+        edited_geo_urn = None  # set only when an online search picks a result
+        if location_display == SEARCH_ONLINE:
+            loc_name, geo = self._search_location_online()
+            if geo:
+                edited_geo_urn = geo
+                location_display = loc_name
+            else:
+                # Keep the previous location if the search was cancelled.
+                location_display = current_location_name
+
+        # Connection degree.
+        current_network = self._campaign_get_field(campaign, "network", '["F","S"]')
+        network_display = inquirer.select(
+            message="Connection degree:",
+            choices=get_network_display_names(),
+            default=get_network_name_from_value(current_network),
+        ).execute()
+
+        # Industry.
+        current_industry_id = self._campaign_get_field(campaign, "industry_ids", None)
+        current_industry_name = (
+            get_industry_name_from_id(current_industry_id)
+            if current_industry_id
+            else "Any"
+        )
+        industry_choices = get_industry_display_names()
+        if current_industry_name not in industry_choices:
+            industry_choices.append(current_industry_name)
+        industry_display = inquirer.select(
+            message="Target industry:",
+            choices=industry_choices,
+            default=current_industry_name,
+        ).execute()
+
+        daily_limit = inquirer.number(
+            message="Daily connection limit:",
+            min_allowed=1,
+            max_allowed=100,
+            default=campaign.daily_limit,
+        ).execute()
+
+        message_template = inquirer.text(
+            message="Connection message template:",
+            default=self._campaign_get_field(
+                campaign, "message_template", "Hi {name}, I'd like to connect with you!"
+            ),
+            validate=lambda x: "{name}" in x
+            or "Message must contain {name} placeholder",
+        ).execute()
+
+        # Resolve display names back into stored values. An online-search pick
+        # provides its geoUrn directly; otherwise map from the curated list.
+        if edited_geo_urn:
+            geo_urn = edited_geo_urn
+        else:
+            geo_urn = get_location_urn(location_display) if location_display != "Any" else None
+        network_value = get_network_value(network_display)
+        industry_id = (
+            get_industry_id(industry_display) if industry_display != "Any" else None
+        )
+
+        updates = {
+            "name": name.strip(),
+            "description": description.strip() or None,
+            "keywords": keywords.strip() or None,
+            "geo_urn": geo_urn,
+            "location_display": location_display if location_display != "Any" else None,
+            "network": network_value,
+            "network_display": network_display,
+            "industry_ids": industry_id,
+            "industry_display": industry_display if industry_display != "Any" else None,
+            "daily_limit": int(daily_limit),
+            "message_template": message_template,
+        }
+
+        if not self.db_manager:
+            self.console.print("[green]✅ Campaign updated![/green]")
+            self.console.print("[blue]💡 Demo mode: Would save to database[/blue]")
+            return
+
+        try:
+            updated = self.db_manager.update_campaign(campaign.id, updates)
+            if updated:
+                self.console.print(
+                    f"[green]✅ Campaign '{updated.name}' updated successfully![/green]"
+                )
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error updating campaign: {e}[/red]")
+
+    def delete_campaign(self, campaign):
+        """Delete a campaign (and its contacts). Returns True if it was removed."""
+        confirm = inquirer.confirm(
+            message=f"⚠️  Are you sure you want to delete '{campaign.name}'? "
+            "This also removes its contacts.",
+            default=False,
+        ).execute()
+
+        if not confirm:
+            self.console.print("[yellow]Deletion cancelled.[/yellow]")
+            return False
+
+        if not self.db_manager:
+            self.console.print(f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]")
+            self.console.print("[blue]💡 Demo mode: Would delete from database[/blue]")
+            return False
+
+        try:
+            deleted = self.db_manager.delete_campaign(campaign.id)
+            if deleted:
+                self.console.print(
+                    f"[red]🗑️ Campaign '{campaign.name}' deleted.[/red]"
+                )
+                return True
+            else:
+                self.console.print(
+                    f"[red]❌ Campaign '{campaign.name}' not found.[/red]"
+                )
+                return False
+        except Exception as e:
+            self.console.print(f"[red]❌ Error deleting campaign: {e}[/red]")
+            return False
+
+    def export_contacts(self, campaign):
+        """Export a campaign's contacts to a CSV file."""
+        if not self.db_manager:
+            self.console.print(
+                "[blue]💡 Demo mode: contact export requires a database.[/blue]"
+            )
+            return
+
+        try:
+            contacts = self.db_manager.get_contacts(campaign_id=campaign.id)
+        except Exception as e:
+            self.console.print(f"[red]❌ Error loading contacts: {e}[/red]")
+            return
+
+        if not contacts:
+            self.console.print(
+                f"[yellow]No contacts found for '{campaign.name}' yet.[/yellow]"
+            )
+            return
+
+        safe_name = "".join(
+            c if c.isalnum() or c in ("-", "_") else "_" for c in campaign.name
+        ).strip("_") or "campaign"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = str(Path.cwd() / f"{safe_name}_contacts_{timestamp}.csv")
+
+        output_path = inquirer.text(
+            message="Save CSV to:",
+            default=default_path,
+        ).execute()
+
+        fieldnames = [
+            "name",
+            "profile_url",
+            "headline",
+            "location",
+            "company",
+            "status",
+            "connection_sent_at",
+            "connection_accepted_at",
+            "notes",
+        ]
+
+        try:
+            path = Path(output_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for contact in contacts:
+                    writer.writerow(
+                        {
+                            field: self._csv_value(
+                                self._campaign_get_field(contact, field)
+                            )
+                            for field in fieldnames
+                        }
+                    )
+            self.console.print(
+                f"[green]✅ Exported {len(contacts)} contacts to {path}[/green]"
+            )
+        except Exception as e:
+            self.console.print(f"[red]❌ Error writing CSV: {e}[/red]")
+
+    @staticmethod
+    def _csv_value(value):
+        """Normalize a value for CSV output."""
+        if value is None:
+            return ""
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value)
 
     def view_campaign_details(self, campaign):
         """View detailed campaign information"""
@@ -426,8 +704,7 @@ class LinkedInCLI:
                 border_style="blue",
             )
         )
-
-        inquirer.confirm(message="Press Enter to continue...").execute()
+        # Note: the caller (manage_campaigns) prompts to continue.
 
     def execute_campaign(self):
         """Execute campaign selection"""
@@ -592,18 +869,44 @@ class LinkedInCLI:
                 Choice(value="browser", name="🌐 Browser automation settings"),
                 Choice(value="limits", name="⚡ Rate limiting settings"),
                 Choice(value="data", name="📁 Data directory information"),
+                Choice(value="location_lookup", name="🔎 Look up location code (online)"),
                 Separator(),
                 Choice(value="back", name="🔙 Back to main menu"),
             ],
         ).execute()
 
         if setting == "credentials":
+            self.show_credentials_settings()
+        elif setting == "browser":
+            self.show_browser_settings()
+        elif setting == "limits":
+            self.show_limits_settings()
+        elif setting == "data":
+            self.show_data_settings()
+        elif setting == "location_lookup":
+            self.location_lookup()
+
+        if setting != "back":
+            inquirer.confirm(message="Press Enter to continue...").execute()
+
+    @staticmethod
+    def _mask_email(email):
+        """Mask an email for display, e.g. 'joh***@example.com'."""
+        if not email:
+            return "Not set"
+        if "@" in email:
+            local, domain = email.split("@", 1)
+            prefix = local[:3] if len(local) >= 3 else local
+            return f"{prefix}***@{domain}"
+        return f"{email[:3]}***"
+
+    def show_credentials_settings(self):
+        """Show real LinkedIn credential status from the environment."""
+        if not self.settings:
             self.console.print(
                 Panel(
                     "[bold]🔐 LinkedIn Credentials[/bold]\n\n"
-                    "[cyan]Status:[/cyan] 🔴 Not configured (demo mode)\n"
-                    "[cyan]Email:[/cyan] Not set\n"
-                    "[cyan]Password:[/cyan] Not set\n\n"
+                    "[cyan]Status:[/cyan] 🔴 Not configured (demo mode)\n\n"
                     "[dim]Set via environment variables:\n"
                     'export LINKEDIN_EMAIL="your-email"\n'
                     'export LINKEDIN_PASSWORD="your-password"[/dim]',
@@ -611,100 +914,195 @@ class LinkedInCLI:
                     border_style="blue",
                 )
             )
-        elif setting == "browser":
-            self.console.print(
-                Panel(
-                    "[bold]🌐 Browser Settings[/bold]\n\n"
-                    "[cyan]Browser:[/cyan] Chromium (Playwright)\n"
-                    "[cyan]Headless Mode:[/cyan] True\n"
-                    "[cyan]Viewport:[/cyan] 1920x1080\n"
-                    "[cyan]User Data Dir:[/cyan] ~/.linkedin-networking-cli/browser_data/",
-                    title="Browser Configuration",
-                    border_style="blue",
-                )
-            )
-        elif setting == "limits":
-            self.console.print(
-                Panel(
-                    "[bold]⚡ Rate Limiting[/bold]\n\n"
-                    "[cyan]Connection Delay:[/cyan] 2-5 seconds\n"
-                    "[cyan]Daily Connection Limit:[/cyan] 20\n"
-                    "[cyan]Search Limit:[/cyan] 100\n"
-                    "[cyan]Retry Attempts:[/cyan] 3",
-                    title="Rate Limiting Settings",
-                    border_style="blue",
-                )
-            )
-        elif setting == "data":
-            self.console.print(
-                Panel(
-                    "[bold]📁 Data Storage[/bold]\n\n"
-                    "[cyan]App Directory:[/cyan] ~/.linkedin-networking-cli/\n"
-                    "[cyan]Database:[/cyan] linkedin_networking.db\n"
-                    "[cyan]Session Data:[/cyan] session.json\n"
-                    "[cyan]Browser Data:[/cyan] browser_data/",
-                    title="Data Directory Information",
-                    border_style="blue",
-                )
-            )
+            return
 
-        if setting != "back":
-            inquirer.confirm(message="Press Enter to continue...").execute()
-
-    def file_editor_demo(self):
-        """Demo file editor with syntax highlighting - recreating your original request"""
-        sample_code = '''def is_palindrome(text: str) -> bool:
-    """
-    Check if the given text is a palindrome.
-
-    Args:
-        text: The input string to check
-
-    Returns:
-        bool: True if the string is a palindrome, False otherwise
-    """
-    # Clean the text: convert to lowercase and keep only alphanumeric characters
-    cleaned_text = ''.join(char.lower() for char in text if char.isalnum())
-
-    # Check if the cleaned text reads the same forward and backward
-    return cleaned_text == cleaned_text[::-1]'''
-
-        # Display file content with syntax highlighting
-        syntax = Syntax(sample_code, "python", theme="monokai", line_numbers=True)
+        email = self.settings.linkedin_email
+        has_password = bool(self.settings.linkedin_password)
+        configured = bool(email) and has_password
+        status = "🟢 Configured" if configured else "🔴 Not configured"
 
         self.console.print(
-            Panel(syntax, title="📝 Edit file: palindrome.py", border_style="cyan")
+            Panel(
+                "[bold]🔐 LinkedIn Credentials[/bold]\n\n"
+                f"[cyan]Status:[/cyan] {status}\n"
+                f"[cyan]Email:[/cyan] {self._mask_email(email)}\n"
+                f"[cyan]Password:[/cyan] {'Set' if has_password else 'Not set'}\n\n"
+                "[dim]Set via environment variables:\n"
+                'export LINKEDIN_EMAIL="your-email"\n'
+                'export LINKEDIN_PASSWORD="your-password"[/dim]',
+                title="Credentials Status",
+                border_style="blue",
+            )
         )
 
-        # This recreates the interface from your original image
-        action = inquirer.select(
-            message="Do you want to make this edit to palindrome.py?",
-            choices=[
-                Choice(value="yes", name="1. Yes"),
-                Choice(
-                    value="yes_auto",
-                    name="2. Yes, and don't ask again this session (shift+tab)",
-                ),
-                Choice(
-                    value="no",
-                    name="3. No, and tell Claude what to do differently (esc)",
-                ),
-            ],
+    def show_browser_settings(self):
+        """Show the real browser configuration."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Browser settings unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        b = self.settings.get_browser_settings()
+        viewport = b.get("viewport", {})
+        self.console.print(
+            Panel(
+                "[bold]🌐 Browser Settings[/bold]\n\n"
+                f"[cyan]Channel:[/cyan] {b.get('channel') or 'bundled Chromium'}\n"
+                f"[cyan]Executable:[/cyan] {b.get('executable_path') or 'default'}\n"
+                f"[cyan]Headless Mode:[/cyan] {b.get('headless')}\n"
+                f"[cyan]Viewport:[/cyan] {viewport.get('width')}x{viewport.get('height')}\n"
+                f"[cyan]User Data Dir:[/cyan] {b.get('user_data_dir')}",
+                title="Browser Configuration",
+                border_style="blue",
+            )
+        )
+
+    def show_limits_settings(self):
+        """Show the real rate-limiting / automation configuration."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Rate limiting settings unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        a = self.settings.get_automation_settings()
+        self.console.print(
+            Panel(
+                "[bold]⚡ Rate Limiting[/bold]\n\n"
+                f"[cyan]Connection Delay:[/cyan] {a.get('connection_delay_min')}-{a.get('connection_delay_max')} seconds\n"
+                f"[cyan]Daily Connection Limit:[/cyan] {a.get('daily_connection_limit')}\n"
+                f"[cyan]Search Limit:[/cyan] {a.get('search_limit')}",
+                title="Rate Limiting Settings",
+                border_style="blue",
+            )
+        )
+
+    def show_data_settings(self):
+        """Show the real data storage locations."""
+        if not self.settings:
+            self.console.print(
+                "[yellow]Data directory information unavailable in demo mode.[/yellow]"
+            )
+            return
+
+        self.console.print(
+            Panel(
+                "[bold]📁 Data Storage[/bold]\n\n"
+                f"[cyan]App Directory:[/cyan] {self.settings.app_dir}\n"
+                f"[cyan]Database:[/cyan] {self.settings.db_path}\n"
+                f"[cyan]Session Data:[/cyan] {self.settings.session_path}\n"
+                f"[cyan]Browser Data:[/cyan] {Path(self.settings.app_dir) / 'browser_data'}",
+                title="Data Directory Information",
+                border_style="blue",
+            )
+        )
+
+    def location_lookup(self):
+        """Look up a LinkedIn location geoUrn code online via the Voyager API.
+
+        Requires an authenticated session. Useful for finding codes that are
+        not in the curated list so they can be pasted into a campaign's
+        "Other (enter custom geoUrn)" option.
+        """
+        if not self.db_manager or not self.settings:
+            self.console.print(
+                "[red]Location lookup requires database access and app settings.[/red]"
+            )
+            return
+
+        query = inquirer.text(
+            message="Search location (e.g. 'Madrid', 'Greater Tokyo'):",
+            validate=lambda x: len(x.strip()) > 0 or "Enter a search term",
         ).execute()
 
-        if action in ["yes", "yes_auto"]:
-            # Write the file
-            with open("palindrome.py", "w", encoding="utf-8") as f:
-                f.write(sample_code)
+        results = self._run_location_search(query.strip())
+        if results is None:
+            self.console.print("[red]❌ Could not authenticate with LinkedIn.[/red]")
+            return
+        if not results:
+            self.console.print(f"[yellow]No locations found for '{query}'.[/yellow]")
+            return
 
-            mode_text = " (auto-confirm enabled)" if action == "yes_auto" else ""
-            self.console.print(
-                f"[green]✅ File saved: palindrome.py{mode_text}[/green]"
+        lines = ["[bold]🔎 Location results[/bold]\n"]
+        for item in results:
+            lines.append(
+                f"[cyan]{item.get('name', '?')}[/cyan]  →  geoUrn [green]{item.get('geoUrn', '?')}[/green]"
             )
-        else:
-            self.console.print("[yellow]Edit cancelled.[/yellow]")
+        lines.append(
+            "\n[dim]Use a code via Create/Edit Campaign → 'Other (enter custom geoUrn)'.[/dim]"
+        )
+        self.console.print(
+            Panel("\n".join(lines), title="Location Lookup", border_style="blue")
+        )
 
-        inquirer.confirm(message="Press Enter to continue...").execute()
+    def _run_location_search(self, query):
+        """Authenticate and query LinkedIn's typeahead for locations.
+
+        Returns a list of ``{"name", "geoUrn"}`` dicts, an empty list when
+        nothing matched, or ``None`` when authentication failed.
+        """
+        if not self.db_manager or not self.settings:
+            return None
+
+        self.console.print(
+            "[cyan]Opening LinkedIn to search locations (login may be required)...[/cyan]"
+        )
+
+        def progress_update(message: str) -> None:
+            self.console.print(f"[cyan]{message}[/cyan]")
+
+        async def run_lookup():
+            async with LinkedInAutomation(self.db_manager, self.settings) as automation:
+                login_ok = await automation.login(progress_update)
+                if not login_ok:
+                    return None
+                return await automation.search_location(query)
+
+        try:
+            return asyncio.run(run_lookup())
+        except Exception as e:
+            self.console.print(f"[red]❌ Location search failed: {e}[/red]")
+            return []
+
+    def _search_location_online(self):
+        """Prompt for a query, search LinkedIn, and let the user pick a result.
+
+        Returns a ``(display_name, geo_urn)`` tuple, or ``(None, None)`` if the
+        search failed or was cancelled.
+        """
+        if not self.db_manager or not self.settings:
+            self.console.print(
+                "[yellow]Online search requires database access and app settings.[/yellow]"
+            )
+            return None, None
+
+        query = inquirer.text(
+            message="Search location (e.g. 'Madrid', 'Greater Tokyo'):",
+            validate=lambda x: len(x.strip()) > 0 or "Enter a search term",
+        ).execute()
+
+        results = self._run_location_search(query.strip())
+        if results is None:
+            self.console.print("[red]❌ Could not authenticate with LinkedIn.[/red]")
+            return None, None
+        if not results:
+            self.console.print(f"[yellow]No locations found for '{query}'.[/yellow]")
+            return None, None
+
+        choices = [
+            Choice(value=item, name=f"{item.get('name', '?')} (geoUrn {item.get('geoUrn', '?')})")
+            for item in results
+        ]
+        choices.append(Choice(value=None, name="🔙 Cancel"))
+        selected = inquirer.select(
+            message="Select a location:",
+            choices=choices,
+        ).execute()
+
+        if not selected:
+            return None, None
+        return selected.get("name"), selected.get("geoUrn")
 
     def connection_checker(self):
         """Check pending connections using smart checker"""

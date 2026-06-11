@@ -180,26 +180,31 @@ class TestLogin:
 
     @pytest.mark.asyncio
     async def test_login_with_existing_session(self, mock_linkedin_automation):
-        """Test login when session already exists."""
-        # Mock page to simulate existing session
+        """Test login when session already exists (feed loads without redirect)."""
+        # Login detection is URL-based: staying on /feed means we are authenticated.
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
-        mock_page.is_visible = AsyncMock(return_value=True)
+        mock_page.url = "https://www.linkedin.com/feed/"
 
         result = await mock_linkedin_automation.login()
 
         assert result is True
         assert mock_linkedin_automation.is_authenticated is True
+        # Already authenticated: no credentials should be entered.
+        assert mock_page.fill.call_count == 0
 
     @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
-        """Test login with username and password."""
+        """Test login with username and password after redirect to /login."""
         automation = LinkedInAutomation(db_manager, app_settings)
         automation.page = mock_page
         automation.context = AsyncMock()
 
-        # Mock successful login
-        mock_page.is_visible = AsyncMock(side_effect=[False, True])  # No session, then success
+        # Visiting /feed redirects to /login -> credentials flow is triggered.
+        mock_page.url = "https://www.linkedin.com/login"
+        # No CAPTCHA present on the page.
+        mock_page.query_selector = AsyncMock(return_value=None)
+        mock_page.content = AsyncMock(return_value="")
 
         result = await automation.login()
 
@@ -214,28 +219,18 @@ class TestLogin:
 
 @pytest.mark.unit
 class TestSearchLocation:
-    """Test location search via Voyager API."""
+    """Test location search via the search filter UI."""
 
     @pytest.mark.asyncio
     async def test_search_location_valid_query(self, mock_linkedin_automation):
         """Test searching for a location with valid query."""
-        # Mock response
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.json = AsyncMock(return_value={
-            "data": {
-                "elements": [
-                    {
-                        "targetUrn": "urn:li:fs_geo:90000084",
-                        "text": {"text": "San Francisco Bay Area"}
-                    }
-                ]
-            }
-        })
-
-        mock_linkedin_automation.page.request.get = AsyncMock(return_value=mock_response)
-
-        results = await mock_linkedin_automation.search_location("San Francisco")
+        with patch.object(
+            mock_linkedin_automation,
+            "_search_location_via_filter_ui",
+            new_callable=AsyncMock,
+            return_value=[{"name": "San Francisco Bay Area", "geoUrn": "90000084"}],
+        ):
+            results = await mock_linkedin_automation.search_location("San Francisco")
 
         assert len(results) == 1
         assert results[0]["name"] == "San Francisco Bay Area"
@@ -258,15 +253,15 @@ class TestSearchLocation:
             await automation.search_location("test")
 
     @pytest.mark.asyncio
-    async def test_search_location_api_error(self, mock_linkedin_automation):
-        """Test location search when API returns error."""
-        mock_response = AsyncMock()
-        mock_response.ok = False
-        mock_response.status = 404
-
-        mock_linkedin_automation.page.request.get = AsyncMock(return_value=mock_response)
-
-        results = await mock_linkedin_automation.search_location("test")
+    async def test_search_location_ui_error(self, mock_linkedin_automation):
+        """Test location search when driving the filter UI fails."""
+        with patch.object(
+            mock_linkedin_automation,
+            "_search_location_via_filter_ui",
+            new_callable=AsyncMock,
+            side_effect=Exception("UI structure changed"),
+        ):
+            results = await mock_linkedin_automation.search_location("test")
 
         assert results == []
 
@@ -417,6 +412,33 @@ class TestLinkedInProfile:
 
         # Dataclasses have __dataclass_fields__
         assert hasattr(LinkedInProfile, '__dataclass_fields__')
+
+
+# ============================================================================
+# Text Normalization Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestNormalize:
+    """Test the accent-insensitive text normalizer used for matching
+    profile names and the invitation-cooldown toast."""
+
+    def test_strips_accents(self):
+        # Accent stripping is what lets the cooldown toast ("invitación")
+        # match the plain marker ("invitacion").
+        assert LinkedInAutomation._normalize("invitación") == "invitacion"
+        assert LinkedInAutomation._normalize("Martí Altimira") == "marti altimira"
+
+    def test_casefolds_and_collapses_whitespace(self):
+        assert LinkedInAutomation._normalize("  Hello   WORLD  ") == "hello world"
+
+    def test_handles_none(self):
+        assert LinkedInAutomation._normalize(None) == ""
+
+    def test_name_substring_match_is_accent_insensitive(self):
+        name = LinkedInAutomation._normalize("Martí Altimira Cebrian")
+        aria = LinkedInAutomation._normalize("Invita a Martí Altimira Cebrian a conectar")
+        assert name in aria
 
 
 # ============================================================================
