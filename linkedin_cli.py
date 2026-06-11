@@ -214,10 +214,10 @@ class LinkedInCLI:
         custom_geo_urn = None
 
         if location_display == SEARCH_ONLINE:
-            name, geo = self._search_location_online()
+            loc_name, geo = self._search_location_online()
             if geo:
                 custom_geo_urn = geo
-                location_display = name
+                location_display = loc_name
             else:
                 # Fall back to manual entry if the search yielded nothing.
                 location_display = CUSTOM_GEO
@@ -485,10 +485,10 @@ class LinkedInCLI:
 
         edited_geo_urn = None  # set only when an online search picks a result
         if location_display == SEARCH_ONLINE:
-            name, geo = self._search_location_online()
+            loc_name, geo = self._search_location_online()
             if geo:
                 edited_geo_urn = geo
-                location_display = name
+                location_display = loc_name
             else:
                 # Keep the previous location if the search was cancelled.
                 location_display = current_location_name
