@@ -194,7 +194,7 @@ async def _update_accepted_connection(
         await new_page.wait_for_timeout(random.randint(5000, 8000))
 
         # Get updated contact info
-        contact_info = get_contact_info(new_page)
+        contact_info = await get_contact_info(new_page)
 
         # Update the contact in database
         update_data = {
@@ -317,7 +317,7 @@ async def check_specific_contacts(
 
                 # Try to get contact info
                 try:
-                    contact_info = get_contact_info(automation.page)
+                    contact_info = await get_contact_info(automation.page)
                     if contact_info.get("email"):
                         update_data["email"] = contact_info["email"]
                     if contact_info.get("phone"):

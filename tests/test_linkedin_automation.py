@@ -180,26 +180,31 @@ class TestLogin:
 
     @pytest.mark.asyncio
     async def test_login_with_existing_session(self, mock_linkedin_automation):
-        """Test login when session already exists."""
-        # Mock page to simulate existing session
+        """Test login when session already exists (feed loads without redirect)."""
+        # Login detection is URL-based: staying on /feed means we are authenticated.
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
-        mock_page.is_visible = AsyncMock(return_value=True)
+        mock_page.url = "https://www.linkedin.com/feed/"
 
         result = await mock_linkedin_automation.login()
 
         assert result is True
         assert mock_linkedin_automation.is_authenticated is True
+        # Already authenticated: no credentials should be entered.
+        assert mock_page.fill.call_count == 0
 
     @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
-        """Test login with username and password."""
+        """Test login with username and password after redirect to /login."""
         automation = LinkedInAutomation(db_manager, app_settings)
         automation.page = mock_page
         automation.context = AsyncMock()
 
-        # Mock successful login
-        mock_page.is_visible = AsyncMock(side_effect=[False, True])  # No session, then success
+        # Visiting /feed redirects to /login -> credentials flow is triggered.
+        mock_page.url = "https://www.linkedin.com/login"
+        # No CAPTCHA present on the page.
+        mock_page.query_selector = AsyncMock(return_value=None)
+        mock_page.content = AsyncMock(return_value="")
 
         result = await automation.login()
 

@@ -245,14 +245,16 @@ Tesla: 15564
 
 ### Campaign Editing
 
-**Status:** No implementado
+**Status:** ✅ IMPLEMENTADO (CRUD básico)
 **Prioridad:** Alta
 
-Permitir editar campañas existentes:
-- Cambiar filtros sin crear nueva campaña
-- Pausar/resumir campañas
-- Ajustar daily limits on-the-fly
-- Modificar message templates
+Implementado en "Manage Campaigns" (cableado a SQLite vía `DatabaseManager`):
+- ✅ Editar nombre, descripción, daily limit y message template
+- ✅ Pausar/reanudar campañas (toggle active/inactive)
+- ✅ Eliminar campaña y sus contactos asociados
+
+**Pendiente (futuro):**
+- Editar filtros de targeting (keywords/location/industry) sin recrear la campaña
 
 ---
 
@@ -386,6 +388,50 @@ Guardar configuraciones comunes como templates:
 
 ---
 
-**Última actualización:** 2025-11-12
+**Última actualización:** 2026-06-10
 **Versión actual:** 0.1.0
 **Próxima versión planeada:** 0.2.0 (Fase 1 completada)
+
+---
+
+## ✅ Completado en esta iteración
+
+- Cableado de "Manage Campaigns" a la base de datos: toggle activar/desactivar, editar y eliminar
+  campaña — antes eran stubs que solo imprimían "In real app: Would...".
+- `edit_campaign` ahora también edita los **filtros de targeting** (keywords, ubicación,
+  industria, grado de conexión), no solo nombre/límite/plantilla.
+- Nuevo **export de contactos a CSV** por campaña (Manage Campaigns → "Export contacts to CSV").
+- Nueva utilidad **"Look up location code (online)"** en Settings: usa la Voyager API
+  (`search_location`) para encontrar geoUrn de cualquier ubicación, autenticando la sesión.
+- **Conversión async crítica:** `interactions.py` y `scraping.py` estaban escritos en estilo
+  síncrono sobre una página async, así que la detección de CAPTCHA/límites y la extracción de
+  perfiles/contactos nunca funcionaban. Convertidos a async/await y actualizados los call sites
+  en `linkedin.py` y `checker.py`.
+- Corregido `record_daily_analytics`: `DetachedInstanceError` al actualizar (faltaba `refresh`).
+- Corregidos IDs duplicados en mappings: `LOCATION_CHOICES` (Atlanta/Phoenix) e `INDUSTRY_CHOICES`
+  (Design).
+- Actualizados los tests de login al esquema de detección por URL.
+- Añadidos tests para `interactions` y `scraping` (cobertura de esos módulos 15%/0% → 46%/31%).
+- Añadidos **CI** (GitHub Actions: `uv sync` + `pytest`), **Dockerfile** y `.dockerignore`.
+- README reescrito (sin mojibake, con disclaimer de ToS, export CSV, Docker, testing).
+- Eliminado el "File Editor Demo" (andamiaje ajeno al producto).
+- Suite de tests en verde: **269 passed**.
+
+### Completado (segunda tanda de pendientes)
+- **Búsqueda dinámica de ubicaciones integrada en el flujo de creación Y edición** de campañas
+  (opción "🔎 Search location online"), además de la utilidad en Settings. Helper compartido
+  `_run_location_search` / `_search_location_online`.
+- **Backoff exponencial ante cuenta restringida** en `send_connection_requests`: se detiene ante
+  CAPTCHA o límite semanal de invitaciones y aplica backoff exponencial (5s→…→300s) tras fallos
+  consecutivos.
+- **Cobertura subida**: `session.py` 0%→97%, `checker.py` 0%→41% (tests nuevos). Total 49%→58%,
+  **294 tests**.
+- **Packaging a PyPI**: añadido `[build-system]` (hatchling) + metadata (license, classifiers,
+  keywords, urls); `uv build` genera wheel/sdist y el wheel instala e importa correctamente en un
+  entorno Python 3.13 limpio (entry point `linkedin-cli` funcional).
+
+### Pendiente real (requiere cuenta de LinkedIn / fuera de este entorno)
+- Verificar los geoUrn/industry IDs marcados con `❓` contra búsquedas reales (mitigado: usar el
+  lookup online integrado o geoUrn custom; los `❓` están claramente marcados como no verificados).
+- Tests de integración end-to-end contra LinkedIn real (login, search, send) — requieren credenciales
+  y navegador; el resto de la lógica ya está cubierta con mocks.

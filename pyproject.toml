@@ -4,6 +4,18 @@ version = "0.1.0"
 description = "Interactive CLI tool for LinkedIn networking automation"
 readme = "README.md"
 requires-python = ">=3.13"
+license = { text = "MIT" }
+keywords = ["linkedin", "networking", "automation", "cli", "playwright"]
+authors = [{ name = "linkedin-networking-cli contributors" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
 dependencies = [
     "playwright>=1.40.0",
     "sqlmodel>=0.0.14",
@@ -12,6 +24,10 @@ dependencies = [
     "inquirerpy>=0.3.4",
     "psutil>=5.9.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/bman95/linkedin-networking-cli"
+Issues = "https://github.com/bman95/linkedin-networking-cli/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -25,6 +41,20 @@ dev = [
 
 [project.scripts]
 linkedin-cli = "linkedin_cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The runtime modules live under src/ and are imported as top-level packages
+# (database, automation, config, utils, exceptions). Map src/ to the wheel root
+# and ship the top-level entry point alongside them.
+only-include = ["src", "linkedin_cli.py"]
+exclude = ["src/__init__.py"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src" = ""
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
