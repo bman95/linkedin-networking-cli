@@ -44,6 +44,43 @@ class AppSettings:
             logger.warning("LINKEDIN_PASSWORD environment variable not set")
         return password
 
+    @staticmethod
+    def _detect_host_timezone() -> str:
+        """Best-effort IANA timezone name for the host.
+
+        Playwright's ``timezone_id`` needs an IANA name (e.g. ``Europe/Madrid``),
+        not an abbreviation like ``CEST``. We read it from the host rather than
+        hardcoding one so the value stays coherent with the OS the browser
+        actually runs on. Falls back to ``UTC`` when nothing reliable is found.
+        """
+        tz = os.getenv("TZ")
+        if tz and "/" in tz:
+            return tz
+
+        localtime = Path("/etc/localtime")
+        try:
+            if localtime.is_symlink():
+                target = os.readlink(localtime)
+                marker = "zoneinfo/"
+                idx = target.find(marker)
+                if idx != -1:
+                    candidate = target[idx + len(marker):]
+                    if candidate:
+                        return candidate
+        except OSError:
+            pass
+
+        etc_tz = Path("/etc/timezone")
+        try:
+            if etc_tz.exists():
+                value = etc_tz.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+        except OSError:
+            pass
+
+        return "UTC"
+
     def get_browser_settings(self) -> Dict[str, Any]:
         """Get browser settings"""
         channel_env = os.getenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
@@ -65,15 +102,42 @@ class AppSettings:
         else:
             headless = headless_env.strip().lower() in {"1", "true", "yes", "on"}
 
+        # Locale and timezone are set on the browser context so they stay
+        # coherent with the host (and each other). Defaults derive from the
+        # host; both are overridable for users on a differently-configured box.
+        locale = os.getenv("BROWSER_LOCALE", "en-US").strip() or "en-US"
+
+        timezone_env = os.getenv("BROWSER_TIMEZONE")
+        if timezone_env is not None and timezone_env.strip():
+            timezone_id = timezone_env.strip()
+        else:
+            timezone_id = self._detect_host_timezone()
+
+        # User-agent is intentionally left to real Chrome by default: Chrome's
+        # own UA already matches its platform and version, so forcing one risks
+        # introducing the very inconsistency this whole config exists to avoid.
+        # The override is opt-in and the user owns keeping it coherent.
+        user_agent_env = os.getenv("BROWSER_USER_AGENT")
+        user_agent = user_agent_env.strip() if user_agent_env else None
+        if not user_agent:
+            user_agent = None
+
         settings = {
             "headless": headless,
             "user_data_dir": str(self.app_dir / "browser_data"),
             "viewport": {"width": 1920, "height": 1080},
             "channel": channel,
-            "executable_path": executable
+            "executable_path": executable,
+            "locale": locale,
+            "timezone_id": timezone_id,
+            "user_agent": user_agent,
         }
 
-        logger.debug(f"Browser settings: headless={headless}, channel={channel}, executable={executable is not None}")
+        logger.debug(
+            f"Browser settings: headless={headless}, channel={channel}, "
+            f"executable={executable is not None}, locale={locale}, "
+            f"timezone_id={timezone_id}, user_agent={'custom' if user_agent else 'default'}"
+        )
         return settings
 
     def get_automation_settings(self) -> Dict[str, Any]:

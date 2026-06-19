@@ -239,6 +239,89 @@ class TestBrowserSettings:
 
 
 # ============================================================================
+# Fingerprint Settings Tests (locale / timezone / user-agent)
+# ============================================================================
+
+@pytest.mark.unit
+class TestFingerprintSettings:
+    """Locale, timezone and user-agent stay coherent and configurable."""
+
+    def _clear_env(self, monkeypatch):
+        for var in ("BROWSER_LOCALE", "BROWSER_TIMEZONE", "BROWSER_USER_AGENT"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_browser_settings_expose_fingerprint_keys(self, monkeypatch):
+        """locale, timezone_id and user_agent are always present."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        browser_settings = settings.get_browser_settings()
+
+        assert "locale" in browser_settings
+        assert "timezone_id" in browser_settings
+        assert "user_agent" in browser_settings
+
+    def test_locale_default(self, monkeypatch):
+        """Locale defaults to en-US when unset."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "en-US"
+
+    def test_locale_override(self, monkeypatch):
+        """BROWSER_LOCALE overrides the default locale (and is trimmed)."""
+        monkeypatch.setenv("BROWSER_LOCALE", "  es-ES  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "es-ES"
+
+    def test_locale_empty_falls_back_to_default(self, monkeypatch):
+        """An empty BROWSER_LOCALE falls back to the default, never ''."""
+        monkeypatch.setenv("BROWSER_LOCALE", "   ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "en-US"
+
+    def test_user_agent_default_unset(self, monkeypatch):
+        """User-agent defaults to None so real Chrome's UA is used."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] is None
+
+    def test_user_agent_override(self, monkeypatch):
+        """BROWSER_USER_AGENT sets an explicit override (trimmed)."""
+        monkeypatch.setenv("BROWSER_USER_AGENT", "  CustomUA/1.0  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] == "CustomUA/1.0"
+
+    def test_user_agent_empty_is_none(self, monkeypatch):
+        """A blank BROWSER_USER_AGENT yields None, not an empty string."""
+        monkeypatch.setenv("BROWSER_USER_AGENT", "   ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] is None
+
+    def test_timezone_override(self, monkeypatch):
+        """BROWSER_TIMEZONE overrides host detection (trimmed)."""
+        monkeypatch.setenv("BROWSER_TIMEZONE", "  America/New_York  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] == "America/New_York"
+
+    def test_timezone_is_iana_not_abbreviation(self, monkeypatch):
+        """The detected timezone is a non-empty IANA-style id, never an
+        abbreviation like 'CEST' which Playwright rejects."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        tz = settings.get_browser_settings()["timezone_id"]
+
+        assert isinstance(tz, str) and tz
+        # Either a region/location IANA id (has a '/') or the UTC fallback.
+        assert "/" in tz or tz == "UTC"
+
+    def test_timezone_from_tz_env(self, monkeypatch):
+        """A TZ env var holding an IANA name is honoured by detection."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TZ", "Asia/Tokyo")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] == "Asia/Tokyo"
+
+
+# ============================================================================
 # Automation Settings Tests
 # ============================================================================
 

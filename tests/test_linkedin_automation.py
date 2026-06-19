@@ -535,6 +535,81 @@ class TestBrowserHardening:
 
 
 # ============================================================================
+# Fingerprint Consistency Tests (locale / timezone / user-agent on context)
+# ============================================================================
+
+@pytest.mark.unit
+class TestFingerprintConsistency:
+    """locale and timezone are applied coherently on every launch path; the
+    user-agent is left to real Chrome unless explicitly overridden."""
+
+    _patched_playwright = staticmethod(TestBrowserHardening._patched_playwright)
+
+    @pytest.mark.asyncio
+    async def test_transient_context_receives_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The transient new_context call carries locale + timezone_id and, by
+        default, no user_agent override."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_LOCALE", "en-US")
+        monkeypatch.setenv("BROWSER_TIMEZONE", "America/New_York")
+        monkeypatch.delenv("BROWSER_USER_AGENT", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["locale"] == "en-US"
+        assert kwargs["timezone_id"] == "America/New_York"
+        # No override -> real Chrome's UA is left untouched.
+        assert "user_agent" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_persistent_context_receives_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The persistent-context launch carries locale + timezone_id too, so
+        both launch paths produce one coherent fingerprint."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+        monkeypatch.setenv("BROWSER_LOCALE", "es-ES")
+        monkeypatch.setenv("BROWSER_TIMEZONE", "Europe/Madrid")
+        monkeypatch.delenv("BROWSER_USER_AGENT", raising=False)
+
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = playwright.chromium.launch_persistent_context.call_args.kwargs
+        assert kwargs["locale"] == "es-ES"
+        assert kwargs["timezone_id"] == "Europe/Madrid"
+        assert "user_agent" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_user_agent_override_applied_when_set(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When BROWSER_USER_AGENT is set it is passed through to the context."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) Custom")
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64) Custom"
+
+
+# ============================================================================
 # LinkedInProfile Dataclass Tests
 # ============================================================================
 
