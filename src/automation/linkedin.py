@@ -179,14 +179,34 @@ class LinkedInAutomation:
                 if self.context.pages:
                     self.page = self.context.pages[0]
                     logger.info("Using existing page from persistent context")
+                    # The reused page's current document loaded before the
+                    # init script was registered, so reload it so the mask
+                    # applies before this page navigates to LinkedIn.
+                    try:
+                        await self.page.reload(wait_until="domcontentloaded")
+                    except Exception as reload_error:
+                        logger.debug(
+                            "Could not reload reused persistent page: %s", reload_error
+                        )
             except Exception as persistent_error:
                 logger.exception(
                     "Failed persistent context, falling back to transient browser…"
                 )
-                # Discard the half-built context so the transient fallback
-                # below actually engages and registers the webdriver mask on a
-                # fresh context (a partial failure can leave self.context set).
+                # Close the half-built context (if any) so the partial Chrome
+                # instance is not leaked, then discard it so the transient
+                # fallback below engages and registers the mask on a fresh
+                # context.
+                if self.context:
+                    try:
+                        await self.context.close()
+                    except Exception as close_error:
+                        logger.debug(
+                            "Could not close partial persistent context: %s",
+                            close_error,
+                        )
                 self.context = None
+                self.browser = None
+                self.page = None
                 use_persistent = False
 
         if not self.context:

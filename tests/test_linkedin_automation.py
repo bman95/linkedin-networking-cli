@@ -492,6 +492,9 @@ class TestBrowserHardening:
         context.new_page.assert_not_called()
         assert automation.page is existing_page
         assert page_at_registration["value"] is None
+        # The reused page's current document predates the init script, so it is
+        # reloaded to apply the mask before navigating to LinkedIn.
+        existing_page.reload.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_persistent_failure_falls_back_and_masks_transient_context(
