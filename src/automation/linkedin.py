@@ -28,6 +28,7 @@ from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
 from automation.interactions import random_wait, _is_true_limit
+from automation.diagnostics import capture_error_context
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -433,12 +434,22 @@ class LinkedInAutomation:
                 await self.page.wait_for_selector(
                     ".search-results-container, main a[href*='/in/']", timeout=15000
                 )
-            except TimeoutError:
-                raise SelectorNotFoundException(
+            except TimeoutError as exc:
+                not_found = SelectorNotFoundException(
                     "Search results not found - LinkedIn page structure may have changed",
                     selector=".search-results-container, main a[href*='/in/']",
                     timeout=15000
                 )
+                # Capture an evidence bundle before raising so a layout change
+                # leaves a screenshot + DOM snapshot to inspect. Best-effort:
+                # this never raises and never masks the original failure.
+                await capture_error_context(
+                    self.page,
+                    "search_results_readiness_wait",
+                    exc=not_found,
+                    context={"campaign": campaign.name},
+                )
+                raise not_found from exc
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops
