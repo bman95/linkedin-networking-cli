@@ -40,6 +40,21 @@ from exceptions import (
 logger = get_logger(__name__)
 
 
+# Passive automation hardening: drop the two most obvious "this is a bot"
+# tells that page JS can read for free. Scope is deliberately narrow — no
+# canvas/WebGL/audio fingerprint spoofing (synthetic noise creates
+# detectable inconsistencies on real Chrome).
+#
+# 1. Disables the AutomationControlled blink feature, which otherwise sets
+#    navigator.webdriver = true and advertises automation to detectors.
+AUTOMATION_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+# 2. Belt-and-braces: mask navigator.webdriver before any page script runs,
+#    in case the flag is still readable on a given Chrome build.
+WEBDRIVER_MASK_SCRIPT = (
+    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+)
+
+
 def force_close_chrome() -> None:
     """Close Chrome processes forcefully before launching Playwright."""
     try:
@@ -133,6 +148,7 @@ class LinkedInAutomation:
         launch_kwargs: Dict[str, Any] = {
             "headless": browser_settings["headless"],
             "timeout": 60_000,  # Increased timeout
+            "args": list(AUTOMATION_LAUNCH_ARGS),
         }
 
         browser_executable = browser_settings.get("executable_path")
@@ -175,15 +191,44 @@ class LinkedInAutomation:
                     **persistent_kwargs,
                 )
                 self.browser = self.context.browser
+                # Register the webdriver mask before touching any page: a
+                # persistent context opens with a page already loaded, and an
+                # init script only applies to documents created or navigated
+                # after registration.
+                await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
                 # Persistent context already opens a page; reuse it instead
                 # of creating a second tab.
                 if self.context.pages:
                     self.page = self.context.pages[0]
                     logger.info("Using existing page from persistent context")
+                    # The reused page's current document loaded before the
+                    # init script was registered, so reload it so the mask
+                    # applies before this page navigates to LinkedIn.
+                    try:
+                        await self.page.reload(wait_until="domcontentloaded")
+                    except Exception as reload_error:
+                        logger.debug(
+                            "Could not reload reused persistent page: %s", reload_error
+                        )
             except Exception as persistent_error:
                 logger.exception(
                     "Failed persistent context, falling back to transient browser…"
                 )
+                # Close the half-built context (if any) so the partial Chrome
+                # instance is not leaked, then discard it so the transient
+                # fallback below engages and registers the mask on a fresh
+                # context.
+                if self.context:
+                    try:
+                        await self.context.close()
+                    except Exception as close_error:
+                        logger.debug(
+                            "Could not close partial persistent context: %s",
+                            close_error,
+                        )
+                self.context = None
+                self.browser = None
+                self.page = None
                 use_persistent = False
 
         if not self.context:
@@ -196,7 +241,8 @@ class LinkedInAutomation:
                         launch_error,
                     )
                     self.browser = await self.playwright.chromium.launch(
-                        headless=browser_settings["headless"]
+                        headless=browser_settings["headless"],
+                        args=list(AUTOMATION_LAUNCH_ARGS),
                     )
                 else:
                     raise
@@ -221,6 +267,11 @@ class LinkedInAutomation:
                     viewport=browser_settings["viewport"]
                 )
                 logger.info("Starting fresh LinkedIn session")
+
+            # Mask navigator.webdriver before the page is created, so it runs
+            # before any page script on every navigation. This non-persistent
+            # context has no page yet (one is created below).
+            await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
 
         if self.page is None:
             self.page = await self.context.new_page()

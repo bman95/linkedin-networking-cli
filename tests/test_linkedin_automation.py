@@ -365,6 +365,176 @@ class TestContextManager:
 
 
 # ============================================================================
+# Browser Hardening Tests (navigator.webdriver / AutomationControlled)
+# ============================================================================
+
+@pytest.mark.unit
+class TestBrowserHardening:
+    """Passive automation tells are masked on every launch path."""
+
+    AUTOMATION_ARG = "--disable-blink-features=AutomationControlled"
+
+    @staticmethod
+    def _patched_playwright(monkeypatch, *, persistent_pages=None):
+        """Patch async_playwright/force_close_chrome and return the
+        playwright mock plus the context that start_browser will use."""
+        from automation import linkedin as linkedin_module
+
+        context = AsyncMock()
+        context.add_init_script = AsyncMock()
+        context.new_page = AsyncMock()
+        if persistent_pages is not None:
+            context.pages = persistent_pages
+            context.browser = AsyncMock()
+
+        browser = AsyncMock()
+        browser.new_context = AsyncMock(return_value=context)
+
+        playwright = AsyncMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            return_value=context
+        )
+        playwright.stop = AsyncMock()
+
+        starter = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(
+            linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
+        )
+        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+        return playwright, browser, context
+
+    @pytest.mark.asyncio
+    async def test_transient_launch_includes_automation_arg(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The transient browser launch carries the AutomationControlled flag."""
+        # No executable / Chrome channel -> persistent path is skipped.
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        args = playwright.chromium.launch.call_args.kwargs["args"]
+        assert self.AUTOMATION_ARG in args
+
+    @pytest.mark.asyncio
+    async def test_persistent_launch_includes_automation_arg(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The persistent-context launch carries the AutomationControlled flag."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = playwright.chromium.launch_persistent_context.call_args.kwargs
+        assert self.AUTOMATION_ARG in kwargs["args"]
+
+    @pytest.mark.asyncio
+    async def test_init_script_registered_on_context(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """A navigator.webdriver mask is registered at the context level."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        context.add_init_script.assert_called_once()
+        script = context.add_init_script.call_args.args[0]
+        assert "navigator" in script and "webdriver" in script
+
+    @pytest.mark.asyncio
+    async def test_init_script_registered_on_persistent_context_before_page_reuse(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """On the persistent path the mask is registered before the
+        pre-existing page is reused.
+
+        An init script only applies to documents created/navigated after
+        registration, so registering after binding the persistent context's
+        existing page would leave that page's current document unmasked.
+        """
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        existing_page = AsyncMock()
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[existing_page]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+
+        # Record whether the existing page had already been bound to
+        # automation.page when the mask was registered.
+        page_at_registration = {}
+
+        async def record(*_args, **_kwargs):
+            page_at_registration["value"] = automation.page
+
+        context.add_init_script.side_effect = record
+
+        await automation.start_browser()
+
+        context.add_init_script.assert_called_once()
+        # Pre-existing page reused (no extra tab), and the mask was registered
+        # before that page was bound.
+        context.new_page.assert_not_called()
+        assert automation.page is existing_page
+        assert page_at_registration["value"] is None
+        # The reused page's current document predates the init script, so it is
+        # reloaded to apply the mask before navigating to LinkedIn.
+        existing_page.reload.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_persistent_failure_falls_back_and_masks_transient_context(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When the persistent context fails, the transient fallback still
+        registers the webdriver mask exactly once on the new context."""
+        from automation import linkedin as linkedin_module
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        transient_context = AsyncMock()
+        transient_context.add_init_script = AsyncMock()
+        transient_context.new_page = AsyncMock()
+
+        browser = AsyncMock()
+        browser.new_context = AsyncMock(return_value=transient_context)
+
+        playwright = AsyncMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            side_effect=Exception("persistent context unavailable")
+        )
+        playwright.stop = AsyncMock()
+
+        starter = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(
+            linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
+        )
+        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        # Fallback engaged on a fresh transient context, mask registered once.
+        assert automation.context is transient_context
+        transient_context.add_init_script.assert_called_once()
+
+
+# ============================================================================
 # LinkedInProfile Dataclass Tests
 # ============================================================================
 
