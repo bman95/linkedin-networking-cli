@@ -41,6 +41,21 @@ from exceptions import (
 logger = get_logger(__name__)
 
 
+# Passive automation hardening: drop the two most obvious "this is a bot"
+# tells that page JS can read for free. Scope is deliberately narrow — no
+# canvas/WebGL/audio fingerprint spoofing (synthetic noise creates
+# detectable inconsistencies on real Chrome).
+#
+# 1. Disables the AutomationControlled blink feature, which otherwise sets
+#    navigator.webdriver = true and advertises automation to detectors.
+AUTOMATION_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+# 2. Belt-and-braces: mask navigator.webdriver before any page script runs,
+#    in case the flag is still readable on a given Chrome build.
+WEBDRIVER_MASK_SCRIPT = (
+    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+)
+
+
 def force_close_chrome() -> None:
     """Close Chrome processes forcefully before launching Playwright."""
     try:
@@ -111,6 +126,7 @@ class LinkedInAutomation:
         launch_kwargs: Dict[str, Any] = {
             "headless": browser_settings["headless"],
             "timeout": 60_000,  # Increased timeout
+            "args": list(AUTOMATION_LAUNCH_ARGS),
         }
 
         browser_executable = browser_settings.get("executable_path")
@@ -174,7 +190,8 @@ class LinkedInAutomation:
                         launch_error,
                     )
                     self.browser = await self.playwright.chromium.launch(
-                        headless=browser_settings["headless"]
+                        headless=browser_settings["headless"],
+                        args=list(AUTOMATION_LAUNCH_ARGS),
                     )
                 else:
                     raise
@@ -199,6 +216,11 @@ class LinkedInAutomation:
                     viewport=browser_settings["viewport"]
                 )
                 logger.info("Starting fresh LinkedIn session")
+
+        # Mask navigator.webdriver before any page script runs. Registering on
+        # the context (not the page) applies it to every page and survives
+        # navigation, covering all launch paths above.
+        await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
 
         if self.page is None:
             self.page = await self.context.new_page()

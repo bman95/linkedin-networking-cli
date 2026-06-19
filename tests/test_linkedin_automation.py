@@ -365,6 +365,114 @@ class TestContextManager:
 
 
 # ============================================================================
+# Browser Hardening Tests (navigator.webdriver / AutomationControlled)
+# ============================================================================
+
+@pytest.mark.unit
+class TestBrowserHardening:
+    """Passive automation tells are masked on every launch path."""
+
+    AUTOMATION_ARG = "--disable-blink-features=AutomationControlled"
+
+    @staticmethod
+    def _patched_playwright(monkeypatch, *, persistent_pages=None):
+        """Patch async_playwright/force_close_chrome and return the
+        playwright mock plus the context that start_browser will use."""
+        from automation import linkedin as linkedin_module
+
+        context = AsyncMock()
+        context.add_init_script = AsyncMock()
+        context.new_page = AsyncMock()
+        if persistent_pages is not None:
+            context.pages = persistent_pages
+            context.browser = AsyncMock()
+
+        browser = AsyncMock()
+        browser.new_context = AsyncMock(return_value=context)
+
+        playwright = AsyncMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            return_value=context
+        )
+        playwright.stop = AsyncMock()
+
+        starter = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(
+            linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
+        )
+        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+        return playwright, browser, context
+
+    @pytest.mark.asyncio
+    async def test_transient_launch_includes_automation_arg(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The transient browser launch carries the AutomationControlled flag."""
+        # No executable / Chrome channel -> persistent path is skipped.
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        args = playwright.chromium.launch.call_args.kwargs["args"]
+        assert self.AUTOMATION_ARG in args
+
+    @pytest.mark.asyncio
+    async def test_persistent_launch_includes_automation_arg(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The persistent-context launch carries the AutomationControlled flag."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = playwright.chromium.launch_persistent_context.call_args.kwargs
+        assert self.AUTOMATION_ARG in kwargs["args"]
+
+    @pytest.mark.asyncio
+    async def test_init_script_registered_on_context(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """A navigator.webdriver mask is registered at the context level."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        context.add_init_script.assert_called_once()
+        script = context.add_init_script.call_args.args[0]
+        assert "navigator" in script and "webdriver" in script
+
+    @pytest.mark.asyncio
+    async def test_init_script_registered_on_persistent_context(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The mask is also registered on the persistent context path."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        context.add_init_script.assert_called_once()
+
+
+# ============================================================================
 # LinkedInProfile Dataclass Tests
 # ============================================================================
 
