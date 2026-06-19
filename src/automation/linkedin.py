@@ -879,6 +879,9 @@ class LinkedInAutomation:
                 # don't release it. reserved_count is the cumulative day total.
                 slot_reserved = False
                 total_today = reserved_count
+                # Stamp the cooldown timestamp now (only on a real send, not on
+                # reservation), so a failed send never triggers a false cooldown.
+                self.db_manager.mark_connection_sent(today)
                 logger.info(f"Successfully sent connection request to {profile.name}")
 
                 if progress_callback:

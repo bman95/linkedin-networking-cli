@@ -864,6 +864,26 @@ class TestPersistedDailyCap:
         assert result["sent"] == 0
         # Every reservation was released: no slots consumed.
         assert db.get_daily_connection_count(today) == 0
+        # And a failed send must NOT stamp the cooldown timestamp.
+        assert db.get_last_connection_at() is None
+
+    @pytest.mark.asyncio
+    async def test_successful_send_stamps_cooldown_timestamp(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A confirmed send records last_action_at (drives the cooldown)."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        assert db.get_last_connection_at() is None
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(1), progress_callback=None
+            )
+        assert db.get_last_connection_at() is not None
 
 
 # ============================================================================

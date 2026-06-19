@@ -351,8 +351,10 @@ class DatabaseManager:
         at ``limit - 1``.
 
         Returns the new cumulative count when a slot was claimed, or ``None``
-        when the day is already at the limit (caller must stop). The
-        last-action timestamp is recorded for the inter-session cooldown.
+        when the day is already at the limit (caller must stop). This does NOT
+        touch ``last_action_at`` — that timestamp drives the inter-session
+        cooldown and must reflect an actual send, so it is stamped separately
+        by :meth:`mark_connection_sent` only on confirmed success.
 
         If a reserved slot is not used (e.g. the send fails), call
         :meth:`release_daily_slot` to give it back.
@@ -362,13 +364,11 @@ class DatabaseManager:
             # guard, so refuse explicitly.
             return None
         try:
-            now = datetime.now(timezone.utc)
             now_naive = datetime.now()
             with self.get_session() as session:
                 stmt = sqlite_insert(DailyConnectionCount).values(
                     date=date_str,
                     count=1,
-                    last_action_at=now,
                 )
                 # The WHERE guard makes the conflict update a no-op once the day
                 # is at the limit. rowcount distinguishes the two count==limit
@@ -379,7 +379,6 @@ class DatabaseManager:
                     index_elements=["date"],
                     set_={
                         "count": DailyConnectionCount.count + 1,
-                        "last_action_at": now,
                         "updated_at": now_naive,
                     },
                     where=DailyConnectionCount.count < limit,
@@ -433,6 +432,27 @@ class DatabaseManager:
                 logger.debug(f"Released a daily connection slot for {date_str}")
         except Exception as e:
             logger.error(f"Failed to release daily connection slot for {date_str}: {e}")
+
+    def mark_connection_sent(self, date_str: str) -> None:
+        """Stamp the last-action timestamp after a request was actually sent.
+
+        Kept separate from slot reservation so the inter-session cooldown
+        reflects real sends only: a reserved-then-released slot (failed send)
+        must not leave a stale ``last_action_at`` that would falsely trigger a
+        cooldown on the next run. Best-effort; logged rather than raised.
+        """
+        try:
+            with self.get_session() as session:
+                stmt = (
+                    update(DailyConnectionCount)
+                    .where(DailyConnectionCount.date == date_str)
+                    .values(last_action_at=datetime.now(timezone.utc))
+                )
+                session.exec(stmt)
+                session.commit()
+                logger.debug(f"Marked a connection sent for {date_str}")
+        except Exception as e:
+            logger.error(f"Failed to mark connection sent for {date_str}: {e}")
 
     def get_last_connection_at(self) -> Optional[datetime]:
         """Return the most recent connection timestamp across all days.
