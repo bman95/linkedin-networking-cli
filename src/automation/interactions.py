@@ -6,15 +6,12 @@ All functions operate on an async Playwright ``Page`` and must be awaited.
 
 import math
 import random
-from datetime import datetime
-from typing import Optional, Dict, Any
 import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
-from exceptions import RateLimitExceededException, CaptchaDetectedException
 
 logger = get_logger(__name__)
 
@@ -92,20 +89,6 @@ async def _is_true_limit(modal) -> bool:
     return any(t in header for t in true_texts)
 
 
-async def check_connection_email_required(page) -> bool:
-    """Check that email is not required to connect."""
-    logger.info("Checking if email is required to connect")
-    label = await page.query_selector('label[for="email"]')
-    if label:
-        logger.info("Email request modal detected. Not clicking connect...")
-        # Try to dismiss the modal
-        dismiss_button = await page.query_selector('button[aria-label="Dismiss"]')
-        if dismiss_button:
-            await dismiss_button.click()
-        return True
-    return False
-
-
 async def detect_captcha(page) -> bool:
     """Detect if a CAPTCHA challenge is present on the page."""
     try:
@@ -145,186 +128,6 @@ async def detect_captcha(page) -> bool:
     except Exception as e:
         logger.warning(f"Error detecting CAPTCHA: {e}")
         return False
-
-
-async def detect_invitation_limit(page) -> bool:
-    """Detect if LinkedIn invitation limit has been reached."""
-    try:
-        # Look for common invitation limit modal indicators
-        limit_modals = [
-            "#ip-fuse-limit-alert",
-            "[data-test-modal-id='ip-fuse-limit-alert']",
-            ".artdeco-modal[role='dialog']",
-        ]
-
-        for selector in limit_modals:
-            modal = await page.query_selector(selector)
-            if modal and await modal.is_visible():
-                if await _is_true_limit(modal):
-                    logger.warning("LinkedIn invitation limit detected!")
-                    return True
-
-        # Also check for limit text in the page
-        limit_texts = [
-            "weekly invitation limit",
-            "límite semanal de invitaciones",
-            "invitation limit reached",
-        ]
-
-        page_content = (await page.content()).lower()
-        for text in limit_texts:
-            if text in page_content:
-                logger.warning(f"Invitation limit text detected: {text}")
-                return True
-
-        return False
-
-    except Exception as e:
-        logger.warning(f"Error detecting invitation limit: {e}")
-        return False
-
-
-async def send_connection_request(
-    page,
-    candidate_name: str,
-    message_template: Optional[str] = None,
-    progress_callback: Optional[callable] = None,
-) -> Dict[str, Any]:
-    """
-    Send connection request with enhanced error handling and limit detection.
-
-    Returns:
-        Dict with keys: success (bool), status (str), message (str)
-    """
-    try:
-        if progress_callback:
-            progress_callback(f"Attempting to connect with {candidate_name}")
-
-        # Wait for page to load
-        await random_wait(page, min_ms=2000, max_ms=4000)
-
-        # Check for CAPTCHA challenge
-        if await detect_captcha(page):
-            raise CaptchaDetectedException("CAPTCHA challenge detected - manual verification required")
-
-        # Check if email is required for connection
-        if await check_connection_email_required(page):
-            return {
-                "success": False,
-                "status": "email_required",
-                "message": "Email required for connection"
-            }
-
-        # Look for connect button
-        connect_selectors = [
-            "button:has-text('Connect')",
-            "button[aria-label*='Invite'][aria-label*='connect']",
-            "button[data-test-app-aware-link]",
-        ]
-
-        connect_button = None
-        for selector in connect_selectors:
-            connect_button = await page.query_selector(selector)
-            if connect_button and await connect_button.is_visible():
-                break
-
-        if not connect_button:
-            return {
-                "success": False,
-                "status": "no_connect_button",
-                "message": "No connect button found"
-            }
-
-        # Click connect button
-        await connect_button.click()
-        await random_wait(page, min_ms=1000, max_ms=2000)
-
-        # Check for CAPTCHA after clicking
-        if await detect_captcha(page):
-            raise CaptchaDetectedException("CAPTCHA challenge detected after clicking connect")
-
-        # Check for invitation limit after clicking
-        if await detect_invitation_limit(page):
-            raise RateLimitExceededException(
-                "LinkedIn weekly invitation limit reached",
-                limit_type="weekly"
-            )
-
-        # Handle connection modal
-        send_button = None
-
-        # Look for send buttons
-        send_selectors = [
-            "button:has-text('Send without a note')",
-            "button:has-text('Send')",
-            "button[aria-label='Send now']",
-        ]
-
-        for selector in send_selectors:
-            send_button = await page.query_selector(selector)
-            if send_button and await send_button.is_visible():
-                break
-
-        if send_button:
-            # If we have a message template and there's an option to add a note
-            if message_template and message_template.strip():
-                note_button = await page.query_selector("button:has-text('Add a note')")
-                if note_button and await note_button.is_visible():
-                    await note_button.click()
-                    await random_wait(page, min_ms=500, max_ms=1000)
-
-                    # Fill in the personalized message
-                    message = message_template.format(name=candidate_name)
-                    textarea = await page.query_selector("textarea")
-                    if textarea:
-                        await textarea.fill(message)
-                        await random_wait(page, min_ms=500, max_ms=1000)
-
-            # Send the connection request
-            await send_button.click()
-            await random_wait(page, min_ms=1000, max_ms=2000)
-
-            # Check again for invitation limit after sending
-            if await detect_invitation_limit(page):
-                raise RateLimitExceededException(
-                    "LinkedIn weekly invitation limit reached",
-                    limit_type="weekly"
-                )
-
-            if progress_callback:
-                progress_callback(f"✅ Connection request sent to {candidate_name}")
-
-            return {
-                "success": True,
-                "status": "sent",
-                "message": f"Connection request sent to {candidate_name}"
-            }
-        else:
-            return {
-                "success": False,
-                "status": "no_send_button",
-                "message": "No send button found in modal"
-            }
-
-    except (RateLimitExceededException, CaptchaDetectedException):
-        raise  # Re-raise limit / CAPTCHA exceptions for callers to handle
-    except Exception as e:
-        logger.error(f"Error sending connection request to {candidate_name}: {e}")
-
-        # Take screenshot on error
-        try:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            screenshot_path = f"Error_Screenshots/connection_error_{timestamp}.png"
-            await page.screenshot(path=screenshot_path)
-            logger.info(f"Screenshot saved: {screenshot_path}")
-        except Exception as screenshot_error:
-            logger.warning(f"Failed to save screenshot: {screenshot_error}")
-
-        return {
-            "success": False,
-            "status": "error",
-            "message": f"Error: {str(e)}"
-        }
 
 
 async def check_if_connected(page) -> bool:

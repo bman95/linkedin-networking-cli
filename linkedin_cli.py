@@ -4,14 +4,36 @@
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
-from rich.console import Console
+from rich.align import Align
+from rich.console import Console, Group
 from rich.panel import Panel
+from rich.text import Text
 from collections import namedtuple
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 import asyncio
 import csv
 import sys
+
+# LinkedIn brand blue, used across the welcome banner
+BRAND_BLUE = "#0A66C2"
+
+# ASCII logo (ANSI Shadow font) shown on startup
+LOGO = r"""██╗       ██╗  ███╗   ██╗  ██╗  ██╗  ███████╗  ██████╗   ██╗  ███╗   ██╗
+██║       ██║  ████╗  ██║  ██║ ██╔╝  ██╔════╝  ██╔══██╗  ██║  ████╗  ██║
+██║       ██║  ██╔██╗ ██║  █████╔╝   █████╗    ██║  ██║  ██║  ██╔██╗ ██║
+██║       ██║  ██║╚██╗██║  ██╔═██╗   ██╔══╝    ██║  ██║  ██║  ██║╚██╗██║
+███████╗  ██║  ██║ ╚████║  ██║  ██╗  ███████╗  ██████╔╝  ██║  ██║ ╚████║
+╚══════╝  ╚═╝  ╚═╝  ╚═══╝  ╚═╝  ╚═╝  ╚══════╝  ╚═════╝   ╚═╝  ╚═╝  ╚═══╝"""
+
+
+def _app_version() -> str:
+    """Return the installed package version, falling back gracefully."""
+    try:
+        return _pkg_version("linkedin-networking-cli")
+    except PackageNotFoundError:
+        return "0.1.0"
 
 # Add src directory to path for imports
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -65,12 +87,43 @@ class LinkedInCLI:
         return getattr(campaign, attr, default)
 
     def display_welcome(self):
-        """Display welcome banner"""
+        """Display a styled welcome banner."""
+        version = _app_version()
+
+        # On narrow terminals the ASCII logo would wrap and look broken,
+        # so fall back to a compact title instead.
+        if self.console.width < 74:
+            body = Group(
+                Align.center(
+                    Text("LinkedIn Networking CLI", style=f"bold {BRAND_BLUE}")
+                ),
+                Align.center(
+                    Text("Professional networking automation", style="dim")
+                ),
+            )
+        else:
+            logo = Text(LOGO, style=f"bold {BRAND_BLUE}")
+            subtitle = Text.assemble(
+                ("Networking Automation", "italic white"),
+                ("   ·   ", "dim"),
+                (f"v{version}", f"bold {BRAND_BLUE}"),
+            )
+            body = Group(
+                Align.center(logo),
+                Text(""),
+                Align.center(subtitle),
+            )
+
         self.console.print(
-            Panel.fit(
-                "[bold cyan]LinkedIn Networking CLI[/bold cyan]\n"
-                "[dim]Professional networking automation with InquirerPy interface[/dim]",
-                border_style="cyan",
+            Panel(
+                body,
+                border_style=BRAND_BLUE,
+                padding=(1, 4),
+            )
+        )
+        self.console.print(
+            Align.center(
+                Text("Press ↑ ↓ to navigate · Enter to select", style="dim")
             )
         )
         print()
