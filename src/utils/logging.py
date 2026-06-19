@@ -20,6 +20,7 @@ class LoggerSetup:
         log_level: int = logging.INFO,
         console_output: bool = True,
         file_output: bool = True,
+        console_level: int = logging.WARNING,
     ) -> None:
         """
         Configure logging for the entire application.
@@ -29,6 +30,8 @@ class LoggerSetup:
             log_level: Logging level (default: INFO)
             console_output: Enable console logging (default: True)
             file_output: Enable file logging (default: True)
+            console_level: Logging level for console output (default: WARNING, so
+                INFO startup noise stays out of the terminal but is kept in files)
         """
         if cls._initialized:
             return
@@ -60,7 +63,7 @@ class LoggerSetup:
         # Console handler
         if console_output:
             console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(log_level)
+            console_handler.setLevel(console_level)
             console_handler.setFormatter(simple_formatter)
             root_logger.addHandler(console_handler)
 
