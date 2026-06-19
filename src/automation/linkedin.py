@@ -591,6 +591,19 @@ class LinkedInAutomation:
 
         for i, profile in enumerate(profiles):
             try:
+                # Recompute the local-day key each iteration so a run that
+                # crosses midnight starts a fresh bucket, and re-check the
+                # persisted count (the source of truth) before each send so a
+                # concurrent run today is also accounted for.
+                today = date.today().isoformat()
+                if self.db_manager.get_daily_connection_count(today) >= daily_limit:
+                    if progress_callback:
+                        progress_callback(
+                            f"Daily connection limit reached "
+                            f"({daily_limit}/{daily_limit} used today)"
+                        )
+                    break
+
                 if progress_callback:
                     progress_callback(
                         f"Processing {profile.name} ({i + 1}/{len(profiles)})"
@@ -844,7 +857,17 @@ class LinkedInAutomation:
                 sent_count += 1
                 consecutive_failures = 0  # successful action resets backoff
                 # Persist the cumulative per-day count so it survives restarts.
-                total_today = self.db_manager.increment_daily_connection_count(today)
+                # A counter hiccup must not demote a request that really went
+                # out to "failed", so isolate it from the loop's except handler.
+                try:
+                    total_today = self.db_manager.increment_daily_connection_count(today)
+                except Exception as count_error:
+                    logger.error(
+                        "Sent request to %s but failed to persist daily count: %s",
+                        profile.name,
+                        count_error,
+                    )
+                    total_today = already_sent_today + sent_count
                 logger.info(f"Successfully sent connection request to {profile.name}")
 
                 if progress_callback:

@@ -1,6 +1,7 @@
 from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 from sqlmodel import SQLModel, create_engine, Session, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from pathlib import Path
 import json
 import sys
@@ -297,36 +298,43 @@ class DatabaseManager:
             raise
 
     def increment_daily_connection_count(self, date_str: str) -> int:
-        """Increment and persist the connection count for a given local day.
+        """Atomically increment the connection count for a given local day.
 
-        Upserts the per-day row and records the last-action timestamp (used for
-        the optional inter-session cooldown). Returns the new cumulative count.
+        Uses a single SQLite upsert (``INSERT ... ON CONFLICT DO UPDATE
+        SET count = count + 1``) so two same-day runs cannot race a
+        read-modify-write and under-count, and the unique-date insert race is
+        resolved in the database rather than raising. Records the last-action
+        timestamp (used for the optional inter-session cooldown) and returns
+        the new cumulative count.
         """
         try:
+            now = datetime.now(timezone.utc)
+            now_naive = datetime.now()
             with self.get_session() as session:
-                row = session.exec(
-                    select(DailyConnectionCount).where(
+                stmt = sqlite_insert(DailyConnectionCount).values(
+                    date=date_str,
+                    count=1,
+                    last_action_at=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["date"],
+                    set_={
+                        "count": DailyConnectionCount.count + 1,
+                        "last_action_at": now,
+                        "updated_at": now_naive,
+                    },
+                )
+                session.exec(stmt)
+                session.commit()
+                count = session.exec(
+                    select(DailyConnectionCount.count).where(
                         DailyConnectionCount.date == date_str
                     )
                 ).first()
-                now = datetime.now(timezone.utc)
-                if row:
-                    row.count += 1
-                    row.last_action_at = now
-                    row.updated_at = datetime.now()
-                else:
-                    row = DailyConnectionCount(
-                        date=date_str,
-                        count=1,
-                        last_action_at=now,
-                    )
-                    session.add(row)
-                session.commit()
-                session.refresh(row)
                 logger.debug(
-                    f"Incremented daily connection count for {date_str} to {row.count}"
+                    f"Incremented daily connection count for {date_str} to {count}"
                 )
-                return row.count
+                return count
         except Exception as e:
             logger.error(
                 f"Failed to increment daily connection count for {date_str}: {e}"

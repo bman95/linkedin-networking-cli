@@ -119,10 +119,11 @@ class Settings(SQLModel, table=True):
 class DailyConnectionCount(SQLModel, table=True):
     """Per-local-day connection counter for restart-safe rate limiting.
 
-    One row per local day (``date`` in YYYY-MM-DD format, matching
-    ``Analytics.date``). The cumulative count persists across CLI restarts so
-    the daily connection cap cannot be exceeded by quitting and reopening the
-    app; a new local day simply starts at a fresh row with count 0.
+    One row per local day (``date`` is a YYYY-MM-DD string derived from
+    ``date.today()`` so the bucket follows the user's wall-clock day). The
+    cumulative count persists across CLI restarts so the daily connection cap
+    cannot be exceeded by quitting and reopening the app; a new local day
+    simply starts at a fresh row with count 0.
     """
     id: Optional[int] = Field(default=None, primary_key=True)
     date: str = Field(index=True, unique=True)  # YYYY-MM-DD format (local day)

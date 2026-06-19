@@ -708,6 +708,107 @@ class TestPersistedDailyCap:
         # 15 < 20, so the run proceeds (does not early-return).
         assert db.get_daily_connection_count(today) == 15
 
+    def _wire_success_page(self, automation):
+        """Wire the mocked page/helpers so each profile reaches the success path.
+
+        Returns the configured automation. Patches the connect-control lookup,
+        the blocked/limit/captcha checks, and the modal locators so a Connect
+        click flows straight through to a successful "Send without a note".
+        """
+        button = AsyncMock()
+        button.click = AsyncMock()
+        button.evaluate = AsyncMock()
+
+        automation._find_connect_control = AsyncMock(return_value=(button, "connect"))
+        automation._invitation_blocked_toast = AsyncMock(return_value=False)
+        automation._handle_invitation_limit_modal = AsyncMock(return_value=False)
+
+        # No email-request modal.
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.goto = AsyncMock()
+        automation.page.wait_for_timeout = AsyncMock()
+
+        # Every modal locator reports one matching button that clicks cleanly.
+        loc = AsyncMock()
+        loc.count = AsyncMock(return_value=1)
+        loc.click = AsyncMock()
+        first = MagicMock()
+        first.first = loc
+        automation.page.locator = MagicMock(return_value=first)
+        return automation
+
+    @pytest.mark.asyncio
+    async def test_success_persists_count_and_reports_quota(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A successful send increments the persisted count and reports quota."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        messages = []
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=messages.append
+            )
+
+        today = date.today().isoformat()
+        assert result["sent"] == 3
+        assert db.get_daily_connection_count(today) == 3
+        # Acceptance criterion: remaining quota surfaced to the user.
+        assert any("1/20 used today" in m for m in messages)
+        assert any("3/20 used today" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_cumulative_break_stops_at_limit(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A run starting partway through today stops exactly at the cap."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        today = date.today().isoformat()
+        for _ in range(18):  # prior run left 18/20
+            db.increment_daily_connection_count(today)
+
+        self._wire_success_page(mock_linkedin_automation)
+        messages = []
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(10), progress_callback=messages.append
+            )
+
+        # Only 2 more sends allowed; cumulative count caps at 20.
+        assert result["sent"] == 2
+        assert db.get_daily_connection_count(today) == 20
+        assert any("Daily connection limit reached" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_cooldown_warns_when_within_window(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A run started within the cooldown window warns the user."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_COOLDOWN", "3600")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        # Record a recent connection (sets last_action_at to now).
+        db.increment_daily_connection_count(date.today().isoformat())
+
+        messages = []
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, [], progress_callback=messages.append
+            )
+
+        assert any("Cooldown active" in m for m in messages)
+
     @pytest.mark.asyncio
     async def test_new_day_starts_fresh(
         self, mock_linkedin_automation, monkeypatch, freeze_time
