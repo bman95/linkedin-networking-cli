@@ -45,14 +45,36 @@ def _good_page(url="https://www.linkedin.com/search", title="Search"):
     return page
 
 
+class _CrashedPage:
+    """A page where every accessor raises on ATTRIBUTE ACCESS.
+
+    A real closed Playwright page raises ``Target page ... has been closed``
+    the moment you touch ``page.url`` / ``page.title`` / ``page.content`` /
+    ``page.screenshot`` — before any await. An ``AsyncMock`` with
+    ``side_effect`` only raises on the await, which is a weaker failure mode,
+    so we model the realistic one explicitly here.
+    """
+
+    @property
+    def url(self):
+        raise RuntimeError("closed")
+
+    def __getattr__(self, name):
+        if name in ("title", "content", "screenshot"):
+            raise RuntimeError("closed")
+        raise AttributeError(name)
+
+
 def _crashed_page():
-    """A mock page where every accessor raises (crashed/closed page)."""
-    page = AsyncMock()
-    type(page).url = property(lambda self: (_ for _ in ()).throw(RuntimeError("closed")))
-    page.title = AsyncMock(side_effect=RuntimeError("closed"))
-    page.content = AsyncMock(side_effect=RuntimeError("closed"))
-    page.screenshot = AsyncMock(side_effect=RuntimeError("closed"))
-    return page
+    """A mock page where every accessor raises on attribute access."""
+    return _CrashedPage()
+
+
+class _BoomRepr:
+    """A value whose ``__repr__`` raises, to exercise the _safe_repr guard."""
+
+    def __repr__(self):
+        raise ValueError("boom in repr")
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +161,44 @@ class TestCaptureErrorContext:
         assert rec.diagnostics_exc_type == "ValueError"
         assert rec.diagnostics_profile_url == "https://li/in/jdoe"
         assert rec.diagnostics_campaign == "Camp A"
-        # Single parseable message line carries the key fields too.
+        # Single parseable message line carries the key fields too, including
+        # the artifact paths (an acceptance-criteria field most likely to
+        # regress silently).
         msg = rec.getMessage()
         assert "step=readiness_wait" in msg
         assert "exc_type=ValueError" in msg
+        assert "screenshot=" in msg
+        assert "dom=" in msg
+        assert rec.diagnostics_screenshot is not None
+        assert rec.diagnostics_dom is not None
 
     @pytest.mark.asyncio
     async def test_log_line_emitted_even_when_both_captures_fail(self, caplog):
         page = _crashed_page()
         with caplog.at_level(logging.ERROR, logger="automation.diagnostics"):
-            await capture_error_context(page, "boom", exc=RuntimeError("x"))
+            result = await capture_error_context(page, "boom", exc=RuntimeError("x"))
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert errors, "structured log line must still be emitted on a crashed page"
+        # Exactly one DIAGNOSTICS line must fire (not a backstop "failed" line).
+        diag_lines = [r for r in errors if "DIAGNOSTICS error" in r.getMessage()]
+        assert diag_lines, "structured DIAGNOSTICS line must fire on a crashed page"
+        # Return value is consistent with what's actually on disk (nothing).
+        assert result["screenshot"] is None and result["dom"] is None
+        assert result["screenshot_ok"] is False and result["dom_ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_never_raises_on_throwing_repr_context(self, caplog):
+        page = _good_page()
+        with caplog.at_level(logging.ERROR, logger="automation.diagnostics"):
+            # A context value whose __repr__ raises must not derail capture.
+            result = await capture_error_context(
+                page, "boom", exc=ValueError("x"), context={"weird": _BoomRepr()}
+            )
+        assert result["dom_ok"] is True  # capture still completed
+        diag_lines = [
+            r for r in caplog.records if "DIAGNOSTICS error" in r.getMessage()
+        ]
+        assert diag_lines, "structured line must fire despite a throwing __repr__"
+        assert "<unrepresentable>" in diag_lines[-1].getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +328,58 @@ class TestSearchReadinessWiring:
         assert call.kwargs["context"]["campaign"] == "Wiring Test"
         # The captured exception is the SelectorNotFoundException.
         assert type(call.kwargs["exc"]).__name__ == "SelectorNotFoundException"
+
+
+@pytest.mark.unit
+class TestSearchLoopDiagnosticsWiring:
+    """The ring buffer, per-run reset, and anomaly path are wired live."""
+
+    @pytest.mark.asyncio
+    async def test_run_resets_rate_limit_and_snapshots_landed_page(
+        self, mock_linkedin_automation
+    ):
+        from database.models import Campaign
+
+        campaign = Campaign(name="Loop Test")
+        # One search page that yields no profiles, then stop (no next button).
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(return_value=[])
+        mock_linkedin_automation.page.query_selector = AsyncMock(return_value=None)
+
+        with patch(
+            "automation.linkedin.reset_anomaly_rate_limit"
+        ) as mock_reset, patch(
+            "automation.linkedin.snapshot_page", new=AsyncMock()
+        ) as mock_snapshot, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=5)
+
+        # Per-run boundary cleared the anomaly counter exactly once.
+        mock_reset.assert_called_once()
+        # The landed page was snapshotted into the ring buffer (seq 0).
+        mock_snapshot.assert_awaited()
+        assert mock_snapshot.await_args.args[1] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_profiles_extracted_captures_anomaly(
+        self, mock_linkedin_automation
+    ):
+        from database.models import Campaign
+
+        campaign = Campaign(name="Anomaly Test")
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(return_value=[])
+        mock_linkedin_automation.page.query_selector = AsyncMock(return_value=None)
+
+        with patch(
+            "automation.linkedin.capture_anomaly_context", new=AsyncMock()
+        ) as mock_anomaly, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=5)
+
+        mock_anomaly.assert_awaited_once()
+        call = mock_anomaly.await_args
+        assert call.args[1] == "search_page_no_profiles_extracted"
+        assert call.kwargs["context"]["campaign"] == "Anomaly Test"

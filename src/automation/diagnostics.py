@@ -78,7 +78,12 @@ def _timestamp() -> str:
 
 
 async def _safe_text(coro_factory, default: str = "") -> str:
-    """Await a page accessor, swallowing any error (best-effort metadata)."""
+    """Await a page accessor, swallowing any error (best-effort metadata).
+
+    ``coro_factory`` is a zero-arg callable so the *attribute access* it
+    performs (e.g. ``page.title``) is also inside the guard — on a closed
+    page that access itself can raise.
+    """
     try:
         return await coro_factory()
     except Exception:
@@ -86,15 +91,19 @@ async def _safe_text(coro_factory, default: str = "") -> str:
 
 
 async def _safe_url(page) -> str:
-    """Read ``page.url`` defensively (it is a property that can throw)."""
+    """Read ``page.url`` defensively. On a closed page the access raises."""
     try:
-        value = page.url
-        # On real pages this is a str property; on mocks it may be a coroutine.
-        if callable(value):
-            value = value()
-        return str(value)
+        return str(page.url)
     except Exception:
         return ""
+
+
+def _safe_repr(value: Any) -> str:
+    """``repr`` that can never raise (a value's ``__repr__`` may throw)."""
+    try:
+        return repr(value)
+    except Exception:
+        return "<unrepresentable>"
 
 
 async def _capture_screenshot(page, path: Path) -> bool:
@@ -154,15 +163,17 @@ async def _capture_bundle(
     png_path = base_dir / f"{prefix}_{slug}_{ts}.png"
     html_path = base_dir / f"{prefix}_{slug}_{ts}.html"
 
-    # Best-effort page metadata (each accessor independently guarded).
+    # Best-effort page metadata. Each accessor is fully guarded, including the
+    # attribute access itself (e.g. ``page.title``) — on a closed page even
+    # touching the attribute can raise.
     url = await _safe_url(page)
-    title = await _safe_text(page.title, "")
+    title = await _safe_text(lambda: page.title(), "")
 
     screenshot_ok = await _capture_screenshot(page, png_path)
     dom_ok = await _capture_dom(page, html_path)
 
     exc_type = type(exc).__name__ if exc is not None else None
-    exc_msg = str(exc) if exc is not None else None
+    exc_msg = _safe_repr(exc) if exc is not None else None
 
     artifacts = {
         "screenshot": str(png_path) if screenshot_ok else None,
@@ -184,28 +195,37 @@ async def _capture_bundle(
         "diagnostics_campaign": context.get("campaign"),
     }
 
-    # One clearly-parseable line carrying all the salient context.
+    # One clearly-parseable line carrying all the salient context. Every
+    # interpolation uses _safe_repr so a value with a throwing __repr__ can
+    # never derail the log emission below.
     parts = [
         f"step={name}",
-        f"url={url!r}",
-        f"title={title!r}",
+        f"url={_safe_repr(url)}",
+        f"title={_safe_repr(title)}",
         f"exc_type={exc_type}",
-        f"exc_msg={exc_msg!r}",
+        f"exc_msg={exc_msg}",
         f"screenshot={artifacts['screenshot']}",
         f"dom={artifacts['dom']}",
     ]
     if context.get("profile_url"):
-        parts.append(f"profile_url={context['profile_url']!r}")
+        parts.append(f"profile_url={_safe_repr(context['profile_url'])}")
     if context.get("campaign"):
-        parts.append(f"campaign={context['campaign']!r}")
+        parts.append(f"campaign={_safe_repr(context['campaign'])}")
     # Surface any additional context keys without overwriting the structured ones.
     for key, value in context.items():
         if key in ("profile_url", "campaign"):
             continue
-        parts.append(f"{key}={value!r}")
+        parts.append(f"{key}={_safe_repr(value)}")
         extra[f"diagnostics_{key}"] = value
 
-    logger.log(severity, "DIAGNOSTICS %s | %s", prefix, " ".join(parts), extra=extra)
+    # The structured line is the one thing that must always be emitted, even
+    # if both captures failed on a crashed page. Guard it so message assembly
+    # can never swallow it.
+    try:
+        logger.log(severity, "DIAGNOSTICS %s | %s", prefix, " ".join(parts), extra=extra)
+    except Exception as log_exc:  # pragma: no cover - defensive backstop
+        logger.log(severity, "DIAGNOSTICS %s | step=%s (log assembly failed: %s)",
+                   prefix, name, log_exc)
 
     return artifacts
 

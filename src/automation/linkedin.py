@@ -28,7 +28,12 @@ from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
 from automation.interactions import random_wait, _is_true_limit
-from automation.diagnostics import capture_error_context
+from automation.diagnostics import (
+    capture_error_context,
+    capture_anomaly_context,
+    snapshot_page,
+    reset_anomaly_rate_limit,
+)
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -418,6 +423,9 @@ class LinkedInAutomation:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         profiles = []
+        # New run boundary: clear the per-run anomaly capture rate limit so a
+        # long-lived CLI process doesn't leak the counter across campaigns.
+        reset_anomaly_rate_limit()
 
         try:
             # Build search URL
@@ -475,6 +483,12 @@ class LinkedInAutomation:
                         timeout=10000
                     )
 
+                # Record the landed search page into the rolling ring buffer so
+                # a later failure can be traced back through how we got here.
+                await snapshot_page(self.page, page_count - 1)
+
+                profiles_before_page = len(profiles)
+
                 # Legacy UI: structured result elements with a stable attribute
                 profile_elements = await self.page.query_selector_all(
                     "[data-chameleon-result-urn]"
@@ -498,6 +512,17 @@ class LinkedInAutomation:
                         if profile.profile_url not in seen_urls:
                             profiles.append(profile)
                             seen_urls.add(profile.profile_url)
+
+                # The readiness selector matched but neither extraction strategy
+                # yielded a profile: a "weird but survivable" SDUI-drift state.
+                # Capture an anomaly bundle (rate-limited, best-effort) so a
+                # silent extraction regression leaves evidence.
+                if len(profiles) == profiles_before_page:
+                    await capture_anomaly_context(
+                        self.page,
+                        "search_page_no_profiles_extracted",
+                        context={"campaign": campaign.name, "page": page_count},
+                    )
 
                 # Check for next page (EN/ES aria-labels, then SDUI text button)
                 next_button = await self.page.query_selector(
