@@ -835,6 +835,36 @@ class TestPersistedDailyCap:
         assert result["sent"] == 0
         assert not any("already reached" in m for m in messages)
 
+    @pytest.mark.asyncio
+    async def test_non_send_outcome_releases_reserved_slot(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A profile that doesn't end in a confirmed send must not burn a slot.
+
+        The blocked-invitation path reserves a slot before the send then bails,
+        so the reservation has to be released — otherwise the day's budget
+        leaks and the user loses real capacity.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+        # Force the post-reservation blocked-invitation exit for every profile.
+        mock_linkedin_automation._invitation_blocked_toast = AsyncMock(
+            return_value=True
+        )
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=None
+            )
+
+        today = date.today().isoformat()
+        assert result["sent"] == 0
+        # Every reservation was released: no slots consumed.
+        assert db.get_daily_connection_count(today) == 0
+
 
 # ============================================================================
 # Error Handling Tests

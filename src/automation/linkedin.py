@@ -590,12 +590,15 @@ class LinkedInAutomation:
         backoff_cap_seconds = 300
 
         for i, profile in enumerate(profiles):
+            # Tracks whether THIS iteration has claimed a daily slot, so any
+            # path that doesn't end in a confirmed send can give it back.
+            slot_reserved = False
+            today = date.today().isoformat()
             try:
                 # Recompute the local-day key each iteration so a run that
-                # crosses midnight starts a fresh bucket, and re-check the
-                # persisted count (the source of truth) before each send so a
-                # concurrent run today is also accounted for.
-                today = date.today().isoformat()
+                # crosses midnight starts a fresh bucket. The actual slot is
+                # claimed atomically just before sending (reserve-before-send),
+                # so this is only a cheap early stop, not the enforcement point.
                 if self.db_manager.get_daily_connection_count(today) >= daily_limit:
                     if progress_callback:
                         progress_callback(
@@ -678,6 +681,21 @@ class LinkedInAutomation:
                     if progress_callback:
                         progress_callback(f"⚠️ No Connect button for {profile.name}")
                     continue
+
+                # Reserve a daily slot atomically BEFORE sending. This closes
+                # the check-then-send window: a concurrent run cannot also pass
+                # the cap while we are mid-send, because only one process can
+                # claim the slot that brings the count to the limit. If the
+                # reservation is refused, the day is full and we stop.
+                reserved_count = self.db_manager.reserve_daily_slot(today, daily_limit)
+                if reserved_count is None:
+                    if progress_callback:
+                        progress_callback(
+                            f"Daily connection limit reached "
+                            f"({daily_limit}/{daily_limit} used today)"
+                        )
+                    break
+                slot_reserved = True
 
                 # Click Connect. The top-card control is already in view at
                 # scroll-top, so a real Playwright click reaches it and the
@@ -856,18 +874,11 @@ class LinkedInAutomation:
                 self.db_manager.create_contact(contact_data)
                 sent_count += 1
                 consecutive_failures = 0  # successful action resets backoff
-                # Persist the cumulative per-day count so it survives restarts.
-                # A counter hiccup must not demote a request that really went
-                # out to "failed", so isolate it from the loop's except handler.
-                try:
-                    total_today = self.db_manager.increment_daily_connection_count(today)
-                except Exception as count_error:
-                    logger.error(
-                        "Sent request to %s but failed to persist daily count: %s",
-                        profile.name,
-                        count_error,
-                    )
-                    total_today = already_sent_today + sent_count
+                # The slot was reserved (and persisted) before the send, so the
+                # request is now confirmed and the reservation is consumed —
+                # don't release it. reserved_count is the cumulative day total.
+                slot_reserved = False
+                total_today = reserved_count
                 logger.info(f"Successfully sent connection request to {profile.name}")
 
                 if progress_callback:
@@ -917,6 +928,13 @@ class LinkedInAutomation:
                         )
                     await self.page.wait_for_timeout(wait_seconds * 1000)
                 continue
+            finally:
+                # Give back a reserved slot that wasn't consumed by a confirmed
+                # send (email-required, blocked, modal-not-found, failed send,
+                # or any exception). Success clears the flag, so this is a
+                # no-op there. Runs on every continue/break/exception exit.
+                if slot_reserved:
+                    self.db_manager.release_daily_slot(today)
 
         # Update campaign statistics
         self.db_manager.update_campaign_stats(campaign.id)

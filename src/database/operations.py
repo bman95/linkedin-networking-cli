@@ -1,6 +1,6 @@
 from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
-from sqlmodel import SQLModel, create_engine, Session, select
+from sqlmodel import SQLModel, create_engine, Session, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from pathlib import Path
 import json
@@ -300,12 +300,10 @@ class DatabaseManager:
     def increment_daily_connection_count(self, date_str: str) -> int:
         """Atomically increment the connection count for a given local day.
 
-        Uses a single SQLite upsert (``INSERT ... ON CONFLICT DO UPDATE
+        A single SQLite upsert (``INSERT ... ON CONFLICT DO UPDATE
         SET count = count + 1``) so two same-day runs cannot race a
-        read-modify-write and under-count, and the unique-date insert race is
-        resolved in the database rather than raising. Records the last-action
-        timestamp (used for the optional inter-session cooldown) and returns
-        the new cumulative count.
+        read-modify-write. Unconditional — use :meth:`reserve_daily_slot` when
+        the increment must respect the daily limit. Returns the new count.
         """
         try:
             now = datetime.now(timezone.utc)
@@ -340,6 +338,101 @@ class DatabaseManager:
                 f"Failed to increment daily connection count for {date_str}: {e}"
             )
             raise
+
+    def reserve_daily_slot(self, date_str: str, limit: int) -> Optional[int]:
+        """Atomically claim one connection slot for the day if under ``limit``.
+
+        Performed as a single conditional SQLite upsert
+        (``INSERT ... ON CONFLICT DO UPDATE SET count = count + 1
+        WHERE count < :limit``) so the check and the increment cannot be raced
+        by a concurrent run: only one process can claim the slot that brings the
+        count to ``limit``. Reserving *before* the network send closes the
+        check-then-send window that would otherwise let two runs both send while
+        at ``limit - 1``.
+
+        Returns the new cumulative count when a slot was claimed, or ``None``
+        when the day is already at the limit (caller must stop). The
+        last-action timestamp is recorded for the inter-session cooldown.
+
+        If a reserved slot is not used (e.g. the send fails), call
+        :meth:`release_daily_slot` to give it back.
+        """
+        if limit <= 0:
+            # No slots exist; the initial INSERT path can't honour the WHERE
+            # guard, so refuse explicitly.
+            return None
+        try:
+            now = datetime.now(timezone.utc)
+            now_naive = datetime.now()
+            with self.get_session() as session:
+                stmt = sqlite_insert(DailyConnectionCount).values(
+                    date=date_str,
+                    count=1,
+                    last_action_at=now,
+                )
+                # The WHERE guard makes the conflict update a no-op once the day
+                # is at the limit. rowcount distinguishes the two count==limit
+                # cases that a value read alone cannot: claiming the final slot
+                # (1 row affected) vs. an already-full day blocking the update
+                # (0 rows affected).
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["date"],
+                    set_={
+                        "count": DailyConnectionCount.count + 1,
+                        "last_action_at": now,
+                        "updated_at": now_naive,
+                    },
+                    where=DailyConnectionCount.count < limit,
+                )
+                result = session.exec(stmt)
+                session.commit()
+                if result.rowcount == 0:
+                    # Guard blocked the update: the day is already at the limit.
+                    logger.debug(
+                        f"Daily slot reservation refused for {date_str}: "
+                        f"already at limit {limit}"
+                    )
+                    return None
+                count = session.exec(
+                    select(DailyConnectionCount.count).where(
+                        DailyConnectionCount.date == date_str
+                    )
+                ).first()
+                logger.debug(
+                    f"Reserved daily connection slot for {date_str}: {count}/{limit}"
+                )
+                return count
+        except Exception as e:
+            logger.error(
+                f"Failed to reserve daily connection slot for {date_str}: {e}"
+            )
+            raise
+
+    def release_daily_slot(self, date_str: str) -> None:
+        """Give back one previously reserved slot (e.g. when a send fails).
+
+        Atomically decrements the day's count, never below zero. Best-effort:
+        a failure here only over-counts the day slightly (fails safe toward the
+        cap), so it is logged rather than raised.
+        """
+        try:
+            with self.get_session() as session:
+                stmt = (
+                    update(DailyConnectionCount)
+                    .where(
+                        DailyConnectionCount.date == date_str,
+                        DailyConnectionCount.count > 0,
+                    )
+                    .values(
+                        count=DailyConnectionCount.count - 1,
+                        updated_at=datetime.now(),
+                    )
+                )
+                session.exec(stmt)
+                session.commit()
+                logger.debug(f"Released a daily connection slot for {date_str}")
+        except Exception as e:
+            logger.error(f"Failed to release daily connection slot for {date_str}: {e}")
 
     def get_last_connection_at(self) -> Optional[datetime]:
         """Return the most recent connection timestamp across all days.
