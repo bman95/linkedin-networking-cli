@@ -9,7 +9,13 @@ import pytest
 from datetime import datetime, timezone, date
 from sqlmodel import Session, select
 
-from database.models import Campaign, Contact, Analytics, Settings
+from database.models import (
+    Campaign,
+    Contact,
+    Analytics,
+    Settings,
+    DailyConnectionCount,
+)
 
 
 # ============================================================================
@@ -431,6 +437,61 @@ class TestSettingsModel:
         db_session.add(settings2)
 
         # This should raise an integrity error
+        with pytest.raises(Exception):  # SQLite IntegrityError
+            db_session.commit()
+
+
+# ============================================================================
+# DailyConnectionCount Model Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestDailyConnectionCountModel:
+    """Test DailyConnectionCount model (persisted per-day rate limiting)."""
+
+    def test_create_with_required_fields(self):
+        """Test creating a daily count row with required fields."""
+        row = DailyConnectionCount(date="2025-01-15")
+        assert row.date == "2025-01-15"
+        assert row.count == 0
+        assert row.last_action_at is None
+
+    def test_count_default_is_zero(self):
+        """The count defaults to zero (a fresh day starts empty)."""
+        row = DailyConnectionCount(date="2025-01-15")
+        assert row.count == 0
+
+    def test_timestamps(self):
+        """Test that the row has a created_at timestamp."""
+        row = DailyConnectionCount(date="2025-01-15")
+        assert isinstance(row.created_at, datetime)
+        assert row.updated_at is None
+
+    def test_in_database(self, db_session):
+        """Test saving and retrieving a daily count from the database."""
+        row = DailyConnectionCount(date="2025-01-15", count=3)
+        db_session.add(row)
+        db_session.commit()
+        db_session.refresh(row)
+
+        assert row.id is not None
+
+        retrieved = db_session.exec(
+            select(DailyConnectionCount).where(
+                DailyConnectionCount.date == "2025-01-15"
+            )
+        ).first()
+        assert retrieved is not None
+        assert retrieved.count == 3
+
+    def test_unique_date_constraint(self, db_session):
+        """Test that the date column is unique (one row per local day)."""
+        row1 = DailyConnectionCount(date="2025-01-15", count=1)
+        db_session.add(row1)
+        db_session.commit()
+
+        row2 = DailyConnectionCount(date="2025-01-15", count=2)
+        db_session.add(row2)
         with pytest.raises(Exception):  # SQLite IntegrityError
             db_session.commit()
 

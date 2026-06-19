@@ -252,6 +252,7 @@ class TestAutomationSettings:
         monkeypatch.delenv("CONNECTION_DELAY_MIN", raising=False)
         monkeypatch.delenv("CONNECTION_DELAY_MAX", raising=False)
         monkeypatch.delenv("DAILY_CONNECTION_LIMIT", raising=False)
+        monkeypatch.delenv("CONNECTION_COOLDOWN", raising=False)
         monkeypatch.delenv("SEARCH_LIMIT", raising=False)
 
         settings = AppSettings()
@@ -260,6 +261,7 @@ class TestAutomationSettings:
         assert auto_settings["connection_delay_min"] == 2
         assert auto_settings["connection_delay_max"] == 5
         assert auto_settings["daily_connection_limit"] == 20
+        assert auto_settings["connection_cooldown"] == 0
         assert auto_settings["search_limit"] == 100
 
     def test_get_automation_settings_custom_values(self, monkeypatch):
@@ -267,6 +269,7 @@ class TestAutomationSettings:
         monkeypatch.setenv("CONNECTION_DELAY_MIN", "5")
         monkeypatch.setenv("CONNECTION_DELAY_MAX", "10")
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "50")
+        monkeypatch.setenv("CONNECTION_COOLDOWN", "3600")
         monkeypatch.setenv("SEARCH_LIMIT", "200")
 
         settings = AppSettings()
@@ -275,6 +278,7 @@ class TestAutomationSettings:
         assert auto_settings["connection_delay_min"] == 5
         assert auto_settings["connection_delay_max"] == 10
         assert auto_settings["daily_connection_limit"] == 50
+        assert auto_settings["connection_cooldown"] == 3600
         assert auto_settings["search_limit"] == 200
 
     def test_get_automation_settings_zero_values(self, monkeypatch):
@@ -297,12 +301,14 @@ class TestAutomationSettings:
         assert isinstance(auto_settings["connection_delay_min"], int)
         assert isinstance(auto_settings["connection_delay_max"], int)
         assert isinstance(auto_settings["daily_connection_limit"], int)
+        assert isinstance(auto_settings["connection_cooldown"], int)
         assert isinstance(auto_settings["search_limit"], int)
 
     @pytest.mark.parametrize("env_var,default_value", [
         ("CONNECTION_DELAY_MIN", 2),
         ("CONNECTION_DELAY_MAX", 5),
         ("DAILY_CONNECTION_LIMIT", 20),
+        ("CONNECTION_COOLDOWN", 0),
         ("SEARCH_LIMIT", 100),
     ])
     def test_automation_settings_individual_defaults(self, monkeypatch, env_var, default_value):

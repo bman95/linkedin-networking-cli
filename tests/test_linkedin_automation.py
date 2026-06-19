@@ -6,7 +6,7 @@ Tests LinkedInAutomation class with mocked Playwright interactions.
 
 import pytest
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 from automation.linkedin import LinkedInAutomation, LinkedInProfile
 from database.models import Campaign
@@ -647,6 +647,92 @@ class TestLinkedInAutomationIntegration:
         assert mock_page.goto.called
         assert mock_page.wait_for_selector.called
         assert isinstance(profiles, list)
+
+
+# ============================================================================
+# Persisted Daily Cap Tests (restart-safe rate limiting)
+# ============================================================================
+
+@pytest.mark.unit
+class TestPersistedDailyCap:
+    """Test that the daily connection cap survives across CLI restarts."""
+
+    def _profiles(self, n):
+        return [
+            LinkedInProfile(
+                name=f"Person {i}",
+                profile_url=f"https://www.linkedin.com/in/person{i}/",
+            )
+            for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cap_already_reached_stops_before_sending(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A new run cannot exceed the limit reached by a prior run today."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        # Simulate 20 connections already sent today by a previous run.
+        today = date.today().isoformat()
+        for _ in range(20):
+            db.increment_daily_connection_count(today)
+
+        messages = []
+        result = await mock_linkedin_automation.send_connection_requests(
+            campaign, self._profiles(5), progress_callback=messages.append
+        )
+
+        # No new requests sent; the browser was never driven.
+        assert result["sent"] == 0
+        assert not mock_linkedin_automation.page.goto.called
+        # Persisted count is untouched and still capped.
+        assert db.get_daily_connection_count(today) == 20
+        assert any("already reached" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_partial_prior_run_does_not_reset(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A partial prior count is the starting point, not zero."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        today = date.today().isoformat()
+        for _ in range(15):
+            db.increment_daily_connection_count(today)
+
+        # 15 < 20, so the run proceeds (does not early-return).
+        assert db.get_daily_connection_count(today) == 15
+
+    @pytest.mark.asyncio
+    async def test_new_day_starts_fresh(
+        self, mock_linkedin_automation, monkeypatch, freeze_time
+    ):
+        """A new local day starts the counter at zero (self-clearing)."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        # Yesterday was capped; today's key is a different row.
+        yesterday = "2025-01-14"
+        for _ in range(20):
+            db.increment_daily_connection_count(yesterday)
+
+        today = date.today().isoformat()  # frozen to 2025-01-15
+        assert today != yesterday
+        assert db.get_daily_connection_count(today) == 0
+
+        messages = []
+        result = await mock_linkedin_automation.send_connection_requests(
+            campaign, [], progress_callback=messages.append
+        )
+        # Empty profile list, but it must NOT early-return on the cap.
+        assert result["sent"] == 0
+        assert not any("already reached" in m for m in messages)
 
 
 # ============================================================================

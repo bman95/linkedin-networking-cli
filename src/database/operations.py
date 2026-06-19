@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 from sqlmodel import SQLModel, create_engine, Session, select
 from pathlib import Path
@@ -8,7 +8,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
-from .models import Campaign, Contact, Analytics, Settings
+from .models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
 
 logger = get_logger(__name__)
 
@@ -273,6 +273,83 @@ class DatabaseManager:
                 session.commit()
         except Exception as e:
             logger.error(f"Failed to set setting '{key}': {e}")
+            raise
+
+    # Persisted daily rate-limiting operations
+    def get_daily_connection_count(self, date_str: str) -> int:
+        """Get the persisted connection count for a given local day.
+
+        Returns 0 when no row exists for that day, so a new local day always
+        starts at zero (the counter self-clears on date rollover).
+        """
+        try:
+            with self.get_session() as session:
+                row = session.exec(
+                    select(DailyConnectionCount).where(
+                        DailyConnectionCount.date == date_str
+                    )
+                ).first()
+                count = row.count if row else 0
+                logger.debug(f"Daily connection count for {date_str}: {count}")
+                return count
+        except Exception as e:
+            logger.error(f"Failed to get daily connection count for {date_str}: {e}")
+            raise
+
+    def increment_daily_connection_count(self, date_str: str) -> int:
+        """Increment and persist the connection count for a given local day.
+
+        Upserts the per-day row and records the last-action timestamp (used for
+        the optional inter-session cooldown). Returns the new cumulative count.
+        """
+        try:
+            with self.get_session() as session:
+                row = session.exec(
+                    select(DailyConnectionCount).where(
+                        DailyConnectionCount.date == date_str
+                    )
+                ).first()
+                now = datetime.now(timezone.utc)
+                if row:
+                    row.count += 1
+                    row.last_action_at = now
+                    row.updated_at = datetime.now()
+                else:
+                    row = DailyConnectionCount(
+                        date=date_str,
+                        count=1,
+                        last_action_at=now,
+                    )
+                    session.add(row)
+                session.commit()
+                session.refresh(row)
+                logger.debug(
+                    f"Incremented daily connection count for {date_str} to {row.count}"
+                )
+                return row.count
+        except Exception as e:
+            logger.error(
+                f"Failed to increment daily connection count for {date_str}: {e}"
+            )
+            raise
+
+    def get_last_connection_at(self) -> Optional[datetime]:
+        """Return the most recent connection timestamp across all days.
+
+        Used to enforce the optional inter-session cooldown when a new run
+        starts shortly after a previous one ended. Returns None if no
+        connections have ever been recorded.
+        """
+        try:
+            with self.get_session() as session:
+                row = session.exec(
+                    select(DailyConnectionCount)
+                    .where(DailyConnectionCount.last_action_at != None)  # noqa: E711
+                    .order_by(DailyConnectionCount.last_action_at.desc())
+                ).first()
+                return row.last_action_at if row else None
+        except Exception as e:
+            logger.error(f"Failed to get last connection timestamp: {e}")
             raise
 
     # Campaign statistics

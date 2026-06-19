@@ -1020,11 +1020,27 @@ class LinkedInCLI:
             return
 
         a = self.settings.get_automation_settings()
+        daily_limit = a.get("daily_connection_limit")
+
+        # Show today's persisted usage so the user can see remaining quota.
+        used_today_line = ""
+        if self.db_manager:
+            from datetime import date
+
+            used_today = self.db_manager.get_daily_connection_count(
+                date.today().isoformat()
+            )
+            used_today_line = (
+                f"[cyan]Used Today:[/cyan] {used_today}/{daily_limit}\n"
+            )
+
         self.console.print(
             Panel(
                 "[bold]⚡ Rate Limiting[/bold]\n\n"
                 f"[cyan]Connection Delay:[/cyan] {a.get('connection_delay_min')}-{a.get('connection_delay_max')} seconds\n"
-                f"[cyan]Daily Connection Limit:[/cyan] {a.get('daily_connection_limit')}\n"
+                f"[cyan]Daily Connection Limit:[/cyan] {daily_limit}\n"
+                f"{used_today_line}"
+                f"[cyan]Inter-session Cooldown:[/cyan] {a.get('connection_cooldown')} seconds\n"
                 f"[cyan]Search Limit:[/cyan] {a.get('search_limit')}",
                 title="Rate Limiting Settings",
                 border_style="blue",
