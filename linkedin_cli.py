@@ -37,6 +37,11 @@ from automation.linkedin_mappings import (
     get_industry_id,
     get_industry_name_from_id,
 )
+from automation.localization import (
+    get_native_language_choices,
+    get_native_language_display,
+    default_greeting,
+)
 
 
 class LinkedInCLI:
@@ -63,6 +68,59 @@ class LinkedInCLI:
         if isinstance(campaign, dict):
             return campaign.get(attr, default)
         return getattr(campaign, attr, default)
+
+    def _prompt_message_config(self, campaign=None):
+        """Prompt for the bilingual message setup and note prioritization.
+
+        Returns a dict with native_language, message_template (native),
+        message_template_en and priority_keywords. The message language is
+        chosen automatically per contact: native for contacts located in a
+        country that speaks it, English for everyone else. When editing,
+        existing values are offered as defaults.
+        """
+        current_lang = self._campaign_get_field(campaign, "native_language", "es") or "es"
+        language_choices = [
+            Choice(value=code, name=display)
+            for display, code in get_native_language_choices()
+        ]
+        native_language = inquirer.select(
+            message="Native language (auto-used for contacts from that country; English otherwise):",
+            choices=language_choices,
+            default=current_lang,
+        ).execute()
+
+        native_label = get_native_language_display(native_language)
+        native_default = (
+            self._campaign_get_field(campaign, "message_template", None)
+            or default_greeting(native_language)
+        )
+        message_template = inquirer.text(
+            message=f"Message in {native_label} (must contain {{name}}):",
+            default=native_default,
+            validate=lambda x: "{name}" in x or "Message must contain {name} placeholder",
+        ).execute()
+
+        english_default = (
+            self._campaign_get_field(campaign, "message_template_en", None)
+            or default_greeting("en")
+        )
+        message_template_en = inquirer.text(
+            message="Message in English (for international contacts; must contain {name}):",
+            default=english_default,
+            validate=lambda x: "{name}" in x or "Message must contain {name} placeholder",
+        ).execute()
+
+        priority_keywords = inquirer.text(
+            message="Priority keywords for personalized notes (comma-separated titles/companies, optional):",
+            default=self._campaign_get_field(campaign, "priority_keywords", "") or "",
+        ).execute()
+
+        return {
+            "native_language": native_language,
+            "message_template": message_template,
+            "message_template_en": message_template_en.strip() or None,
+            "priority_keywords": priority_keywords.strip() or None,
+        }
 
     def display_welcome(self):
         """Display welcome banner"""
@@ -266,12 +324,7 @@ class LinkedInCLI:
             default=20,
         ).execute()
 
-        message_template = inquirer.text(
-            message="Connection message template:",
-            default="Hi {name}, I'd like to connect with you!",
-            validate=lambda x: "{name}" in x
-            or "Message must contain {name} placeholder",
-        ).execute()
+        msg_config = self._prompt_message_config()
 
         # Get the actual values from display names
         if custom_geo_urn:
@@ -295,7 +348,10 @@ class LinkedInCLI:
                 f"[cyan]Connection Degree:[/cyan] {network_display}\n"
                 f"[cyan]Industry:[/cyan] {industry_display}\n"
                 f"[cyan]Daily Limit:[/cyan] {daily_limit}\n"
-                f"[cyan]Message:[/cyan] {message_template}",
+                f"[cyan]Native language:[/cyan] {get_native_language_display(msg_config['native_language'])}\n"
+                f"[cyan]Message ({msg_config['native_language']}):[/cyan] {msg_config['message_template']}\n"
+                f"[cyan]Message (en):[/cyan] {msg_config['message_template_en'] or '—'}\n"
+                f"[cyan]Priority keywords:[/cyan] {msg_config['priority_keywords'] or 'None (seniority only)'}",
                 title="Campaign Created",
                 border_style="green",
             )
@@ -315,7 +371,7 @@ class LinkedInCLI:
             "industry_display": industry_display if industry_display != "Any" else None,
             # Settings
             "daily_limit": daily_limit,
-            "message_template": message_template,
+            **msg_config,
         }
 
         if self.db_manager:
@@ -524,14 +580,7 @@ class LinkedInCLI:
             default=campaign.daily_limit,
         ).execute()
 
-        message_template = inquirer.text(
-            message="Connection message template:",
-            default=self._campaign_get_field(
-                campaign, "message_template", "Hi {name}, I'd like to connect with you!"
-            ),
-            validate=lambda x: "{name}" in x
-            or "Message must contain {name} placeholder",
-        ).execute()
+        msg_config = self._prompt_message_config(campaign)
 
         # Resolve display names back into stored values. An online-search pick
         # provides its geoUrn directly; otherwise map from the curated list.
@@ -555,7 +604,7 @@ class LinkedInCLI:
             "industry_ids": industry_id,
             "industry_display": industry_display if industry_display != "Any" else None,
             "daily_limit": int(daily_limit),
-            "message_template": message_template,
+            **msg_config,
         }
 
         if not self.db_manager:

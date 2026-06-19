@@ -35,7 +35,21 @@ class Campaign(SQLModel, table=True):
 
     # Campaign settings
     daily_limit: int = Field(default=20)
+
+    # Connection message templates (bilingual).
+    # message_template holds the native-language note; message_template_en is
+    # sent to contacts from non-native-language countries. native_language is
+    # the ISO code of the native template (e.g. "es", "fr", "pt").
     message_template: str = Field(default="Hi {name}, I'd like to connect with you!")
+    native_language: str = Field(default="es")
+    message_template_en: Optional[str] = None
+
+    # Personalized notes are a scarce resource (LinkedIn Premium / limited free
+    # quota), so they are only spent on "important" contacts. These comma-separated
+    # keywords (titles or companies) mark a contact as important when matched
+    # against their headline/company, in addition to a built-in seniority list.
+    priority_keywords: Optional[str] = None
+
     active: bool = Field(default=True)
 
     # Timestamps

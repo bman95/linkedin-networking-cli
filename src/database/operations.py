@@ -26,10 +26,38 @@ class DatabaseManager:
         """Create all database tables"""
         try:
             SQLModel.metadata.create_all(self.engine)
+            self._migrate_schema()
             logger.info("Database tables created/verified successfully")
         except Exception as e:
             logger.error(f"Failed to create database tables: {e}")
             raise
+
+    def _migrate_schema(self):
+        """Add columns introduced after a database was first created.
+
+        SQLModel's create_all never alters existing tables, so new Campaign
+        fields would be missing on databases created by older versions. Add
+        them here with a plain ALTER TABLE when absent.
+        """
+        from sqlalchemy import text
+
+        new_columns = {
+            "native_language": "TEXT DEFAULT 'es'",
+            "message_template_en": "TEXT",
+            "priority_keywords": "TEXT",
+        }
+
+        with self.engine.connect() as conn:
+            existing = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(campaign)"))
+            }
+            for column, definition in new_columns.items():
+                if column not in existing:
+                    conn.execute(
+                        text(f"ALTER TABLE campaign ADD COLUMN {column} {definition}")
+                    )
+                    logger.info(f"Migrated campaign table: added column '{column}'")
+            conn.commit()
 
     def get_session(self) -> Session:
         """Get database session"""
