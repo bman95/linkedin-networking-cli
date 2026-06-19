@@ -312,7 +312,16 @@ async def snapshot_page(page, seq: int) -> Optional[str]:
             logger.debug("Page snapshot sidecar failed for slot %d: %s", slot, exc)
 
         ok = await _capture_screenshot(page, png_path)
-        return str(png_path) if ok else None
+        if not ok:
+            # The fresh sidecar must not be paired with a stale screenshot left
+            # by a previous occupant of this slot, or a postmortem would read
+            # evidence from two different pages. Drop the orphaned png.
+            try:
+                png_path.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.debug("Could not remove stale snapshot %s: %s", png_path.name, exc)
+            return None
+        return str(png_path)
     except Exception as exc:  # pragma: no cover - defensive backstop
         logger.debug("snapshot_page failed for seq %s: %s", seq, exc)
         return None
@@ -322,3 +331,30 @@ def reset_anomaly_rate_limit() -> None:
     """Reset the per-run anomaly capture counter (call at the start of a run)."""
     global _anomaly_capture_count
     _anomaly_capture_count = 0
+
+
+def reset_page_ring() -> None:
+    """Clear the rolling page-snapshot ring buffer (call at the start of a run).
+
+    The ring is a record of how *this* session reached a failure. Without a
+    per-run reset, a shorter run leaves higher slots populated by a previous
+    run, so a postmortem would mix evidence from two different sessions.
+    Best-effort: never raises.
+    """
+    try:
+        pages_dir = _artifacts_dir() / "pages"
+        if not pages_dir.exists():
+            return
+        for entry in pages_dir.glob("page_*"):
+            try:
+                entry.unlink()
+            except Exception as exc:
+                logger.debug("Could not clear page-ring entry %s: %s", entry.name, exc)
+    except Exception as exc:
+        logger.debug("reset_page_ring failed: %s", exc)
+
+
+def reset_diagnostics_run() -> None:
+    """Reset all per-run diagnostics state. Call at the start of a run."""
+    reset_anomaly_rate_limit()
+    reset_page_ring()

@@ -300,8 +300,8 @@ def isolate_diagnostics_artifacts(tmp_path, monkeypatch):
     ``LINKEDIN_CLI_ARTIFACTS_DIR`` override.
     """
     monkeypatch.setenv("LINKEDIN_CLI_ARTIFACTS_DIR", str(tmp_path / "artifacts"))
-    # Reset the per-run anomaly rate-limit counter so cross-test state doesn't
-    # leak through the module global.
+    # Reset per-run diagnostics state so cross-test state doesn't leak through
+    # the module global counter.
     try:
         from automation.diagnostics import reset_anomaly_rate_limit
         reset_anomaly_rate_limit()

@@ -21,6 +21,8 @@ from automation.diagnostics import (
     capture_error_context,
     snapshot_page,
     reset_anomaly_rate_limit,
+    reset_page_ring,
+    reset_diagnostics_run,
     _slugify,
     _PAGE_RING_SIZE,
     _MAX_ANOMALY_CAPTURES,
@@ -293,6 +295,66 @@ class TestSnapshotPage:
         result = await snapshot_page(page, 0)
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_failed_overwrite_removes_stale_png(self, artifacts_dir):
+        # A slot first written successfully by a real screenshot...
+        pages_dir = artifacts_dir / "pages"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        stale = pages_dir / "page_0.png"
+        stale.write_bytes(b"stale-evidence-from-a-previous-page")
+
+        # ...is reused by a later snapshot whose screenshot fails. The fresh
+        # sidecar must not be paired with the stale png.
+        page = _good_page(url="https://www.linkedin.com/new")
+        page.screenshot = AsyncMock(side_effect=RuntimeError("snap failed"))
+        result = await snapshot_page(page, 0)
+
+        assert result is None
+        assert not stale.exists(), "stale screenshot must be removed on failed overwrite"
+        # The sidecar is still written (records the URL that failed to shoot).
+        assert (pages_dir / "page_0.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-run reset of diagnostics state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestResetDiagnosticsRun:
+    @pytest.mark.asyncio
+    async def test_reset_page_ring_clears_stale_slots(self, artifacts_dir):
+        page = _good_page()
+        # Populate a few slots (sidecars are written for real).
+        for seq in range(4):
+            await snapshot_page(page, seq)
+        pages_dir = artifacts_dir / "pages"
+        assert list(pages_dir.glob("page_*.txt"))
+
+        reset_page_ring()
+        assert not list(pages_dir.glob("page_*")), "ring must be empty after reset"
+
+    @pytest.mark.asyncio
+    async def test_reset_page_ring_safe_when_dir_absent(self):
+        # No pages dir created yet — must not raise.
+        reset_page_ring()
+
+    @pytest.mark.asyncio
+    async def test_reset_diagnostics_run_resets_both(self, artifacts_dir):
+        page = _good_page()
+        for seq in range(3):
+            await snapshot_page(page, seq)
+        for _ in range(_MAX_ANOMALY_CAPTURES):
+            await capture_anomaly_context(page, "spam")
+        # Counter exhausted and ring populated.
+        assert await capture_anomaly_context(page, "spam") is None
+        assert list((artifacts_dir / "pages").glob("page_*.txt"))
+
+        reset_diagnostics_run()
+
+        assert await capture_anomaly_context(page, "ok") is not None
+        # Only the just-written anomaly snapshot-less bundle; the page ring was cleared.
+        assert not list((artifacts_dir / "pages").glob("page_*"))
+
 
 # ---------------------------------------------------------------------------
 # Wiring: search_profiles readiness wait captures a bundle before raising
@@ -346,7 +408,7 @@ class TestSearchLoopDiagnosticsWiring:
         mock_linkedin_automation.page.query_selector = AsyncMock(return_value=None)
 
         with patch(
-            "automation.linkedin.reset_anomaly_rate_limit"
+            "automation.linkedin.reset_diagnostics_run"
         ) as mock_reset, patch(
             "automation.linkedin.snapshot_page", new=AsyncMock()
         ) as mock_snapshot, patch.object(
@@ -355,7 +417,7 @@ class TestSearchLoopDiagnosticsWiring:
         ):
             await mock_linkedin_automation.search_profiles(campaign, limit=5)
 
-        # Per-run boundary cleared the anomaly counter exactly once.
+        # Per-run boundary cleared all diagnostics state exactly once.
         mock_reset.assert_called_once()
         # The landed page was snapshotted into the ring buffer (seq 0).
         mock_snapshot.assert_awaited()

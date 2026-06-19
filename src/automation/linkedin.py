@@ -32,7 +32,7 @@ from automation.diagnostics import (
     capture_error_context,
     capture_anomaly_context,
     snapshot_page,
-    reset_anomaly_rate_limit,
+    reset_diagnostics_run,
 )
 from utils.logging import get_logger
 from exceptions import (
@@ -423,9 +423,10 @@ class LinkedInAutomation:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         profiles = []
-        # New run boundary: clear the per-run anomaly capture rate limit so a
-        # long-lived CLI process doesn't leak the counter across campaigns.
-        reset_anomaly_rate_limit()
+        # New run boundary: clear per-run diagnostics state (anomaly rate-limit
+        # counter + page-snapshot ring) so a long-lived CLI process neither
+        # leaks the counter nor mixes ring-buffer evidence across campaigns.
+        reset_diagnostics_run()
 
         try:
             # Build search URL
