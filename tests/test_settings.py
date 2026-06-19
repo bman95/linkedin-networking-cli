@@ -8,6 +8,7 @@ import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import available_timezones
 
 from config.settings import AppSettings
 
@@ -319,6 +320,80 @@ class TestFingerprintSettings:
         monkeypatch.setenv("TZ", "Asia/Tokyo")
         settings = AppSettings()
         assert settings.get_browser_settings()["timezone_id"] == "Asia/Tokyo"
+
+    def test_invalid_timezone_override_falls_back(self, monkeypatch):
+        """An invalid BROWSER_TIMEZONE (typo/abbreviation) is rejected and the
+        host default is used instead, never a value Playwright would reject."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "CEST")  # abbreviation, not IANA
+        settings = AppSettings()
+        tz = settings.get_browser_settings()["timezone_id"]
+        assert tz != "CEST"
+        assert tz in available_timezones()
+
+
+@pytest.mark.unit
+class TestTimezoneDetection:
+    """The host-timezone helper only ever returns a valid IANA id."""
+
+    def test_returns_valid_iana_or_utc(self):
+        """Whatever the host looks like, the result is a real IANA zone."""
+        assert AppSettings._detect_host_timezone() in available_timezones()
+
+    def test_tz_env_with_iana_name(self, monkeypatch):
+        monkeypatch.setenv("TZ", "America/Sao_Paulo")
+        assert AppSettings._detect_host_timezone() == "America/Sao_Paulo"
+
+    def test_tz_env_invalid_is_skipped(self, monkeypatch):
+        """A TZ value that is not a valid IANA id (e.g. the glibc ':/path'
+        form) is ignored rather than returned and later crashing Playwright."""
+        monkeypatch.setenv("TZ", ":/etc/localtime")
+        # Falls through to other detection sources; result must still be valid.
+        assert AppSettings._detect_host_timezone() in available_timezones()
+
+    def test_symlink_branch_parses_zoneinfo_target(self, monkeypatch):
+        """A normal /etc/localtime -> .../zoneinfo/Area/Loc symlink resolves."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: True)
+        monkeypatch.setattr(
+            os, "readlink", lambda p: "/usr/share/zoneinfo/Europe/Berlin"
+        )
+        assert AppSettings._detect_host_timezone() == "Europe/Berlin"
+
+    def test_symlink_posix_prefix_is_stripped(self, monkeypatch):
+        """Leap-second 'posix/' and 'right/' zoneinfo subtrees still resolve to
+        the valid inner IANA id rather than a Playwright-rejected value."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: True)
+        monkeypatch.setattr(
+            os, "readlink", lambda p: "/usr/share/zoneinfo/posix/Europe/Madrid"
+        )
+        assert AppSettings._detect_host_timezone() == "Europe/Madrid"
+
+    def test_etc_timezone_fallback(self, monkeypatch, tmp_path):
+        """When there is no usable TZ/symlink, /etc/timezone contents are used."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+
+        real_read_text = Path.read_text
+
+        def fake_read_text(self, *args, **kwargs):
+            if str(self) == "/etc/timezone":
+                return "Asia/Kolkata\n"
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fake_read_text)
+        monkeypatch.setattr(
+            Path, "exists", lambda self: str(self) == "/etc/timezone"
+        )
+        assert AppSettings._detect_host_timezone() == "Asia/Kolkata"
+
+    def test_no_sources_falls_back_to_utc(self, monkeypatch):
+        """Container with no TZ, no symlink and no /etc/timezone -> UTC."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+        assert AppSettings._detect_host_timezone() == "UTC"
 
 
 # ============================================================================

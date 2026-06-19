@@ -608,6 +608,59 @@ class TestFingerprintConsistency:
         kwargs = browser.new_context.call_args.kwargs
         assert kwargs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64) Custom"
 
+    @pytest.mark.asyncio
+    async def test_storage_state_path_carries_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch, tmp_path
+    ):
+        """When a saved session.json exists, the storage_state context still
+        receives locale + timezone_id alongside storage_state."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "America/New_York")
+
+        session_file = tmp_path / "session.json"
+        session_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(app_settings, "session_path", session_file)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["storage_state"] == str(session_file)
+        assert kwargs["timezone_id"] == "America/New_York"
+        assert "locale" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_session_load_failure_fallback_carries_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch, tmp_path
+    ):
+        """If loading session.json fails, the fresh fallback context still
+        carries locale + timezone_id (the coherent fingerprint is not lost)."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "Europe/Madrid")
+
+        session_file = tmp_path / "session.json"
+        session_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(app_settings, "session_path", session_file)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+        # First new_context (storage_state load) fails; second (fallback) wins.
+        fallback_context = context
+        bad_load = Exception("corrupt session")
+        browser.new_context = AsyncMock(side_effect=[bad_load, fallback_context])
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        # The fallback call (second) carries locale/timezone and no storage_state.
+        fallback_kwargs = browser.new_context.call_args_list[-1].kwargs
+        assert "storage_state" not in fallback_kwargs
+        assert fallback_kwargs["timezone_id"] == "Europe/Madrid"
+        assert "locale" in fallback_kwargs
+
 
 # ============================================================================
 # LinkedInProfile Dataclass Tests

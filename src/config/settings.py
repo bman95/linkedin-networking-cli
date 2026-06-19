@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import available_timezones
 import os
 import sys
 
@@ -45,17 +46,41 @@ class AppSettings:
         return password
 
     @staticmethod
-    def _detect_host_timezone() -> str:
-        """Best-effort IANA timezone name for the host.
+    def _normalize_timezone(candidate: Optional[str]) -> Optional[str]:
+        """Return ``candidate`` only if it is a valid IANA timezone id.
 
-        Playwright's ``timezone_id`` needs an IANA name (e.g. ``Europe/Madrid``),
-        not an abbreviation like ``CEST``. We read it from the host rather than
-        hardcoding one so the value stays coherent with the OS the browser
-        actually runs on. Falls back to ``UTC`` when nothing reliable is found.
+        Playwright's ``timezone_id`` must be an IANA name (e.g.
+        ``Europe/Madrid``); abbreviations like ``CEST``, leap-second variants
+        like ``posix/Europe/Madrid``, glibc forms like ``:/etc/localtime`` and
+        plain typos all make ``new_context``/``launch_persistent_context`` raise
+        and would crash ``start_browser``. Anything not recognised by the stdlib
+        zoneinfo database returns ``None`` so callers can fall back safely.
         """
-        tz = os.getenv("TZ")
-        if tz and "/" in tz:
-            return tz
+        if not candidate:
+            return None
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        # Tolerate the leap-second/posix zoneinfo subtrees by stripping the
+        # leading prefix, since the inner path is a valid IANA id.
+        for prefix in ("posix/", "right/"):
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix):]
+        return candidate if candidate in available_timezones() else None
+
+    @classmethod
+    def _detect_host_timezone(cls) -> str:
+        """Best-effort *valid* IANA timezone name for the host.
+
+        Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``)
+        rather than hardcoding a zone, so ``timezone_id`` stays coherent with the
+        OS the browser actually runs on. Every candidate is validated, and the
+        function falls back to ``UTC`` when nothing reliable is found — so it can
+        never return a value Playwright would reject.
+        """
+        normalized = cls._normalize_timezone(os.getenv("TZ"))
+        if normalized:
+            return normalized
 
         localtime = Path("/etc/localtime")
         try:
@@ -64,18 +89,20 @@ class AppSettings:
                 marker = "zoneinfo/"
                 idx = target.find(marker)
                 if idx != -1:
-                    candidate = target[idx + len(marker):]
-                    if candidate:
-                        return candidate
+                    normalized = cls._normalize_timezone(target[idx + len(marker):])
+                    if normalized:
+                        return normalized
         except OSError:
             pass
 
         etc_tz = Path("/etc/timezone")
         try:
             if etc_tz.exists():
-                value = etc_tz.read_text(encoding="utf-8").strip()
-                if value:
-                    return value
+                normalized = cls._normalize_timezone(
+                    etc_tz.read_text(encoding="utf-8").strip()
+                )
+                if normalized:
+                    return normalized
         except OSError:
             pass
 
@@ -107,10 +134,11 @@ class AppSettings:
         # host; both are overridable for users on a differently-configured box.
         locale = os.getenv("BROWSER_LOCALE", "en-US").strip() or "en-US"
 
-        timezone_env = os.getenv("BROWSER_TIMEZONE")
-        if timezone_env is not None and timezone_env.strip():
-            timezone_id = timezone_env.strip()
-        else:
+        # A user-supplied BROWSER_TIMEZONE is validated like the host-detected
+        # one: an invalid id (typo, abbreviation) would crash the browser launch,
+        # so fall back to host detection rather than trusting it blindly.
+        timezone_id = self._normalize_timezone(os.getenv("BROWSER_TIMEZONE"))
+        if not timezone_id:
             timezone_id = self._detect_host_timezone()
 
         # User-agent is intentionally left to real Chrome by default: Chrome's
@@ -119,8 +147,7 @@ class AppSettings:
         # The override is opt-in and the user owns keeping it coherent.
         user_agent_env = os.getenv("BROWSER_USER_AGENT")
         user_agent = user_agent_env.strip() if user_agent_env else None
-        if not user_agent:
-            user_agent = None
+        user_agent = user_agent or None
 
         settings = {
             "headless": headless,
