@@ -493,6 +493,43 @@ class TestBrowserHardening:
         assert automation.page is existing_page
         assert page_at_registration["value"] is None
 
+    @pytest.mark.asyncio
+    async def test_persistent_failure_falls_back_and_masks_transient_context(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When the persistent context fails, the transient fallback still
+        registers the webdriver mask exactly once on the new context."""
+        from automation import linkedin as linkedin_module
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+
+        transient_context = AsyncMock()
+        transient_context.add_init_script = AsyncMock()
+        transient_context.new_page = AsyncMock()
+
+        browser = AsyncMock()
+        browser.new_context = AsyncMock(return_value=transient_context)
+
+        playwright = AsyncMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            side_effect=Exception("persistent context unavailable")
+        )
+        playwright.stop = AsyncMock()
+
+        starter = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(
+            linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
+        )
+        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        # Fallback engaged on a fresh transient context, mask registered once.
+        assert automation.context is transient_context
+        transient_context.add_init_script.assert_called_once()
+
 
 # ============================================================================
 # LinkedInProfile Dataclass Tests

@@ -183,6 +183,10 @@ class LinkedInAutomation:
                 logger.exception(
                     "Failed persistent context, falling back to transient browser…"
                 )
+                # Discard the half-built context so the transient fallback
+                # below actually engages and registers the webdriver mask on a
+                # fresh context (a partial failure can leave self.context set).
+                self.context = None
                 use_persistent = False
 
         if not self.context:
