@@ -33,7 +33,6 @@ from exceptions import (
     NotAuthenticatedException,
     LoginFailedException,
     SelectorNotFoundException,
-    RateLimitExceededException,
     CaptchaDetectedException,
 )
 
@@ -101,7 +100,26 @@ class LinkedInAutomation:
         await self.close_browser()
 
     async def start_browser(self):
-        """Initialize Playwright browser with enhanced session management"""
+        """Initialize Playwright browser with enhanced session management.
+
+        Session persistence relies on two complementary mechanisms, chosen by
+        how the browser is launched:
+
+        - **Persistent context** (``user_data_dir``): used when a real Chrome
+          install is configured (custom executable or the ``chrome`` channel).
+          ``launch_persistent_context`` reuses the on-disk Chrome profile under
+          ``~/.linkedin-networking-cli/browser_data/``, so cookies and login
+          state live inside that profile. This is the default/primary path.
+        - **storage_state JSON** (``session.json``): used only on the transient
+          fallback path (bundled Chromium with no persistent profile). The
+          context is created from / saved to ``session.json`` so auth survives
+          across runs even without a persistent profile.
+
+        The two never overlap in a single run: the persistent profile is the
+        source of truth when present, and ``storage_state`` is the fallback when
+        it is not. ``close_browser``/``login`` still write ``session.json`` so a
+        later transient run can pick up where a persistent one left off.
+        """
         # Force close any existing Chrome processes
         force_close_chrome()
 
@@ -1286,55 +1304,3 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback(f"❌ Failed to extract profile data: {str(e)}")
             return {}
-
-    async def send_connection_with_retry(
-        self,
-        profile_url: str,
-        candidate_name: str,
-        message_template: Optional[str] = None,
-        max_retries: int = 3,
-        progress_callback: Optional[Callable] = None,
-    ) -> Dict[str, Any]:
-        """Send connection request with enhanced error handling and retries"""
-        from .interactions import send_connection_request
-        # RateLimitExceededException is imported at the top from exceptions module
-
-        if not self.is_authenticated:
-            raise NotAuthenticatedException("Not authenticated. Please login first.")
-
-        for attempt in range(max_retries):
-            try:
-                if progress_callback:
-                    progress_callback(f"Attempt {attempt + 1}: Connecting with {candidate_name}")
-
-                # Navigate to profile
-                await self.page.goto(profile_url, timeout=30000)
-
-                # Send connection request using enhanced interactions
-                result = await send_connection_request(
-                    self.page,
-                    candidate_name,
-                    message_template,
-                    progress_callback
-                )
-
-                if result["success"]:
-                    return result
-                else:
-                    logger.warning(f"Connection attempt {attempt + 1} failed: {result['message']}")
-                    if attempt < max_retries - 1:
-                        await self.page.wait_for_timeout(random.randint(3000, 6000))
-
-            except RateLimitExceededException:
-                # Don't retry on limit reached
-                raise
-            except Exception as e:
-                logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}")
-                if attempt < max_retries - 1:
-                    await self.page.wait_for_timeout(random.randint(5000, 10000))
-
-        return {
-            "success": False,
-            "status": "max_retries_exceeded",
-            "message": f"Failed after {max_retries} attempts"
-        }

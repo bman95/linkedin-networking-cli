@@ -40,8 +40,8 @@ linkedin-cli
 - Uses SQLite for local storage at `~/.linkedin-networking-cli/linkedin_networking.db`
 
 **Automation Layer (`src/automation/`)**:
-- `linkedin.py` - LinkedInAutomation class using Playwright for web scraping
-- `session.py` - Session management for persistent LinkedIn authentication
+- `linkedin.py` - LinkedInAutomation class using Playwright for web scraping; also owns session persistence (see Browser Automation Notes)
+- `interactions.py` - Async page-interaction helpers (waits, CAPTCHA detection, scrolling) shared by the automation engine
 - Implements rate limiting, profile searching, and connection request automation
 
 **UI Layer**:
@@ -76,10 +76,25 @@ linkedin-cli
 ### Browser Automation Notes
 
 The LinkedIn automation requires careful handling:
-- Uses persistent browser sessions stored in `~/.linkedin-networking-cli/browser_data/`
 - Implements random delays between actions to avoid detection
 - Requires manual login verification on first run
 - Respects daily connection limits and rate limiting
+
+**Session persistence** is owned entirely by `LinkedInAutomation.start_browser`
+and uses two complementary mechanisms, selected by how the browser launches:
+- **Persistent context** (primary): when a real Chrome install is configured
+  (custom executable or the `chrome` channel), `launch_persistent_context`
+  reuses the on-disk Chrome profile under
+  `~/.linkedin-networking-cli/browser_data/`. Cookies and login state live in
+  that profile.
+- **`storage_state` JSON** (fallback): on the transient bundled-Chromium path
+  (no persistent profile) the context is loaded from / saved to
+  `~/.linkedin-networking-cli/session.json`.
+
+The two never overlap in a single run; the persistent profile is the source of
+truth when present, and `session.json` is the fallback. `close_browser` and
+`login` still write `session.json` so a later transient run can resume a
+session a persistent run established.
 
 ### File Structure Context
 

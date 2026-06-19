@@ -42,9 +42,15 @@ Automating interactions with LinkedIn may violate [LinkedIn's User Agreement and
      Chrome window opens; sign in there yourself (including any 2FA / checkpoint
      step). The app detects when you reach the feed and continues automatically.
 
-   Either way the session is saved to a persistent browser profile under
-   `~/.linkedin-networking-cli/browser_data/`, so **subsequent runs stay logged
-   in** and you won't need to authenticate again until the session expires.
+   Either way the session is persisted so **subsequent runs stay logged in** and
+   you won't need to authenticate again until the session expires. Persistence
+   uses one of two complementary mechanisms depending on how the browser
+   launches: with a real Chrome install (the default), login state lives in the
+   persistent browser profile under `~/.linkedin-networking-cli/browser_data/`;
+   on the bundled-Chromium fallback it is stored as Playwright `storage_state`
+   in `~/.linkedin-networking-cli/session.json`. Only one is active per run, and
+   `session.json` is always refreshed on exit so either path can resume the
+   other's session.
 
 ## Usage
 
