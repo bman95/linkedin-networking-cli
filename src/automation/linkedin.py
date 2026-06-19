@@ -169,6 +169,11 @@ class LinkedInAutomation:
                     **persistent_kwargs,
                 )
                 self.browser = self.context.browser
+                # Register the webdriver mask before touching any page: a
+                # persistent context opens with a page already loaded, and an
+                # init script only applies to documents created or navigated
+                # after registration.
+                await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
                 # Persistent context already opens a page; reuse it instead
                 # of creating a second tab.
                 if self.context.pages:
@@ -217,10 +222,10 @@ class LinkedInAutomation:
                 )
                 logger.info("Starting fresh LinkedIn session")
 
-        # Mask navigator.webdriver before any page script runs. Registering on
-        # the context (not the page) applies it to every page and survives
-        # navigation, covering all launch paths above.
-        await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
+            # Mask navigator.webdriver before the page is created, so it runs
+            # before any page script on every navigation. This non-persistent
+            # context has no page yet (one is created below).
+            await self.context.add_init_script(WEBDRIVER_MASK_SCRIPT)
 
         if self.page is None:
             self.page = await self.context.new_page()

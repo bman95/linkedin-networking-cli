@@ -456,20 +456,42 @@ class TestBrowserHardening:
         assert "navigator" in script and "webdriver" in script
 
     @pytest.mark.asyncio
-    async def test_init_script_registered_on_persistent_context(
+    async def test_init_script_registered_on_persistent_context_before_page_reuse(
         self, db_manager, app_settings, monkeypatch
     ):
-        """The mask is also registered on the persistent context path."""
+        """On the persistent path the mask is registered before the
+        pre-existing page is reused.
+
+        An init script only applies to documents created/navigated after
+        registration, so registering after binding the persistent context's
+        existing page would leave that page's current document unmasked.
+        """
         monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
 
+        existing_page = AsyncMock()
         playwright, browser, context = self._patched_playwright(
-            monkeypatch, persistent_pages=[]
+            monkeypatch, persistent_pages=[existing_page]
         )
 
         automation = LinkedInAutomation(db_manager, app_settings)
+
+        # Record whether the existing page had already been bound to
+        # automation.page when the mask was registered.
+        page_at_registration = {}
+
+        async def record(*_args, **_kwargs):
+            page_at_registration["value"] = automation.page
+
+        context.add_init_script.side_effect = record
+
         await automation.start_browser()
 
         context.add_init_script.assert_called_once()
+        # Pre-existing page reused (no extra tab), and the mask was registered
+        # before that page was bound.
+        context.new_page.assert_not_called()
+        assert automation.page is existing_page
+        assert page_at_registration["value"] is None
 
 
 # ============================================================================
