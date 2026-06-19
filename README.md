@@ -47,10 +47,10 @@ Automating interactions with LinkedIn may violate [LinkedIn's User Agreement and
    uses one of two complementary mechanisms depending on how the browser
    launches: with a real Chrome install (the default), login state lives in the
    persistent browser profile under `~/.linkedin-networking-cli/browser_data/`;
-   on the bundled-Chromium fallback it is stored as Playwright `storage_state`
-   in `~/.linkedin-networking-cli/session.json`. Only one is active per run, and
-   `session.json` is always refreshed on exit so either path can resume the
-   other's session.
+   on the transient (non-persistent) fallback it is loaded from Playwright
+   `storage_state` in `~/.linkedin-networking-cli/session.json`. Only one is
+   *read* per run, but `session.json` is always refreshed on exit (persistent
+   runs included) so either path can resume the other's session.
 
 ## Usage
 

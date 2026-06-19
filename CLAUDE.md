@@ -83,18 +83,19 @@ The LinkedIn automation requires careful handling:
 **Session persistence** is owned entirely by `LinkedInAutomation.start_browser`
 and uses two complementary mechanisms, selected by how the browser launches:
 - **Persistent context** (primary): when a real Chrome install is configured
-  (custom executable or the `chrome` channel), `launch_persistent_context`
-  reuses the on-disk Chrome profile under
+  (custom executable or the `chrome` channel) and the persistent launch
+  succeeds, `launch_persistent_context` reuses the on-disk Chrome profile under
   `~/.linkedin-networking-cli/browser_data/`. Cookies and login state live in
   that profile.
-- **`storage_state` JSON** (fallback): on the transient bundled-Chromium path
-  (no persistent profile) the context is loaded from / saved to
-  `~/.linkedin-networking-cli/session.json`.
+- **`storage_state` JSON** (fallback): on the transient (non-persistent) launch
+  path — no real Chrome configured, a non-`chrome` channel, or a failed
+  persistent launch — the context is loaded from `session.json`.
 
-The two never overlap in a single run; the persistent profile is the source of
-truth when present, and `session.json` is the fallback. `close_browser` and
-`login` still write `session.json` so a later transient run can resume a
-session a persistent run established.
+Only one mechanism is *read* per run (the persistent profile when present,
+otherwise `~/.linkedin-networking-cli/session.json`). Writing is not exclusive:
+`close_browser` and `login` always write `session.json` for the active context
+— persistent runs included — so a later transient run can resume a session a
+persistent run established.
 
 ### File Structure Context
 

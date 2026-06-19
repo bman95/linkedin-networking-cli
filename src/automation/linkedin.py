@@ -106,19 +106,23 @@ class LinkedInAutomation:
         how the browser is launched:
 
         - **Persistent context** (``user_data_dir``): used when a real Chrome
-          install is configured (custom executable or the ``chrome`` channel).
-          ``launch_persistent_context`` reuses the on-disk Chrome profile under
+          install is configured (custom executable or the ``chrome`` channel)
+          and the persistent launch succeeds. ``launch_persistent_context``
+          reuses the on-disk Chrome profile under
           ``~/.linkedin-networking-cli/browser_data/``, so cookies and login
           state live inside that profile. This is the default/primary path.
-        - **storage_state JSON** (``session.json``): used only on the transient
-          fallback path (bundled Chromium with no persistent profile). The
-          context is created from / saved to ``session.json`` so auth survives
-          across runs even without a persistent profile.
+        - **storage_state JSON** (``session.json``): used on the transient
+          (non-persistent) launch path — i.e. when no real Chrome is configured,
+          a non-``chrome`` channel is used, or the persistent launch above
+          fails. Only on this path is ``session.json`` *loaded* into the new
+          context so auth survives across runs without a persistent profile.
 
-        The two never overlap in a single run: the persistent profile is the
-        source of truth when present, and ``storage_state`` is the fallback when
-        it is not. ``close_browser``/``login`` still write ``session.json`` so a
-        later transient run can pick up where a persistent one left off.
+        Read is exclusive — exactly one mechanism is *loaded* per run: the
+        persistent profile when present, otherwise ``session.json``. Writing is
+        not exclusive: ``close_browser`` and ``login`` always write
+        ``session.json`` for whatever context is active (persistent included),
+        so a later transient run can resume the session a persistent run
+        established.
         """
         # Force close any existing Chrome processes
         force_close_chrome()
