@@ -28,6 +28,11 @@ from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
 from automation.interactions import random_wait, _is_true_limit
+from automation.localization import (
+    detect_contact_language,
+    is_important_contact,
+    select_message_template,
+)
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -441,6 +446,66 @@ class LinkedInAutomation:
                 progress_callback(f"Search failed: {str(e)}")
             return profiles
 
+    async def _try_send_with_note(self, profile: "LinkedInProfile", note_text: str) -> bool:
+        """Attempt to send the invitation with a personalized note.
+
+        Returns True only when the note textarea is reachable, filled and the
+        invitation is sent. Returns False when LinkedIn shows the Premium upsell
+        (no note field) or the note UI is otherwise unavailable, so the caller
+        can fall back to sending without a note.
+        """
+        note_button = self.page.locator(
+            "button:has-text('Añadir una nota'), button:has-text('Add a note')"
+        ).first
+        if not await note_button.count():
+            return False
+
+        try:
+            await note_button.click(timeout=5000)
+
+            # On free accounts past the quota, clicking "Add a note" opens an
+            # upsell with no textarea; wait briefly and bail out if none appears.
+            textarea = self.page.locator("textarea").first
+            try:
+                await textarea.wait_for(state="visible", timeout=3000)
+            except TimeoutError:
+                logger.info(
+                    f"Note field did not appear for {profile.name} (likely Premium upsell)"
+                )
+                return False
+
+            await textarea.fill(note_text)
+            await random_wait(self.page, min_ms=500, max_ms=1200)
+
+            send_btn = self.page.locator(
+                "button:text-is('Enviar'), button:text-is('Send')"
+            ).first
+            if not await send_btn.count():
+                return False
+            await send_btn.click(timeout=5000)
+            logger.info(f"Sent personalized note to {profile.name}")
+            return True
+        except Exception as note_error:
+            logger.warning(f"Note attempt failed for {profile.name}: {note_error}")
+            return False
+
+    async def _dismiss_open_modal(self) -> None:
+        """Best-effort close of a leftover modal (e.g. a Premium upsell)."""
+        try:
+            for dismiss_sel in (
+                'button[aria-label="Descartar"]',
+                'button[aria-label="Dismiss"]',
+                'button[aria-label="Cerrar"]',
+                'button[aria-label="Close"]',
+            ):
+                dismiss_btn = self.page.locator(dismiss_sel).first
+                if await dismiss_btn.count():
+                    await dismiss_btn.click(timeout=3000)
+                    return
+            await self.page.keyboard.press("Escape")
+        except Exception as dismiss_error:
+            logger.debug(f"Could not dismiss modal: {dismiss_error}")
+
     async def send_connection_requests(
         self,
         campaign: Campaign,
@@ -656,45 +721,88 @@ class LinkedInAutomation:
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
 
-                # Send without a personalized note. LinkedIn gates custom notes
-                # behind Premium (and a small free quota); attempting "Add a note"
-                # leads to an upsell with no note field, so "Send without a note"
-                # is the reliable path that always delivers the invitation.
-                if campaign.message_template and campaign.message_template.strip():
-                    logger.info(
-                        "Campaign has a message template, but custom notes require "
-                        "LinkedIn Premium; sending without a note"
-                    )
+                # Personalized notes are scarce (LinkedIn Premium / a small free
+                # quota), so only spend them on "important" contacts and pick the
+                # template language from the contact's location. Everyone else is
+                # sent without a note, which is the path that always delivers.
+                note_text = None
+                if is_important_contact(campaign, profile.headline, profile.company):
+                    template = select_message_template(campaign, profile.location)
+                    if template and template.strip():
+                        try:
+                            note_text = template.format(name=profile.name)
+                        except (KeyError, IndexError, ValueError):
+                            note_text = template
+                        note_lang = detect_contact_language(
+                            profile.location, campaign.native_language or "es"
+                        )
+                        logger.info(
+                            f"{profile.name} is an important contact; "
+                            f"attempting a note in '{note_lang}'"
+                        )
 
-                send_no_note = self.page.locator(
-                    "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
-                ).first
-                send_exact = self.page.locator(
-                    "button:text-is('Enviar'), button:text-is('Send')"
-                ).first
-                send_target = send_no_note if await send_no_note.count() else send_exact
+                note_sent = False
+                if note_text:
+                    note_sent = await self._try_send_with_note(profile, note_text)
 
-                logger.info("Clicking 'Send without a note' button")
-                try:
-                    await send_target.click(timeout=5000)
-                except Exception as send_error:
-                    logger.warning(f"Send click failed for {profile.name}: {send_error}")
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Send button not clickable after clicking Connect",
-                    }
-                    self.db_manager.create_contact(contact_data)
-                    failed_count += 1
-                    if progress_callback:
-                        progress_callback(f"❌ Send button not clickable for {profile.name}")
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-                    continue
+                if not note_sent:
+                    if note_text:
+                        logger.info(
+                            "Could not attach a note (Premium/quota); sending without a note"
+                        )
+                    send_no_note = self.page.locator(
+                        "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
+                    ).first
+                    send_exact = self.page.locator(
+                        "button:text-is('Enviar'), button:text-is('Send')"
+                    ).first
+                    send_target = send_no_note if await send_no_note.count() else send_exact
+
+                    # A failed note attempt may have left a Premium upsell modal
+                    # with no send button; bail out cleanly for this contact.
+                    if not await send_target.count():
+                        logger.warning(
+                            f"No send button available for {profile.name}; skipping"
+                        )
+                        await self._dismiss_open_modal()
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "found",
+                            "notes": "Send button unavailable after note upsell",
+                        }
+                        self.db_manager.create_contact(contact_data)
+                        failed_count += 1
+                        if progress_callback:
+                            progress_callback(f"❌ Could not send to {profile.name}")
+                        await random_wait(self.page, min_ms=1000, max_ms=2000)
+                        continue
+
+                    logger.info("Clicking 'Send without a note' button")
+                    try:
+                        await send_target.click(timeout=5000)
+                    except Exception as send_error:
+                        logger.warning(f"Send click failed for {profile.name}: {send_error}")
+                        contact_data = {
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "found",
+                            "notes": "Send button not clickable after clicking Connect",
+                        }
+                        self.db_manager.create_contact(contact_data)
+                        failed_count += 1
+                        if progress_callback:
+                            progress_callback(f"❌ Send button not clickable for {profile.name}")
+                        await random_wait(self.page, min_ms=1000, max_ms=2000)
+                        continue
                 await random_wait(self.page, min_ms=2000, max_ms=3000)
 
                 # Check for the weekly invitation limit, distinguishing the real
