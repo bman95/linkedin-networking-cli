@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, Optional
-from zoneinfo import available_timezones
+from zoneinfo import available_timezones, TZPATH
 import os
 import sys
 
@@ -68,11 +68,40 @@ class AppSettings:
                 candidate = candidate[len(prefix):]
         return candidate if candidate in available_timezones() else None
 
+    @staticmethod
+    def _match_localtime_by_bytes() -> Optional[str]:
+        """Identify the host zone by matching ``/etc/localtime``'s bytes.
+
+        Containers (and some distros) ship ``/etc/localtime`` as a *copy* of a
+        zoneinfo file rather than a symlink, and often without ``/etc/timezone``.
+        The symlink/text branches miss that layout, so as a last resort we read
+        the file and compare it byte-for-byte against the zoneinfo database,
+        returning the matching IANA id. Returns ``None`` on any read error or no
+        match so the caller can fall back to ``UTC``.
+        """
+        try:
+            localtime_bytes = Path("/etc/localtime").read_bytes()
+        except OSError:
+            return None
+
+        for name in available_timezones():
+            for base in TZPATH:
+                candidate = Path(base) / name
+                try:
+                    if candidate.is_file():
+                        if candidate.read_bytes() == localtime_bytes:
+                            return name
+                        break
+                except OSError:
+                    break
+        return None
+
     @classmethod
     def _detect_host_timezone(cls) -> str:
         """Best-effort *valid* IANA timezone name for the host.
 
-        Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``)
+        Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``,
+        then a byte-match of ``/etc/localtime`` against the zoneinfo database)
         rather than hardcoding a zone, so ``timezone_id`` stays coherent with the
         OS the browser actually runs on. Every candidate is validated, and the
         function falls back to ``UTC`` when nothing reliable is found — so it can
@@ -105,6 +134,13 @@ class AppSettings:
                     return normalized
         except OSError:
             pass
+
+        # Copied (non-symlink) /etc/localtime without /etc/timezone — common in
+        # containers. Match the file's bytes against the zoneinfo database so a
+        # non-UTC host is not silently flattened to UTC.
+        matched = cls._match_localtime_by_bytes()
+        if matched:
+            return matched
 
         return "UTC"
 

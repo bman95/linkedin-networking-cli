@@ -388,11 +388,46 @@ class TestTimezoneDetection:
         )
         assert AppSettings._detect_host_timezone() == "Asia/Kolkata"
 
-    def test_no_sources_falls_back_to_utc(self, monkeypatch):
-        """Container with no TZ, no symlink and no /etc/timezone -> UTC."""
+    def test_copied_localtime_matched_by_bytes(self, monkeypatch):
+        """A copied (non-symlink) /etc/localtime with no /etc/timezone — the
+        common container layout — is resolved by byte-matching the zoneinfo DB
+        rather than silently flattening a non-UTC host to UTC."""
         monkeypatch.delenv("TZ", raising=False)
         monkeypatch.setattr(Path, "is_symlink", lambda self: False)
         monkeypatch.setattr(Path, "exists", lambda self: False)
+
+        from zoneinfo import TZPATH
+
+        target_zone = "America/New_York"
+        zone_path = next(
+            (Path(base) / target_zone for base in TZPATH
+             if (Path(base) / target_zone).is_file()),
+            None,
+        )
+        if zone_path is None:
+            pytest.skip("zoneinfo database not available on disk")
+        target_bytes = zone_path.read_bytes()
+
+        real_read_bytes = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if str(self) == "/etc/localtime":
+                return target_bytes
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        assert AppSettings._detect_host_timezone() == target_zone
+
+    def test_no_sources_falls_back_to_utc(self, monkeypatch):
+        """Container with no TZ, no symlink, no /etc/timezone and an
+        unreadable /etc/localtime -> UTC."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+        monkeypatch.setattr(
+            Path, "read_bytes",
+            lambda self: (_ for _ in ()).throw(OSError("no localtime")),
+        )
         assert AppSettings._detect_host_timezone() == "UTC"
 
 
