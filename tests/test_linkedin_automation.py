@@ -609,6 +609,30 @@ class TestFingerprintConsistency:
         assert kwargs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64) Custom"
 
     @pytest.mark.asyncio
+    async def test_timezone_omitted_when_host_zone_undetectable(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When the host timezone cannot be resolved, timezone_id is left out of
+        the context options so the browser keeps its own host zone (not UTC)."""
+        from config.settings import AppSettings
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.delenv("BROWSER_TIMEZONE", raising=False)
+        monkeypatch.setattr(
+            AppSettings, "_detect_host_timezone", classmethod(lambda cls: None)
+        )
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert "timezone_id" not in kwargs
+        assert "locale" in kwargs
+
+    @pytest.mark.asyncio
     async def test_storage_state_path_carries_locale_and_timezone(
         self, db_manager, app_settings, monkeypatch, tmp_path
     ):

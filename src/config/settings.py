@@ -88,24 +88,23 @@ class AppSettings:
             for base in TZPATH:
                 candidate = Path(base) / name
                 try:
-                    if candidate.is_file():
-                        if candidate.read_bytes() == localtime_bytes:
-                            return name
-                        break
+                    if candidate.is_file() and candidate.read_bytes() == localtime_bytes:
+                        return name
                 except OSError:
-                    break
+                    continue
         return None
 
     @classmethod
-    def _detect_host_timezone(cls) -> str:
-        """Best-effort *valid* IANA timezone name for the host.
+    def _detect_host_timezone(cls) -> Optional[str]:
+        """Best-effort *valid* IANA timezone name for the host, or ``None``.
 
         Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``,
         then a byte-match of ``/etc/localtime`` against the zoneinfo database)
         rather than hardcoding a zone, so ``timezone_id`` stays coherent with the
-        OS the browser actually runs on. Every candidate is validated, and the
-        function falls back to ``UTC`` when nothing reliable is found — so it can
-        never return a value Playwright would reject.
+        OS the browser actually runs on. Every candidate is validated. Returns
+        ``None`` when nothing reliable is found (e.g. a Windows host with no
+        Linux timezone files) so the caller can leave the context's timezone to
+        the browser's own host default rather than forcing an incoherent ``UTC``.
         """
         normalized = cls._normalize_timezone(os.getenv("TZ"))
         if normalized:
@@ -137,12 +136,8 @@ class AppSettings:
 
         # Copied (non-symlink) /etc/localtime without /etc/timezone — common in
         # containers. Match the file's bytes against the zoneinfo database so a
-        # non-UTC host is not silently flattened to UTC.
-        matched = cls._match_localtime_by_bytes()
-        if matched:
-            return matched
-
-        return "UTC"
+        # non-UTC host is not silently flattened.
+        return cls._match_localtime_by_bytes()
 
     def get_browser_settings(self) -> Dict[str, Any]:
         """Get browser settings"""
@@ -199,7 +194,8 @@ class AppSettings:
         logger.debug(
             f"Browser settings: headless={headless}, channel={channel}, "
             f"executable={executable is not None}, locale={locale}, "
-            f"timezone_id={timezone_id}, user_agent={'custom' if user_agent else 'default'}"
+            f"timezone_id={timezone_id or 'host-default'}, "
+            f"user_agent={'custom' if user_agent else 'default'}"
         )
         return settings
 

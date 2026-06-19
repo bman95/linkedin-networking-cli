@@ -303,16 +303,15 @@ class TestFingerprintSettings:
         settings = AppSettings()
         assert settings.get_browser_settings()["timezone_id"] == "America/New_York"
 
-    def test_timezone_is_iana_not_abbreviation(self, monkeypatch):
-        """The detected timezone is a non-empty IANA-style id, never an
-        abbreviation like 'CEST' which Playwright rejects."""
+    def test_timezone_is_iana_or_none(self, monkeypatch):
+        """The resolved timezone is either a valid IANA id (never an
+        abbreviation like 'CEST' that Playwright rejects) or None when the host
+        zone cannot be determined."""
         self._clear_env(monkeypatch)
         settings = AppSettings()
         tz = settings.get_browser_settings()["timezone_id"]
 
-        assert isinstance(tz, str) and tz
-        # Either a region/location IANA id (has a '/') or the UTC fallback.
-        assert "/" in tz or tz == "UTC"
+        assert tz is None or tz in available_timezones()
 
     def test_timezone_from_tz_env(self, monkeypatch):
         """A TZ env var holding an IANA name is honoured by detection."""
@@ -331,14 +330,28 @@ class TestFingerprintSettings:
         assert tz != "CEST"
         assert tz in available_timezones()
 
+    def test_timezone_none_when_undetectable(self, monkeypatch):
+        """With no override and no detectable host zone, timezone_id is None so
+        the browser keeps its own host timezone rather than being forced to
+        UTC."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setattr(
+            AppSettings, "_detect_host_timezone", classmethod(lambda cls: None)
+        )
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] is None
+
 
 @pytest.mark.unit
 class TestTimezoneDetection:
-    """The host-timezone helper only ever returns a valid IANA id."""
+    """The host-timezone helper returns a valid IANA id or None — never an
+    abbreviation or other value Playwright would reject."""
 
-    def test_returns_valid_iana_or_utc(self):
-        """Whatever the host looks like, the result is a real IANA zone."""
-        assert AppSettings._detect_host_timezone() in available_timezones()
+    def test_returns_valid_iana_or_none(self):
+        """Whatever the host looks like, the result is a real IANA zone or
+        None (never an invalid id)."""
+        tz = AppSettings._detect_host_timezone()
+        assert tz is None or tz in available_timezones()
 
     def test_tz_env_with_iana_name(self, monkeypatch):
         monkeypatch.setenv("TZ", "America/Sao_Paulo")
@@ -418,9 +431,10 @@ class TestTimezoneDetection:
         monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
         assert AppSettings._detect_host_timezone() == target_zone
 
-    def test_no_sources_falls_back_to_utc(self, monkeypatch):
-        """Container with no TZ, no symlink, no /etc/timezone and an
-        unreadable /etc/localtime -> UTC."""
+    def test_no_sources_returns_none(self, monkeypatch):
+        """Host with no TZ, no symlink, no /etc/timezone and an unreadable
+        /etc/localtime (e.g. native Windows) -> None, so the caller leaves the
+        timezone to the browser's host default instead of forcing UTC."""
         monkeypatch.delenv("TZ", raising=False)
         monkeypatch.setattr(Path, "is_symlink", lambda self: False)
         monkeypatch.setattr(Path, "exists", lambda self: False)
@@ -428,7 +442,7 @@ class TestTimezoneDetection:
             Path, "read_bytes",
             lambda self: (_ for _ in ()).throw(OSError("no localtime")),
         )
-        assert AppSettings._detect_host_timezone() == "UTC"
+        assert AppSettings._detect_host_timezone() is None
 
 
 # ============================================================================

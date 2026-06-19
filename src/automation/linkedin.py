@@ -164,13 +164,17 @@ class LinkedInAutomation:
         # Context options shared by every launch path (persistent and
         # transient) so the resulting page exposes one coherent fingerprint:
         # viewport, locale and timezone always agree, regardless of which path
-        # wins. user_agent is included only when explicitly overridden — the
-        # default leaves real Chrome's own (already-consistent) UA untouched.
+        # wins. timezone_id is included only when the host zone could be
+        # resolved — otherwise it is left to the browser's own host default
+        # rather than forcing an incoherent UTC. user_agent is likewise included
+        # only when explicitly overridden; the default leaves real Chrome's own
+        # (already-consistent) UA untouched.
         context_options: Dict[str, Any] = {
             "viewport": browser_settings["viewport"],
             "locale": browser_settings["locale"],
-            "timezone_id": browser_settings["timezone_id"],
         }
+        if browser_settings.get("timezone_id"):
+            context_options["timezone_id"] = browser_settings["timezone_id"]
         if browser_settings.get("user_agent"):
             context_options["user_agent"] = browser_settings["user_agent"]
 
