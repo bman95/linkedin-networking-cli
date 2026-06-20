@@ -82,10 +82,11 @@ class AppSettings:
             "connection_delay_min": int(os.getenv("CONNECTION_DELAY_MIN", "2")),
             "connection_delay_max": int(os.getenv("CONNECTION_DELAY_MAX", "5")),
             "daily_connection_limit": int(os.getenv("DAILY_CONNECTION_LIMIT", "20")),
+            "connection_cooldown": int(os.getenv("CONNECTION_COOLDOWN", "0")),
             "search_limit": int(os.getenv("SEARCH_LIMIT", "100"))
         }
 
-        logger.debug(f"Automation settings: delay={settings['connection_delay_min']}-{settings['connection_delay_max']}s, daily_limit={settings['daily_connection_limit']}, search_limit={settings['search_limit']}")
+        logger.debug(f"Automation settings: delay={settings['connection_delay_min']}-{settings['connection_delay_max']}s, daily_limit={settings['daily_connection_limit']}, cooldown={settings['connection_cooldown']}s, search_limit={settings['search_limit']}")
         return settings
 
     def validate_credentials(self) -> bool:

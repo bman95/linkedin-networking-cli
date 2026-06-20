@@ -430,6 +430,119 @@ class TestSettingsOperations:
         value = db_manager.get_setting("nonexistent_key", default="default_value")
         assert value == "default_value"
 
+
+# ============================================================================
+# Daily Connection Count (Persisted Rate-Limiting) Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestDailyConnectionCount:
+    """Test persisted per-local-day connection counter operations."""
+
+    def test_get_count_absent_day_is_zero(self, db_manager):
+        """An untouched day starts at zero (self-clearing on date rollover)."""
+        assert db_manager.get_daily_connection_count("2025-01-15") == 0
+
+    def test_increment_creates_row(self, db_manager):
+        """Incrementing an absent day creates a row at count 1."""
+        new_count = db_manager.increment_daily_connection_count("2025-01-15")
+        assert new_count == 1
+        assert db_manager.get_daily_connection_count("2025-01-15") == 1
+
+    def test_increment_accumulates(self, db_manager):
+        """Repeated increments accumulate within the same day."""
+        for expected in range(1, 6):
+            assert (
+                db_manager.increment_daily_connection_count("2025-01-15") == expected
+            )
+        assert db_manager.get_daily_connection_count("2025-01-15") == 5
+
+    def test_counts_are_independent_per_day(self, db_manager):
+        """Each local day keeps its own count; a new day starts at zero."""
+        db_manager.increment_daily_connection_count("2025-01-15")
+        db_manager.increment_daily_connection_count("2025-01-15")
+        db_manager.increment_daily_connection_count("2025-01-16")
+
+        assert db_manager.get_daily_connection_count("2025-01-15") == 2
+        assert db_manager.get_daily_connection_count("2025-01-16") == 1
+        assert db_manager.get_daily_connection_count("2025-01-17") == 0
+
+    def test_increment_records_last_action_at(self, db_manager):
+        """Incrementing records a timezone-aware last-action timestamp."""
+        before = datetime.now(timezone.utc)
+        db_manager.increment_daily_connection_count("2025-01-15")
+        after = datetime.now(timezone.utc)
+
+        last = db_manager.get_last_connection_at()
+        assert last is not None
+        # SQLite drops tzinfo on round-trip; compare as naive UTC.
+        last_naive = last.replace(tzinfo=None) if last.tzinfo else last
+        assert before.replace(tzinfo=None) <= last_naive <= after.replace(tzinfo=None)
+
+    def test_get_last_connection_at_none_when_empty(self, db_manager):
+        """No recorded connections yields no last-action timestamp."""
+        assert db_manager.get_last_connection_at() is None
+
+    def test_get_last_connection_at_returns_most_recent(self, db_manager):
+        """The latest timestamp across all days is returned."""
+        db_manager.increment_daily_connection_count("2025-01-15")
+        db_manager.increment_daily_connection_count("2025-01-16")
+        last = db_manager.get_last_connection_at()
+        assert last is not None
+
+    def test_reserve_slot_on_fresh_day(self, db_manager):
+        """Reserving on an empty day claims slot 1."""
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) == 1
+        assert db_manager.get_daily_connection_count("2025-01-15") == 1
+
+    def test_reserve_slot_accumulates_up_to_limit(self, db_manager):
+        """Reservations accumulate and the final slot is claimable."""
+        for expected in range(1, 21):
+            assert db_manager.reserve_daily_slot("2025-01-15", 20) == expected
+        assert db_manager.get_daily_connection_count("2025-01-15") == 20
+
+    def test_reserve_slot_refused_when_full(self, db_manager):
+        """Once at the limit, reservation is refused and the count is stable."""
+        for _ in range(20):
+            db_manager.reserve_daily_slot("2025-01-15", 20)
+        # Day is full: the next reservation must be refused, not over-count.
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) is None
+        assert db_manager.get_daily_connection_count("2025-01-15") == 20
+
+    def test_reserve_final_slot_is_not_confused_with_full(self, db_manager):
+        """Claiming the last slot (count==limit) returns the count, not None."""
+        for _ in range(19):
+            db_manager.reserve_daily_slot("2025-01-15", 20)
+        # 19/20 -> claiming the 20th must succeed and return 20 (not None).
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) == 20
+        # 20/20 -> now refused.
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) is None
+
+    def test_reserve_slot_zero_limit_refused(self, db_manager):
+        """A non-positive limit never grants a slot."""
+        assert db_manager.reserve_daily_slot("2025-01-15", 0) is None
+        assert db_manager.get_daily_connection_count("2025-01-15") == 0
+
+    def test_release_slot_decrements(self, db_manager):
+        """Releasing gives a reserved slot back."""
+        db_manager.reserve_daily_slot("2025-01-15", 20)
+        db_manager.reserve_daily_slot("2025-01-15", 20)
+        db_manager.release_daily_slot("2025-01-15")
+        assert db_manager.get_daily_connection_count("2025-01-15") == 1
+
+    def test_release_slot_never_below_zero(self, db_manager):
+        """Releasing an empty day never produces a negative count."""
+        db_manager.release_daily_slot("2025-01-15")
+        assert db_manager.get_daily_connection_count("2025-01-15") == 0
+
+    def test_reserve_then_release_frees_capacity(self, db_manager):
+        """A released slot can be reserved again (full -> release -> claim)."""
+        for _ in range(20):
+            db_manager.reserve_daily_slot("2025-01-15", 20)
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) is None
+        db_manager.release_daily_slot("2025-01-15")  # back to 19/20
+        assert db_manager.reserve_daily_slot("2025-01-15", 20) == 20
+
     def test_set_setting_with_string(self, db_manager):
         """Test setting with string value."""
         db_manager.set_setting("username", "john_doe")

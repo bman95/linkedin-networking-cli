@@ -4,7 +4,7 @@ import subprocess
 import time
 import unicodedata
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
 from playwright.async_api import (
@@ -528,9 +528,61 @@ class LinkedInAutomation:
         from .interactions import detect_captcha
 
         automation_settings = self.settings.get_automation_settings()
+        daily_limit = automation_settings["daily_connection_limit"]
         sent_count = 0
         failed_count = 0
         existing_count = 0
+
+        # Persisted, restart-safe daily cap. The count is keyed by the local
+        # day, so quitting and reopening the CLI cannot blow past the limit,
+        # and the counter self-clears when a new local day begins.
+        today = date.today().isoformat()
+        already_sent_today = self.db_manager.get_daily_connection_count(today)
+
+        # Optional inter-session cooldown: if a previous run sent a request
+        # within the configured window, warn the user before continuing.
+        cooldown_seconds = automation_settings.get("connection_cooldown", 0)
+        if cooldown_seconds > 0:
+            last_action_at = self.db_manager.get_last_connection_at()
+            if last_action_at is not None:
+                if last_action_at.tzinfo is None:
+                    last_action_at = last_action_at.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - last_action_at).total_seconds()
+                if elapsed < cooldown_seconds:
+                    remaining = int(cooldown_seconds - elapsed)
+                    logger.warning(
+                        "Inter-session cooldown active: last request %ds ago, "
+                        "cooldown is %ds (%ds remaining)",
+                        int(elapsed),
+                        cooldown_seconds,
+                        remaining,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            f"⚠️ Cooldown active — last connection {int(elapsed)}s ago; "
+                            f"wait {remaining}s before the next run"
+                        )
+
+        # Stop immediately if the persisted daily cap was already reached on a
+        # prior run today.
+        if already_sent_today >= daily_limit:
+            logger.info(
+                "Daily connection limit already reached (%d/%d) before this run",
+                already_sent_today,
+                daily_limit,
+            )
+            if progress_callback:
+                progress_callback(
+                    f"Daily connection limit already reached "
+                    f"({already_sent_today}/{daily_limit} used today)"
+                )
+            self.db_manager.update_campaign_stats(campaign.id)
+            return {
+                "sent": 0,
+                "failed": 0,
+                "existing": 0,
+                "total_processed": 0,
+            }
 
         # Backoff state: repeated failures may signal a restricted account.
         consecutive_failures = 0
@@ -538,7 +590,23 @@ class LinkedInAutomation:
         backoff_cap_seconds = 300
 
         for i, profile in enumerate(profiles):
+            # Tracks whether THIS iteration has claimed a daily slot, so any
+            # path that doesn't end in a confirmed send can give it back.
+            slot_reserved = False
+            today = date.today().isoformat()
             try:
+                # Recompute the local-day key each iteration so a run that
+                # crosses midnight starts a fresh bucket. The actual slot is
+                # claimed atomically just before sending (reserve-before-send),
+                # so this is only a cheap early stop, not the enforcement point.
+                if self.db_manager.get_daily_connection_count(today) >= daily_limit:
+                    if progress_callback:
+                        progress_callback(
+                            f"Daily connection limit reached "
+                            f"({daily_limit}/{daily_limit} used today)"
+                        )
+                    break
+
                 if progress_callback:
                     progress_callback(
                         f"Processing {profile.name} ({i + 1}/{len(profiles)})"
@@ -613,6 +681,21 @@ class LinkedInAutomation:
                     if progress_callback:
                         progress_callback(f"⚠️ No Connect button for {profile.name}")
                     continue
+
+                # Reserve a daily slot atomically BEFORE sending. This closes
+                # the check-then-send window: a concurrent run cannot also pass
+                # the cap while we are mid-send, because only one process can
+                # claim the slot that brings the count to the limit. If the
+                # reservation is refused, the day is full and we stop.
+                reserved_count = self.db_manager.reserve_daily_slot(today, daily_limit)
+                if reserved_count is None:
+                    if progress_callback:
+                        progress_callback(
+                            f"Daily connection limit reached "
+                            f"({daily_limit}/{daily_limit} used today)"
+                        )
+                    break
+                slot_reserved = True
 
                 # Click Connect. The top-card control is already in view at
                 # scroll-top, so a real Playwright click reaches it and the
@@ -791,10 +874,21 @@ class LinkedInAutomation:
                 self.db_manager.create_contact(contact_data)
                 sent_count += 1
                 consecutive_failures = 0  # successful action resets backoff
+                # The slot was reserved (and persisted) before the send, so the
+                # request is now confirmed and the reservation is consumed —
+                # don't release it. reserved_count is the cumulative day total.
+                slot_reserved = False
+                total_today = reserved_count
+                # Stamp the cooldown timestamp now (only on a real send, not on
+                # reservation), so a failed send never triggers a false cooldown.
+                self.db_manager.mark_connection_sent(today)
                 logger.info(f"Successfully sent connection request to {profile.name}")
 
                 if progress_callback:
                     progress_callback(f"✅ Sent connection request to {profile.name}")
+                    progress_callback(
+                        f"📊 {total_today}/{daily_limit} used today"
+                    )
 
                 # Random delay between connections
                 delay = random.randint(
@@ -803,10 +897,13 @@ class LinkedInAutomation:
                 )
                 await self.page.wait_for_timeout(delay * 1000)
 
-                # Check daily limits
-                if sent_count >= automation_settings["daily_connection_limit"]:
+                # Check the persisted daily limit (cumulative across restarts).
+                if total_today >= daily_limit:
                     if progress_callback:
-                        progress_callback("Daily connection limit reached")
+                        progress_callback(
+                            f"Daily connection limit reached "
+                            f"({total_today}/{daily_limit} used today)"
+                        )
                     break
 
             except Exception as e:
@@ -834,6 +931,13 @@ class LinkedInAutomation:
                         )
                     await self.page.wait_for_timeout(wait_seconds * 1000)
                 continue
+            finally:
+                # Give back a reserved slot that wasn't consumed by a confirmed
+                # send (email-required, blocked, modal-not-found, failed send,
+                # or any exception). Success clears the flag, so this is a
+                # no-op there. Runs on every continue/break/exception exit.
+                if slot_reserved:
+                    self.db_manager.release_daily_slot(today)
 
         # Update campaign statistics
         self.db_manager.update_campaign_stats(campaign.id)

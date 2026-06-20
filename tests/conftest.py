@@ -19,7 +19,7 @@ from sqlmodel.pool import StaticPool
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from database.models import Campaign, Contact, Analytics, Settings
+from database.models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
 from database.operations import DatabaseManager
 from config.settings import AppSettings
 
