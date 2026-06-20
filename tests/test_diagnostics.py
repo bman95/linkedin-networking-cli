@@ -144,6 +144,32 @@ class TestCaptureErrorContext:
         assert result["dom"] is None
 
     @pytest.mark.asyncio
+    async def test_dom_capture_is_time_bounded(self, monkeypatch):
+        # A *wedged* (not closed) page: page.content() hangs. The DOM dump must
+        # be time-bounded so it can never stall the error path and swallow the
+        # original exception. Tighten the cap so the test stays fast.
+        import asyncio
+
+        monkeypatch.setattr(diagnostics, "_DOM_TIMEOUT_S", 0.05)
+        page = _good_page()
+
+        async def _hang():
+            await asyncio.sleep(30)
+            return "<html>never</html>"
+
+        page.content = _hang
+
+        # Whole capture must return well within a second despite the 30s hang.
+        result = await asyncio.wait_for(
+            capture_error_context(page, "wedged", exc=RuntimeError("orig")),
+            timeout=2.0,
+        )
+        assert result["dom_ok"] is False
+        assert result["dom"] is None
+        # Screenshot path is independent and still succeeds (mock).
+        assert result["screenshot_ok"] is True
+
+    @pytest.mark.asyncio
     async def test_emits_structured_log_line_at_error(self, caplog):
         page = _good_page(url="https://www.linkedin.com/x", title="Title Z")
         with caplog.at_level(logging.ERROR, logger="automation.diagnostics"):

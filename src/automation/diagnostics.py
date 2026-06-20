@@ -18,6 +18,7 @@ Modeled on the LinkedIn Worker project's ``agent/src/browser/diagnostics.py``.
 All capture functions are async and operate on an async Playwright ``Page``.
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -35,6 +36,12 @@ logger = get_logger(__name__)
 # Viewport-only screenshot on the error path: a full_page shot of a huge or
 # crashed page can hang or balloon, so cap it tight.
 _SCREENSHOT_TIMEOUT_MS = 5_000
+
+# DOM dump cap. ``page.content()`` takes no timeout argument, and on a *wedged*
+# (not closed) page it can block indefinitely — which would hang the whole
+# error path and prevent the original exception from ever propagating. Guard it
+# with the same ceiling as the screenshot so the bundle can never stall.
+_DOM_TIMEOUT_S = 5.0
 
 # Ring-buffer size for landed-page snapshots.
 _PAGE_RING_SIZE = 10
@@ -132,9 +139,15 @@ async def _capture_screenshot(page, path: Path) -> bool:
 
 
 async def _capture_dom(page, path: Path) -> bool:
-    """Write the current DOM to ``path``. Returns True on success, never raises."""
+    """Write the current DOM to ``path``. Returns True on success, never raises.
+
+    ``page.content()`` has no native timeout and can block indefinitely on a
+    wedged page, so it is bounded with ``asyncio.wait_for`` — otherwise a hung
+    DOM read would stall the entire error path and swallow the original
+    exception.
+    """
     try:
-        html = await page.content()
+        html = await asyncio.wait_for(page.content(), timeout=_DOM_TIMEOUT_S)
         path.write_text(html, encoding="utf-8")
         return True
     except Exception as exc:
