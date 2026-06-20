@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from automation import selectors as sel
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -69,15 +70,20 @@ async def scroll_down(page) -> None:
 
 
 async def _is_true_limit(modal) -> bool:
-    """Check if the modal indicates a true invitation limit."""
+    """Check if the modal indicates a true invitation limit.
+
+    The icon and header candidates come from the central
+    ``LIMIT_TRUE_MARKER`` selector (candidate #0 is the locked-padlock icon
+    that marks a true weekly limit; the rest are the header-text fallback).
+    """
+    icon_css, *header_css = sel.LIMIT_TRUE_MARKER.candidates
+
     # Check for LinkedIn invitation limit icon
-    if await modal.query_selector("svg[data-test-icon='locked']"):
+    if await modal.query_selector(icon_css):
         return True
 
     # Fallback by heading text (in case they change the icon)
-    header_el = await modal.query_selector(
-        "#ip-fuse-limit-alert__header, h2.ip-fuse-limit-alert__header"
-    )
+    header_el = await modal.query_selector(", ".join(header_css))
     header = (await header_el.inner_text()).strip().lower() if header_el else ""
 
     true_texts = {

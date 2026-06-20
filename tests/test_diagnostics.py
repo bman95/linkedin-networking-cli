@@ -423,6 +423,7 @@ class TestSearchReadinessWiring:
     ):
         from playwright.async_api import TimeoutError as PWTimeoutError
         from database.models import Campaign
+        from automation import selectors as sel
 
         campaign = Campaign(name="Wiring Test")
         # Force the readiness wait_for_selector to time out.
@@ -430,8 +431,10 @@ class TestSearchReadinessWiring:
             side_effect=PWTimeoutError("timeout")
         )
 
+        # The readiness selector now fails loud through the central registry,
+        # so the evidence capture flows through automation.selectors.
         with patch(
-            "automation.linkedin.capture_error_context",
+            "automation.selectors.capture_error_context",
             new=AsyncMock(),
         ) as mock_capture:
             # search_profiles swallows the exception and returns partial results,
@@ -441,8 +444,12 @@ class TestSearchReadinessWiring:
         assert result == []
         mock_capture.assert_awaited_once()
         call = mock_capture.await_args
-        assert call.args[1] == "search_results_readiness_wait"
+        # Step name is derived from the selector's registry name.
+        assert call.args[1] == "selector_not_found_search_results_ready"
         assert call.kwargs["context"]["campaign"] == "Wiring Test"
+        # The bundle records the selector name and the full candidate list tried.
+        assert call.kwargs["context"]["selector"] == "search_results_ready"
+        assert call.kwargs["context"]["candidates"] == sel.SEARCH_RESULTS_READY.candidates
         # The captured exception is the SelectorNotFoundException.
         assert type(call.kwargs["exc"]).__name__ == "SelectorNotFoundException"
 
