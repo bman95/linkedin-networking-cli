@@ -479,11 +479,19 @@ class TestAutomationSettings:
     def test_get_automation_settings_defaults(self, monkeypatch):
         """Test default automation settings."""
         # Clear all automation-related env vars
-        monkeypatch.delenv("CONNECTION_DELAY_MIN", raising=False)
-        monkeypatch.delenv("CONNECTION_DELAY_MAX", raising=False)
-        monkeypatch.delenv("DAILY_CONNECTION_LIMIT", raising=False)
-        monkeypatch.delenv("CONNECTION_COOLDOWN", raising=False)
-        monkeypatch.delenv("SEARCH_LIMIT", raising=False)
+        for var in (
+            "CONNECTION_DELAY_MIN",
+            "CONNECTION_DELAY_MAX",
+            "DAILY_CONNECTION_LIMIT",
+            "CONNECTION_COOLDOWN",
+            "SEARCH_LIMIT",
+            "TYPING_DELAY_MIN",
+            "TYPING_DELAY_MAX",
+            "ACTION_DELAY_MIN",
+            "ACTION_DELAY_MAX",
+            "MAX_ACTIONS_PER_MINUTE",
+        ):
+            monkeypatch.delenv(var, raising=False)
 
         settings = AppSettings()
         auto_settings = settings.get_automation_settings()
@@ -493,6 +501,12 @@ class TestAutomationSettings:
         assert auto_settings["daily_connection_limit"] == 20
         assert auto_settings["connection_cooldown"] == 0
         assert auto_settings["search_limit"] == 100
+        # Humanization defaults (issue #15).
+        assert auto_settings["typing_delay_min"] == 50
+        assert auto_settings["typing_delay_max"] == 150
+        assert auto_settings["action_delay_min"] == 1
+        assert auto_settings["action_delay_max"] == 4
+        assert auto_settings["max_actions_per_minute"] == 20
 
     def test_get_automation_settings_custom_values(self, monkeypatch):
         """Test automation settings with custom values."""
@@ -501,6 +515,11 @@ class TestAutomationSettings:
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "50")
         monkeypatch.setenv("CONNECTION_COOLDOWN", "3600")
         monkeypatch.setenv("SEARCH_LIMIT", "200")
+        monkeypatch.setenv("TYPING_DELAY_MIN", "80")
+        monkeypatch.setenv("TYPING_DELAY_MAX", "200")
+        monkeypatch.setenv("ACTION_DELAY_MIN", "2")
+        monkeypatch.setenv("ACTION_DELAY_MAX", "6")
+        monkeypatch.setenv("MAX_ACTIONS_PER_MINUTE", "10")
 
         settings = AppSettings()
         auto_settings = settings.get_automation_settings()
@@ -510,6 +529,11 @@ class TestAutomationSettings:
         assert auto_settings["daily_connection_limit"] == 50
         assert auto_settings["connection_cooldown"] == 3600
         assert auto_settings["search_limit"] == 200
+        assert auto_settings["typing_delay_min"] == 80
+        assert auto_settings["typing_delay_max"] == 200
+        assert auto_settings["action_delay_min"] == 2
+        assert auto_settings["action_delay_max"] == 6
+        assert auto_settings["max_actions_per_minute"] == 10
 
     def test_get_automation_settings_zero_values(self, monkeypatch):
         """Test automation settings with zero values."""
@@ -533,6 +557,11 @@ class TestAutomationSettings:
         assert isinstance(auto_settings["daily_connection_limit"], int)
         assert isinstance(auto_settings["connection_cooldown"], int)
         assert isinstance(auto_settings["search_limit"], int)
+        assert isinstance(auto_settings["typing_delay_min"], int)
+        assert isinstance(auto_settings["typing_delay_max"], int)
+        assert isinstance(auto_settings["action_delay_min"], int)
+        assert isinstance(auto_settings["action_delay_max"], int)
+        assert isinstance(auto_settings["max_actions_per_minute"], int)
 
     @pytest.mark.parametrize("env_var,default_value", [
         ("CONNECTION_DELAY_MIN", 2),
@@ -540,6 +569,11 @@ class TestAutomationSettings:
         ("DAILY_CONNECTION_LIMIT", 20),
         ("CONNECTION_COOLDOWN", 0),
         ("SEARCH_LIMIT", 100),
+        ("TYPING_DELAY_MIN", 50),
+        ("TYPING_DELAY_MAX", 150),
+        ("ACTION_DELAY_MIN", 1),
+        ("ACTION_DELAY_MAX", 4),
+        ("MAX_ACTIONS_PER_MINUTE", 20),
     ])
     def test_automation_settings_individual_defaults(self, monkeypatch, env_var, default_value):
         """Test individual automation setting defaults."""

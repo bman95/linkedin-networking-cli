@@ -169,6 +169,31 @@ def mock_page():
     page.get_attribute = AsyncMock()
     page.inner_text = AsyncMock()
 
+    # Humanization primitives (issue #15). scroll_down reads these via
+    # page.evaluate; returning 0 makes the "scrolled to bottom" check true
+    # immediately so the mock loop runs zero iterations. mouse/keyboard back
+    # the human mouse-move and typing helpers.
+    page.evaluate = AsyncMock(return_value=0)
+    mouse = AsyncMock()
+    mouse.move = AsyncMock()
+    mouse.wheel = AsyncMock()
+    page.mouse = mouse
+    page.keyboard = AsyncMock()
+
+    # page.locator() is synchronous in Playwright and returns a Locator. The
+    # default locator supports the methods the humanized paths touch (click,
+    # type, bounding_box, count, first); individual tests override this.
+    def _make_locator(*_args, **_kwargs):
+        locator = AsyncMock()
+        locator.click = AsyncMock()
+        locator.type = AsyncMock()
+        locator.bounding_box = AsyncMock(return_value=None)
+        locator.count = AsyncMock(return_value=1)
+        locator.first = locator
+        return locator
+
+    page.locator = MagicMock(side_effect=_make_locator)
+
     # Mock request context
     request_mock = AsyncMock()
     request_mock.get = AsyncMock()
