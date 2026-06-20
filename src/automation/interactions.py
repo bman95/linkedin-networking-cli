@@ -107,8 +107,14 @@ async def human_type(
     randomized per-key delay (in ms). ``box`` is a Playwright Locator;
     ``press_sequentially`` drives one keystroke at a time, unlike ``fill``
     which sets the value instantly and reads as scripted.
+
+    The field is cleared first so any pre-existing value (browser autofill, a
+    remembered credential in the persistent profile, or a prior failed
+    attempt) is overwritten rather than appended to — matching ``fill``'s
+    overwrite semantics that this replaces.
     """
     await box.click()
+    await box.clear()
     # Brief focus pause before the first keystroke.
     await asyncio.sleep(random.uniform(0.15, 0.4))
     for char in text:

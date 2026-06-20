@@ -147,6 +147,7 @@ class TestHumanType:
     async def test_types_one_key_per_character(self):
         box = AsyncMock()
         box.click = AsyncMock()
+        box.clear = AsyncMock()
         box.press_sequentially = AsyncMock()
 
         # Skip the real focus-pause sleep to keep the test fast.
@@ -161,6 +162,19 @@ class TestHumanType:
         # Per-key delay is passed through within the configured range.
         for call in box.press_sequentially.await_args_list:
             assert call.kwargs["delay"] == 10
+
+    @pytest.mark.asyncio
+    async def test_clears_field_before_typing(self):
+        """Pre-existing content (autofill/remembered) is overwritten, not appended."""
+        box = AsyncMock()
+        box.click = AsyncMock()
+        box.clear = AsyncMock()
+        box.press_sequentially = AsyncMock()
+
+        with patch("automation.interactions.asyncio.sleep", new=AsyncMock()):
+            await human_type(box, "x", delay_min=10, delay_max=10)
+
+        box.clear.assert_awaited_once()
 
 
 @pytest.mark.unit

@@ -212,6 +212,7 @@ class TestLogin:
         def _locator(selector):
             loc = AsyncMock()
             loc.click = AsyncMock()
+            loc.clear = AsyncMock()
             loc.press_sequentially = AsyncMock()
             loc.bounding_box = AsyncMock(return_value=None)
             loc.first = loc
@@ -230,6 +231,10 @@ class TestLogin:
         password = app_settings.linkedin_password
         assert locators["input#username"].press_sequentially.call_count == len(email)
         assert locators["input#password"].press_sequentially.call_count == len(password)
+        # Each field is cleared first so autofill/remembered values don't get
+        # appended to (overwrite semantics, matching the old fill).
+        assert locators["input#username"].clear.called
+        assert locators["input#password"].clear.called
         # Submit button is clicked after a natural mouse move.
         assert locators["button[type=submit]"].click.called
 
