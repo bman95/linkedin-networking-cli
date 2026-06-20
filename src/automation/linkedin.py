@@ -28,6 +28,12 @@ from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
 from automation.interactions import random_wait, _is_true_limit
+from automation.diagnostics import (
+    capture_error_context,
+    capture_anomaly_context,
+    snapshot_page,
+    reset_diagnostics_run,
+)
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -417,6 +423,10 @@ class LinkedInAutomation:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         profiles = []
+        # New run boundary: clear per-run diagnostics state (anomaly rate-limit
+        # counter + page-snapshot ring) so a long-lived CLI process neither
+        # leaks the counter nor mixes ring-buffer evidence across campaigns.
+        reset_diagnostics_run()
 
         try:
             # Build search URL
@@ -433,12 +443,22 @@ class LinkedInAutomation:
                 await self.page.wait_for_selector(
                     ".search-results-container, main a[href*='/in/']", timeout=15000
                 )
-            except TimeoutError:
-                raise SelectorNotFoundException(
+            except TimeoutError as exc:
+                not_found = SelectorNotFoundException(
                     "Search results not found - LinkedIn page structure may have changed",
                     selector=".search-results-container, main a[href*='/in/']",
                     timeout=15000
                 )
+                # Capture an evidence bundle before raising so a layout change
+                # leaves a screenshot + DOM snapshot to inspect. Best-effort:
+                # this never raises and never masks the original failure.
+                await capture_error_context(
+                    self.page,
+                    "search_results_readiness_wait",
+                    exc=not_found,
+                    context={"campaign": campaign.name},
+                )
+                raise not_found from exc
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops
@@ -464,6 +484,12 @@ class LinkedInAutomation:
                         timeout=10000
                     )
 
+                # Record the landed search page into the rolling ring buffer so
+                # a later failure can be traced back through how we got here.
+                await snapshot_page(self.page, page_count - 1)
+
+                profiles_before_page = len(profiles)
+
                 # Legacy UI: structured result elements with a stable attribute
                 profile_elements = await self.page.query_selector_all(
                     "[data-chameleon-result-urn]"
@@ -487,6 +513,17 @@ class LinkedInAutomation:
                         if profile.profile_url not in seen_urls:
                             profiles.append(profile)
                             seen_urls.add(profile.profile_url)
+
+                # The readiness selector matched but neither extraction strategy
+                # yielded a profile: a "weird but survivable" SDUI-drift state.
+                # Capture an anomaly bundle (rate-limited, best-effort) so a
+                # silent extraction regression leaves evidence.
+                if len(profiles) == profiles_before_page:
+                    await capture_anomaly_context(
+                        self.page,
+                        "search_page_no_profiles_extracted",
+                        context={"campaign": campaign.name, "page": page_count},
+                    )
 
                 # Check for next page (EN/ES aria-labels, then SDUI text button)
                 next_button = await self.page.query_selector(
