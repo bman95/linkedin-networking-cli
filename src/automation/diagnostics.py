@@ -43,7 +43,20 @@ _PAGE_RING_SIZE = 10
 _MAX_ANOMALY_CAPTURES = 8
 
 # Mutable run-scoped counter for anomaly rate limiting.
+#
+# Both this counter and the page ring are *process*-global, not bound to a
+# specific run object. The current CLI drives a single sequential search flow,
+# so "per run" and "per process" coincide. If a future caller ever runs two
+# searches concurrently in one process (e.g. asyncio.gather), they would share
+# this counter and the ring slots and corrupt each other's evidence — scope
+# these to a run/context object before doing that.
 _anomaly_capture_count = 0
+
+# Monotonic per-process counter appended to artifact filenames so two captures
+# with the same step name inside the same wall-clock second cannot collide and
+# silently overwrite each other's evidence (one-second timestamp granularity is
+# not unique on the hot anomaly path, which uses a constant step name).
+_artifact_seq = 0
 
 
 def _artifacts_dir() -> Path:
@@ -143,8 +156,12 @@ async def _capture_bundle(
     Returns a dict describing what was written (artifact paths, captured
     metadata) so callers/tests can introspect the bundle.
     """
+    global _artifact_seq
     slug = _slugify(name)
     ts = _timestamp()
+    # Per-process sequence suffix disambiguates same-second, same-step captures.
+    _artifact_seq += 1
+    seq_suffix = f"{_artifact_seq:04d}"
     context = context or {}
 
     try:
@@ -160,8 +177,8 @@ async def _capture_bundle(
         )
         return {"screenshot": None, "dom": None, "screenshot_ok": False, "dom_ok": False}
 
-    png_path = base_dir / f"{prefix}_{slug}_{ts}.png"
-    html_path = base_dir / f"{prefix}_{slug}_{ts}.html"
+    png_path = base_dir / f"{prefix}_{slug}_{ts}_{seq_suffix}.png"
+    html_path = base_dir / f"{prefix}_{slug}_{ts}_{seq_suffix}.html"
 
     # Best-effort page metadata. Each accessor is fully guarded, including the
     # attribute access itself (e.g. ``page.title``) — on a closed page even
@@ -262,9 +279,12 @@ async def capture_anomaly_context(
 ) -> Optional[Dict[str, Any]]:
     """Capture an evidence bundle for a non-fatal anomaly (logged at WARNING).
 
-    Rate-limited to ``_MAX_ANOMALY_CAPTURES`` per run so a repeating banner
-    cannot flood the artifacts directory. Returns ``None`` once the cap is
-    reached. Best-effort: never raises.
+    Rate-limited to ``_MAX_ANOMALY_CAPTURES`` *successful* captures per run so a
+    repeating banner cannot flood the artifacts directory. The slot is consumed
+    only when a bundle actually lands at least one artifact — a string of no-op
+    attempts on a crashed/closed page does not starve the budget, so a later
+    capture on a still-alive page still gets through. Returns ``None`` once the
+    cap is reached. Best-effort: never raises.
     """
     global _anomaly_capture_count
     if _anomaly_capture_count >= _MAX_ANOMALY_CAPTURES:
@@ -274,10 +294,9 @@ async def capture_anomaly_context(
             name,
         )
         return None
-    _anomaly_capture_count += 1
 
     try:
-        return await _capture_bundle(
+        result = await _capture_bundle(
             page, "anomaly", name, logging.WARNING, context=context
         )
     except Exception as capture_exc:  # pragma: no cover - defensive backstop
@@ -285,6 +304,12 @@ async def capture_anomaly_context(
             "capture_anomaly_context failed for %s: %s", name, capture_exc
         )
         return {"screenshot": None, "dom": None, "screenshot_ok": False, "dom_ok": False}
+
+    # Only consume a rate-limit slot when evidence actually landed; no-op
+    # captures on a dead page must not exhaust the per-run budget.
+    if result.get("screenshot_ok") or result.get("dom_ok"):
+        _anomaly_capture_count += 1
+    return result
 
 
 async def snapshot_page(page, seq: int) -> Optional[str]:

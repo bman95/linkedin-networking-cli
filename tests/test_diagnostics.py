@@ -188,6 +188,22 @@ class TestCaptureErrorContext:
         assert result["screenshot_ok"] is False and result["dom_ok"] is False
 
     @pytest.mark.asyncio
+    async def test_same_step_same_second_does_not_overwrite(self, artifacts_dir):
+        # Two captures with the same step name in the same wall-clock second
+        # must resolve to distinct artifact paths, or the second silently
+        # clobbers the first's evidence (one-second timestamp granularity).
+        page = _good_page()
+        page.content = AsyncMock(side_effect=["<html>FIRST</html>", "<html>SECOND</html>"])
+        first = await capture_error_context(page, "same_step", exc=ValueError("a"))
+        second = await capture_error_context(page, "same_step", exc=ValueError("b"))
+
+        assert first["dom"] != second["dom"]
+        assert first["screenshot"] != second["screenshot"]
+        # Both DOMs survive on disk, distinct content.
+        assert Path(first["dom"]).read_text(encoding="utf-8") == "<html>FIRST</html>"
+        assert Path(second["dom"]).read_text(encoding="utf-8") == "<html>SECOND</html>"
+
+    @pytest.mark.asyncio
     async def test_never_raises_on_throwing_repr_context(self, caplog):
         page = _good_page()
         with caplog.at_level(logging.ERROR, logger="automation.diagnostics"):
@@ -246,6 +262,19 @@ class TestCaptureAnomalyContext:
         page = _crashed_page()
         result = await capture_anomaly_context(page, "weird")
         assert result["screenshot_ok"] is False
+
+    @pytest.mark.asyncio
+    async def test_noop_captures_do_not_consume_budget(self):
+        # A string of no-op attempts on a crashed page writes nothing and must
+        # not exhaust the per-run budget — a later capture on a live page still
+        # gets through.
+        crashed = _crashed_page()
+        for _ in range(_MAX_ANOMALY_CAPTURES * 2):
+            await capture_anomaly_context(crashed, "dead")
+        # Budget intact: a real capture on a live page still lands evidence.
+        result = await capture_anomaly_context(_good_page(), "alive")
+        assert result is not None
+        assert result["dom_ok"] is True
 
 
 # ---------------------------------------------------------------------------
