@@ -83,7 +83,8 @@ The LinkedIn automation requires careful handling:
 **Fingerprint coherence.** `start_browser` sets `locale` and `timezone_id` on
 every context (persistent and transient) from `get_browser_settings`, with
 host-derived defaults (`locale` → `en-US`; `timezone_id` → the host's IANA zone
-read from `/etc/localtime`/`TZ`, falling back to `UTC`). Override with
+detected from `TZ`/`/etc/localtime`/`/etc/timezone`, left unset — so the browser
+uses its own host default — when no valid zone can be resolved). Override with
 `BROWSER_LOCALE` / `BROWSER_TIMEZONE`. The **user-agent is intentionally left to
 real Chrome** — its own UA already matches its platform and version, so no UA is
 hardcoded (a hardcoded Windows UA on a Linux host would *create* the very
