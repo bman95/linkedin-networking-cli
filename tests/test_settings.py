@@ -8,6 +8,7 @@ import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import available_timezones
 
 from config.settings import AppSettings
 
@@ -236,6 +237,212 @@ class TestBrowserSettings:
 
         assert "browser_data" in user_data_dir
         assert isinstance(user_data_dir, str)
+
+
+# ============================================================================
+# Fingerprint Settings Tests (locale / timezone / user-agent)
+# ============================================================================
+
+@pytest.mark.unit
+class TestFingerprintSettings:
+    """Locale, timezone and user-agent stay coherent and configurable."""
+
+    def _clear_env(self, monkeypatch):
+        for var in ("BROWSER_LOCALE", "BROWSER_TIMEZONE", "BROWSER_USER_AGENT"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_browser_settings_expose_fingerprint_keys(self, monkeypatch):
+        """locale, timezone_id and user_agent are always present."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        browser_settings = settings.get_browser_settings()
+
+        assert "locale" in browser_settings
+        assert "timezone_id" in browser_settings
+        assert "user_agent" in browser_settings
+
+    def test_locale_default(self, monkeypatch):
+        """Locale defaults to en-US when unset."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "en-US"
+
+    def test_locale_override(self, monkeypatch):
+        """BROWSER_LOCALE overrides the default locale (and is trimmed)."""
+        monkeypatch.setenv("BROWSER_LOCALE", "  es-ES  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "es-ES"
+
+    def test_locale_empty_falls_back_to_default(self, monkeypatch):
+        """An empty BROWSER_LOCALE falls back to the default, never ''."""
+        monkeypatch.setenv("BROWSER_LOCALE", "   ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["locale"] == "en-US"
+
+    def test_user_agent_default_unset(self, monkeypatch):
+        """User-agent defaults to None so real Chrome's UA is used."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] is None
+
+    def test_user_agent_override(self, monkeypatch):
+        """BROWSER_USER_AGENT sets an explicit override (trimmed)."""
+        monkeypatch.setenv("BROWSER_USER_AGENT", "  CustomUA/1.0  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] == "CustomUA/1.0"
+
+    def test_user_agent_empty_is_none(self, monkeypatch):
+        """A blank BROWSER_USER_AGENT yields None, not an empty string."""
+        monkeypatch.setenv("BROWSER_USER_AGENT", "   ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["user_agent"] is None
+
+    def test_timezone_override(self, monkeypatch):
+        """BROWSER_TIMEZONE overrides host detection (trimmed)."""
+        monkeypatch.setenv("BROWSER_TIMEZONE", "  America/New_York  ")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] == "America/New_York"
+
+    def test_timezone_is_iana_or_none(self, monkeypatch):
+        """The resolved timezone is either a valid IANA id (never an
+        abbreviation like 'CEST' that Playwright rejects) or None when the host
+        zone cannot be determined."""
+        self._clear_env(monkeypatch)
+        settings = AppSettings()
+        tz = settings.get_browser_settings()["timezone_id"]
+
+        assert tz is None or tz in available_timezones()
+
+    def test_timezone_from_tz_env(self, monkeypatch):
+        """A TZ env var holding an IANA name is honoured by detection."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("TZ", "Asia/Tokyo")
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] == "Asia/Tokyo"
+
+    def test_invalid_timezone_override_falls_back(self, monkeypatch):
+        """An invalid BROWSER_TIMEZONE (typo/abbreviation) is rejected and the
+        host default is used instead, never a value Playwright would reject."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "CEST")  # abbreviation, not IANA
+        settings = AppSettings()
+        tz = settings.get_browser_settings()["timezone_id"]
+        assert tz != "CEST"
+        assert tz in available_timezones()
+
+    def test_timezone_none_when_undetectable(self, monkeypatch):
+        """With no override and no detectable host zone, timezone_id is None so
+        the browser keeps its own host timezone rather than being forced to
+        UTC."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setattr(
+            AppSettings, "_detect_host_timezone", classmethod(lambda cls: None)
+        )
+        settings = AppSettings()
+        assert settings.get_browser_settings()["timezone_id"] is None
+
+
+@pytest.mark.unit
+class TestTimezoneDetection:
+    """The host-timezone helper returns a valid IANA id or None — never an
+    abbreviation or other value Playwright would reject."""
+
+    def test_returns_valid_iana_or_none(self):
+        """Whatever the host looks like, the result is a real IANA zone or
+        None (never an invalid id)."""
+        tz = AppSettings._detect_host_timezone()
+        assert tz is None or tz in available_timezones()
+
+    def test_tz_env_with_iana_name(self, monkeypatch):
+        monkeypatch.setenv("TZ", "America/Sao_Paulo")
+        assert AppSettings._detect_host_timezone() == "America/Sao_Paulo"
+
+    def test_tz_env_invalid_is_skipped(self, monkeypatch):
+        """A TZ value that is not a valid IANA id (e.g. the glibc ':/path'
+        form) is ignored rather than returned and later crashing Playwright."""
+        monkeypatch.setenv("TZ", ":/etc/localtime")
+        # Falls through to other detection sources; result must still be valid.
+        assert AppSettings._detect_host_timezone() in available_timezones()
+
+    def test_symlink_branch_parses_zoneinfo_target(self, monkeypatch):
+        """A normal /etc/localtime -> .../zoneinfo/Area/Loc symlink resolves."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: True)
+        monkeypatch.setattr(
+            os, "readlink", lambda p: "/usr/share/zoneinfo/Europe/Berlin"
+        )
+        assert AppSettings._detect_host_timezone() == "Europe/Berlin"
+
+    def test_symlink_posix_prefix_is_stripped(self, monkeypatch):
+        """Leap-second 'posix/' and 'right/' zoneinfo subtrees still resolve to
+        the valid inner IANA id rather than a Playwright-rejected value."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: True)
+        monkeypatch.setattr(
+            os, "readlink", lambda p: "/usr/share/zoneinfo/posix/Europe/Madrid"
+        )
+        assert AppSettings._detect_host_timezone() == "Europe/Madrid"
+
+    def test_etc_timezone_fallback(self, monkeypatch, tmp_path):
+        """When there is no usable TZ/symlink, /etc/timezone contents are used."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+
+        real_read_text = Path.read_text
+
+        def fake_read_text(self, *args, **kwargs):
+            if str(self) == "/etc/timezone":
+                return "Asia/Kolkata\n"
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", fake_read_text)
+        monkeypatch.setattr(
+            Path, "exists", lambda self: str(self) == "/etc/timezone"
+        )
+        assert AppSettings._detect_host_timezone() == "Asia/Kolkata"
+
+    def test_copied_localtime_matched_by_bytes(self, monkeypatch):
+        """A copied (non-symlink) /etc/localtime with no /etc/timezone — the
+        common container layout — is resolved by byte-matching the zoneinfo DB
+        rather than silently flattening a non-UTC host to UTC."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+
+        from zoneinfo import TZPATH
+
+        target_zone = "America/New_York"
+        zone_path = next(
+            (Path(base) / target_zone for base in TZPATH
+             if (Path(base) / target_zone).is_file()),
+            None,
+        )
+        if zone_path is None:
+            pytest.skip("zoneinfo database not available on disk")
+        target_bytes = zone_path.read_bytes()
+
+        real_read_bytes = Path.read_bytes
+
+        def fake_read_bytes(self):
+            if str(self) == "/etc/localtime":
+                return target_bytes
+            return real_read_bytes(self)
+
+        monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        assert AppSettings._detect_host_timezone() == target_zone
+
+    def test_no_sources_returns_none(self, monkeypatch):
+        """Host with no TZ, no symlink, no /etc/timezone and an unreadable
+        /etc/localtime (e.g. native Windows) -> None, so the caller leaves the
+        timezone to the browser's host default instead of forcing UTC."""
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(Path, "is_symlink", lambda self: False)
+        monkeypatch.setattr(Path, "exists", lambda self: False)
+        monkeypatch.setattr(
+            Path, "read_bytes",
+            lambda self: (_ for _ in ()).throw(OSError("no localtime")),
+        )
+        assert AppSettings._detect_host_timezone() is None
 
 
 # ============================================================================

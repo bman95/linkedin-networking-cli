@@ -161,6 +161,23 @@ class LinkedInAutomation:
         browser_channel = browser_settings.get("channel")
         user_data_dir = browser_settings.get("user_data_dir")
 
+        # Context options shared by every launch path (persistent and
+        # transient) so the resulting page exposes one coherent fingerprint:
+        # viewport, locale and timezone always agree, regardless of which path
+        # wins. timezone_id is included only when the host zone could be
+        # resolved — otherwise it is left to the browser's own host default
+        # rather than forcing an incoherent UTC. user_agent is likewise included
+        # only when explicitly overridden; the default leaves real Chrome's own
+        # (already-consistent) UA untouched.
+        context_options: Dict[str, Any] = {
+            "viewport": browser_settings["viewport"],
+            "locale": browser_settings["locale"],
+        }
+        if browser_settings.get("timezone_id"):
+            context_options["timezone_id"] = browser_settings["timezone_id"]
+        if browser_settings.get("user_agent"):
+            context_options["user_agent"] = browser_settings["user_agent"]
+
         if user_data_dir:
             user_data_path = Path(user_data_dir)
             user_data_path.mkdir(parents=True, exist_ok=True)
@@ -188,7 +205,7 @@ class LinkedInAutomation:
 
         if use_persistent and user_data_dir:
             persistent_kwargs = launch_kwargs.copy()
-            persistent_kwargs["viewport"] = browser_settings["viewport"]
+            persistent_kwargs.update(context_options)
             logger.info("Using persistent context with user data dir %s", user_data_dir)
             try:
                 logger.info("Launching persistent Chrome…")
@@ -259,19 +276,15 @@ class LinkedInAutomation:
                 try:
                     self.context = await self.browser.new_context(
                         storage_state=str(session_path),
-                        viewport=browser_settings["viewport"],
+                        **context_options,
                     )
                     logger.info("Loaded existing LinkedIn session")
                 except Exception as session_error:
                     logger.warning("Failed to load session state: %s", session_error)
-                    self.context = await self.browser.new_context(
-                        viewport=browser_settings["viewport"]
-                    )
+                    self.context = await self.browser.new_context(**context_options)
                     logger.info("Starting fresh LinkedIn session")
             else:
-                self.context = await self.browser.new_context(
-                    viewport=browser_settings["viewport"]
-                )
+                self.context = await self.browser.new_context(**context_options)
                 logger.info("Starting fresh LinkedIn session")
 
             # Mask navigator.webdriver before the page is created, so it runs

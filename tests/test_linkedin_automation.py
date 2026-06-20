@@ -535,6 +535,158 @@ class TestBrowserHardening:
 
 
 # ============================================================================
+# Fingerprint Consistency Tests (locale / timezone / user-agent on context)
+# ============================================================================
+
+@pytest.mark.unit
+class TestFingerprintConsistency:
+    """locale and timezone are applied coherently on every launch path; the
+    user-agent is left to real Chrome unless explicitly overridden."""
+
+    _patched_playwright = staticmethod(TestBrowserHardening._patched_playwright)
+
+    @pytest.mark.asyncio
+    async def test_transient_context_receives_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The transient new_context call carries locale + timezone_id and, by
+        default, no user_agent override."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_LOCALE", "en-US")
+        monkeypatch.setenv("BROWSER_TIMEZONE", "America/New_York")
+        monkeypatch.delenv("BROWSER_USER_AGENT", raising=False)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["locale"] == "en-US"
+        assert kwargs["timezone_id"] == "America/New_York"
+        # No override -> real Chrome's UA is left untouched.
+        assert "user_agent" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_persistent_context_receives_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """The persistent-context launch carries locale + timezone_id too, so
+        both launch paths produce one coherent fingerprint."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+        monkeypatch.setenv("BROWSER_LOCALE", "es-ES")
+        monkeypatch.setenv("BROWSER_TIMEZONE", "Europe/Madrid")
+        monkeypatch.delenv("BROWSER_USER_AGENT", raising=False)
+
+        playwright, browser, context = self._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = playwright.chromium.launch_persistent_context.call_args.kwargs
+        assert kwargs["locale"] == "es-ES"
+        assert kwargs["timezone_id"] == "Europe/Madrid"
+        assert "user_agent" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_user_agent_override_applied_when_set(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When BROWSER_USER_AGENT is set it is passed through to the context."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64) Custom")
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["user_agent"] == "Mozilla/5.0 (X11; Linux x86_64) Custom"
+
+    @pytest.mark.asyncio
+    async def test_timezone_omitted_when_host_zone_undetectable(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """When the host timezone cannot be resolved, timezone_id is left out of
+        the context options so the browser keeps its own host zone (not UTC)."""
+        from config.settings import AppSettings
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.delenv("BROWSER_TIMEZONE", raising=False)
+        monkeypatch.setattr(
+            AppSettings, "_detect_host_timezone", classmethod(lambda cls: None)
+        )
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert "timezone_id" not in kwargs
+        assert "locale" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_storage_state_path_carries_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch, tmp_path
+    ):
+        """When a saved session.json exists, the storage_state context still
+        receives locale + timezone_id alongside storage_state."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "America/New_York")
+
+        session_file = tmp_path / "session.json"
+        session_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(app_settings, "session_path", session_file)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        kwargs = browser.new_context.call_args.kwargs
+        assert kwargs["storage_state"] == str(session_file)
+        assert kwargs["timezone_id"] == "America/New_York"
+        assert "locale" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_session_load_failure_fallback_carries_locale_and_timezone(
+        self, db_manager, app_settings, monkeypatch, tmp_path
+    ):
+        """If loading session.json fails, the fresh fallback context still
+        carries locale + timezone_id (the coherent fingerprint is not lost)."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "none")
+        monkeypatch.delenv("PLAYWRIGHT_BROWSER_EXECUTABLE", raising=False)
+        monkeypatch.setenv("BROWSER_TIMEZONE", "Europe/Madrid")
+
+        session_file = tmp_path / "session.json"
+        session_file.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(app_settings, "session_path", session_file)
+
+        playwright, browser, context = self._patched_playwright(monkeypatch)
+        # First new_context (storage_state load) fails; second (fallback) wins.
+        fallback_context = context
+        bad_load = Exception("corrupt session")
+        browser.new_context = AsyncMock(side_effect=[bad_load, fallback_context])
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        await automation.start_browser()
+
+        # The fallback call (second) carries locale/timezone and no storage_state.
+        fallback_kwargs = browser.new_context.call_args_list[-1].kwargs
+        assert "storage_state" not in fallback_kwargs
+        assert fallback_kwargs["timezone_id"] == "Europe/Madrid"
+        assert "locale" in fallback_kwargs
+
+
+# ============================================================================
 # LinkedInProfile Dataclass Tests
 # ============================================================================
 

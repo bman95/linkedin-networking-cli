@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, Optional
+from zoneinfo import available_timezones, TZPATH
 import os
 import sys
 
@@ -44,6 +45,100 @@ class AppSettings:
             logger.warning("LINKEDIN_PASSWORD environment variable not set")
         return password
 
+    @staticmethod
+    def _normalize_timezone(candidate: Optional[str]) -> Optional[str]:
+        """Return ``candidate`` only if it is a valid IANA timezone id.
+
+        Playwright's ``timezone_id`` must be an IANA name (e.g.
+        ``Europe/Madrid``); abbreviations like ``CEST``, leap-second variants
+        like ``posix/Europe/Madrid``, glibc forms like ``:/etc/localtime`` and
+        plain typos all make ``new_context``/``launch_persistent_context`` raise
+        and would crash ``start_browser``. Anything not recognised by the stdlib
+        zoneinfo database returns ``None`` so callers can fall back safely.
+        """
+        if not candidate:
+            return None
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        # Tolerate the leap-second/posix zoneinfo subtrees by stripping the
+        # leading prefix, since the inner path is a valid IANA id.
+        for prefix in ("posix/", "right/"):
+            if candidate.startswith(prefix):
+                candidate = candidate[len(prefix):]
+        return candidate if candidate in available_timezones() else None
+
+    @staticmethod
+    def _match_localtime_by_bytes() -> Optional[str]:
+        """Identify the host zone by matching ``/etc/localtime``'s bytes.
+
+        Containers (and some distros) ship ``/etc/localtime`` as a *copy* of a
+        zoneinfo file rather than a symlink, and often without ``/etc/timezone``.
+        The symlink/text branches miss that layout, so as a last resort we read
+        the file and compare it byte-for-byte against the zoneinfo database,
+        returning the matching IANA id. Returns ``None`` on any read error or no
+        match so the caller can fall back to ``UTC``.
+        """
+        try:
+            localtime_bytes = Path("/etc/localtime").read_bytes()
+        except OSError:
+            return None
+
+        for name in available_timezones():
+            for base in TZPATH:
+                candidate = Path(base) / name
+                try:
+                    if candidate.is_file() and candidate.read_bytes() == localtime_bytes:
+                        return name
+                except OSError:
+                    continue
+        return None
+
+    @classmethod
+    def _detect_host_timezone(cls) -> Optional[str]:
+        """Best-effort *valid* IANA timezone name for the host, or ``None``.
+
+        Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``,
+        then a byte-match of ``/etc/localtime`` against the zoneinfo database)
+        rather than hardcoding a zone, so ``timezone_id`` stays coherent with the
+        OS the browser actually runs on. Every candidate is validated. Returns
+        ``None`` when nothing reliable is found (e.g. a Windows host with no
+        Linux timezone files) so the caller can leave the context's timezone to
+        the browser's own host default rather than forcing an incoherent ``UTC``.
+        """
+        normalized = cls._normalize_timezone(os.getenv("TZ"))
+        if normalized:
+            return normalized
+
+        localtime = Path("/etc/localtime")
+        try:
+            if localtime.is_symlink():
+                target = os.readlink(localtime)
+                marker = "zoneinfo/"
+                idx = target.find(marker)
+                if idx != -1:
+                    normalized = cls._normalize_timezone(target[idx + len(marker):])
+                    if normalized:
+                        return normalized
+        except OSError:
+            pass
+
+        etc_tz = Path("/etc/timezone")
+        try:
+            if etc_tz.exists():
+                normalized = cls._normalize_timezone(
+                    etc_tz.read_text(encoding="utf-8").strip()
+                )
+                if normalized:
+                    return normalized
+        except OSError:
+            pass
+
+        # Copied (non-symlink) /etc/localtime without /etc/timezone — common in
+        # containers. Match the file's bytes against the zoneinfo database so a
+        # non-UTC host is not silently flattened.
+        return cls._match_localtime_by_bytes()
+
     def get_browser_settings(self) -> Dict[str, Any]:
         """Get browser settings"""
         channel_env = os.getenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
@@ -65,15 +160,43 @@ class AppSettings:
         else:
             headless = headless_env.strip().lower() in {"1", "true", "yes", "on"}
 
+        # Locale and timezone are set on the browser context so they stay
+        # coherent with the host (and each other). Defaults derive from the
+        # host; both are overridable for users on a differently-configured box.
+        locale = os.getenv("BROWSER_LOCALE", "en-US").strip() or "en-US"
+
+        # A user-supplied BROWSER_TIMEZONE is validated like the host-detected
+        # one: an invalid id (typo, abbreviation) would crash the browser launch,
+        # so fall back to host detection rather than trusting it blindly.
+        timezone_id = self._normalize_timezone(os.getenv("BROWSER_TIMEZONE"))
+        if not timezone_id:
+            timezone_id = self._detect_host_timezone()
+
+        # User-agent is intentionally left to real Chrome by default: Chrome's
+        # own UA already matches its platform and version, so forcing one risks
+        # introducing the very inconsistency this whole config exists to avoid.
+        # The override is opt-in and the user owns keeping it coherent.
+        user_agent_env = os.getenv("BROWSER_USER_AGENT")
+        user_agent = user_agent_env.strip() if user_agent_env else None
+        user_agent = user_agent or None
+
         settings = {
             "headless": headless,
             "user_data_dir": str(self.app_dir / "browser_data"),
             "viewport": {"width": 1920, "height": 1080},
             "channel": channel,
-            "executable_path": executable
+            "executable_path": executable,
+            "locale": locale,
+            "timezone_id": timezone_id,
+            "user_agent": user_agent,
         }
 
-        logger.debug(f"Browser settings: headless={headless}, channel={channel}, executable={executable is not None}")
+        logger.debug(
+            f"Browser settings: headless={headless}, channel={channel}, "
+            f"executable={executable is not None}, locale={locale}, "
+            f"timezone_id={timezone_id or 'host-default'}, "
+            f"user_agent={'custom' if user_agent else 'default'}"
+        )
         return settings
 
     def get_automation_settings(self) -> Dict[str, Any]:
