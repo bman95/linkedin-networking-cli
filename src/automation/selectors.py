@@ -42,13 +42,27 @@ class Selector:
     ``componentkey`` attribute) so it survives LinkedIn's SDUI class-name churn;
     later candidates are ES/EN text or legacy-class fallbacks.
 
+    Candidates may use Playwright's selector syntax (``:has-text(...)``,
+    ``:text-is(...)``) in addition to plain CSS, so they must only be consumed
+    by Playwright APIs (``query_selector`` / ``locator`` / ``wait_for_selector``)
+    — never handed to a non-Playwright CSS engine.
+
+    **Primary peers vs. drift fallbacks.** Not every later candidate signals DOM
+    drift. Locale variants ("Next" / "Siguiente") and equally-stable anchors are
+    *co-equal primaries*: matching any of them is the normal happy path, not a
+    "go update the selector" event. ``primary_count`` marks how many leading
+    candidates are such peers; :meth:`locate` only warns when it has to reach
+    *past* that primary group into a true fallback.
+
     The class never *waits*: ``.locate`` and ``.count`` reflect the page's
     current state. Callers that need to wait for an element to appear pass
     :attr:`css` to Playwright's ``wait_for_selector`` (a presence-only race
     across all candidates at once).
     """
 
-    def __init__(self, name: str, candidates: Sequence[str]):
+    def __init__(
+        self, name: str, candidates: Sequence[str], *, primary_count: int = 1
+    ):
         """Build a selector.
 
         Args:
@@ -56,12 +70,34 @@ class Selector:
             candidates: Ordered CSS candidates, most-stable first. Must be
                 non-empty; each entry must be a single (non-comma) CSS selector
                 so a fallback to candidate #N can be detected per-candidate.
+            primary_count: How many leading candidates are co-equal primaries
+                (e.g. EN/ES locale variants). Matching any of these is the
+                happy path; :meth:`locate` only warns when it falls back *past*
+                them. Defaults to 1 (only candidate #0 is primary).
         """
         cleaned = [c.strip() for c in candidates if c and c.strip()]
         if not cleaned:
             raise ValueError(f"Selector {name!r} needs at least one candidate")
+        if primary_count < 1:
+            raise ValueError(
+                f"Selector {name!r}: primary_count must be >= 1, got {primary_count}"
+            )
         self.name = name
         self.candidates: List[str] = cleaned
+        # Cap at the candidate count so an over-specified primary_count cannot
+        # silence a genuine fallback that simply doesn't exist yet.
+        self.primary_count = min(primary_count, len(cleaned))
+
+    @property
+    def anchor(self) -> str:
+        """The most-stable candidate (#0).
+
+        Callers that need the bare anchor for a presence-only enumeration (e.g.
+        ``query_selector_all`` over the legacy structured cards) use this so the
+        "stable anchor" stays a named concept rather than a positional index
+        reached for at the call site.
+        """
+        return self.candidates[0]
 
     @property
     def css(self) -> str:
@@ -85,8 +121,10 @@ class Selector:
         """Return the first matching element handle, trying candidates in order.
 
         Walks the candidates most-stable-first and returns the first
-        ``query_selector`` hit. Falling back to candidate #N (N > 0) logs a
-        WARNING so DOM drift is visible while the run continues.
+        ``query_selector`` hit. Falling back *past the primary group* (to a
+        candidate at or beyond ``primary_count``) logs a WARNING so DOM drift is
+        visible while the run continues; matching a co-equal primary (e.g. the
+        ES locale variant of an EN/ES pair) is the happy path and stays quiet.
 
         Args:
             page: An async Playwright ``Page``.
@@ -108,14 +146,15 @@ class Selector:
         for index, candidate in enumerate(self.candidates):
             handle = await page.query_selector(candidate)
             if handle is not None:
-                if index > 0:
+                if index >= self.primary_count:
+                    primaries = ", ".join(self.candidates[: self.primary_count])
                     logger.warning(
-                        "Selector %r matched fallback candidate #%d (%s); primary "
-                        "%r no longer matches — update the primary.",
+                        "Selector %r matched fallback candidate #%d (%s); no "
+                        "primary candidate (%s) matched — update the primary.",
                         self.name,
                         index,
                         candidate,
-                        self.candidates[0],
+                        primaries,
                     )
                 return handle
 
@@ -188,7 +227,9 @@ SEARCH_RESULT_CARDS = Selector(
 )
 
 # --- Pagination ---
-# EN/ES aria-labels first (stable role attribute), then the SDUI text fallback.
+# The EN/ES aria-labels are co-equal primaries (same stable role attribute, just
+# a locale difference), so matching either is the happy path — only falling
+# through to the SDUI text candidates signals real drift. Hence primary_count=2.
 PAGINATION_NEXT = Selector(
     "pagination_next",
     [
@@ -197,6 +238,7 @@ PAGINATION_NEXT = Selector(
         "main button:has-text('Siguiente')",
         "main button:has-text('Next')",
     ],
+    primary_count=2,
 )
 
 # --- Connect control ---
@@ -232,9 +274,12 @@ INVITE_SEND = Selector(
 )
 
 # --- Limit modal ---
-# The weekly-invitation-limit modal. ``ip-fuse-limit-alert`` is the stable
-# component id; ``data-test-modal-id`` is the test anchor; ES/EN dialog-text
-# variants are the last resort.
+# The weekly-invitation-limit modal. The ``data-test-modal-id`` test anchor and
+# the ``ip-fuse-limit-alert`` component-class selector are co-equal primaries
+# (LinkedIn ships the component id consistently but the test anchor is not
+# guaranteed present on every SDUI variant, so neither alone is "the" primary);
+# only the ES/EN dialog-text last-resort candidates signal real drift. Hence
+# primary_count=2.
 LIMIT_MODAL = Selector(
     "limit_modal",
     [
@@ -243,6 +288,7 @@ LIMIT_MODAL = Selector(
         "dialog:has-text('límite semanal')",
         "dialog:has-text('weekly invitation limit')",
     ],
+    primary_count=2,
 )
 # The locked-padlock icon inside the limit modal marks a *true* weekly limit
 # (vs. a dismissable "near limit" warning). The header-text variants are the

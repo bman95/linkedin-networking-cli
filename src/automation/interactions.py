@@ -73,17 +73,21 @@ async def _is_true_limit(modal) -> bool:
     """Check if the modal indicates a true invitation limit.
 
     The icon and header candidates come from the central
-    ``LIMIT_TRUE_MARKER`` selector (candidate #0 is the locked-padlock icon
-    that marks a true weekly limit; the rest are the header-text fallback).
+    ``LIMIT_TRUE_MARKER`` selector: its stable anchor is the locked-padlock icon
+    that marks a true weekly limit; the remaining candidates are the header-text
+    fallback (used when LinkedIn swaps the icon).
     """
-    icon_css, *header_css = sel.LIMIT_TRUE_MARKER.candidates
+    icon_css = sel.LIMIT_TRUE_MARKER.anchor
+    header_css = sel.LIMIT_TRUE_MARKER.candidates[1:]
 
     # Check for LinkedIn invitation limit icon
     if await modal.query_selector(icon_css):
         return True
 
     # Fallback by heading text (in case they change the icon)
-    header_el = await modal.query_selector(", ".join(header_css))
+    header_el = (
+        await modal.query_selector(", ".join(header_css)) if header_css else None
+    )
     header = (await header_el.inner_text()).strip().lower() if header_el else ""
 
     true_texts = {

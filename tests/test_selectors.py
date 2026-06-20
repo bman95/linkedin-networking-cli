@@ -61,6 +61,22 @@ class TestSelectorConstruction:
         s = Selector("x", ["a", "b", "c"])
         assert s.css == "a, b, c"
 
+    def test_anchor_is_first_candidate(self):
+        s = Selector("x", ["anchor", "b", "c"])
+        assert s.anchor == "anchor"
+
+    def test_primary_count_defaults_to_one(self):
+        assert Selector("x", ["a", "b"]).primary_count == 1
+
+    def test_primary_count_capped_at_candidate_count(self):
+        # An over-specified primary_count cannot silence a fallback that exists.
+        s = Selector("x", ["a", "b"], primary_count=5)
+        assert s.primary_count == 2
+
+    def test_rejects_zero_primary_count(self):
+        with pytest.raises(ValueError):
+            Selector("x", ["a", "b"], primary_count=0)
+
 
 @pytest.mark.unit
 class TestCount:
@@ -112,6 +128,38 @@ class TestLocateOrdering:
         assert result is None
         # No match at all is not a fallback, so no drift warning is emitted.
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_co_equal_primary_match_is_quiet(self, caplog):
+        # The second of two co-equal primaries (e.g. the ES locale variant)
+        # matching is the happy path — it must NOT emit a drift warning.
+        handle = object()
+        s = Selector(
+            "pagination_next",
+            ["button[aria-label='Next']", "button[aria-label='Siguiente']", "text"],
+            primary_count=2,
+        )
+        page = _page({"button[aria-label='Siguiente']": handle})
+        with caplog.at_level(logging.WARNING):
+            result = await s.locate(page)
+        assert result is handle
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    @pytest.mark.asyncio
+    async def test_warns_only_when_falling_past_primary_group(self, caplog):
+        # Falling through BOTH primaries to the text fallback IS drift.
+        handle = object()
+        s = Selector("pagination_next", ["aria-next", "aria-sig", "text"], primary_count=2)
+        page = _page({"text": handle})
+        with caplog.at_level(logging.WARNING):
+            result = await s.locate(page)
+        assert result is handle
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        msg = warnings[0].getMessage()
+        assert "fallback candidate #2" in msg
+        # The message names the primary group that failed to match.
+        assert "aria-next" in msg and "aria-sig" in msg
 
 
 @pytest.mark.unit
@@ -196,6 +244,9 @@ class TestRegistryShape:
         assert "button[aria-label='Siguiente']" in cands
         # Text fallback for the SDUI layout.
         assert any("has-text('Next')" in c for c in cands)
+        # EN/ES aria-labels are co-equal primaries so a Spanish-locale run
+        # (Siguiente) does not spuriously log a drift warning every page.
+        assert selectors.PAGINATION_NEXT.primary_count == 2
 
     def test_invitation_modal_buttons_es_en(self):
         assert selectors.INVITE_SEND_NO_NOTE.candidates == [
@@ -212,8 +263,13 @@ class TestRegistryShape:
         assert selectors.LIMIT_MODAL.candidates[0] == (
             "[data-test-modal-id='ip-fuse-limit-alert']"
         )
+        # The data-test anchor and the component-class are co-equal primaries
+        # (the test anchor is not guaranteed on every SDUI variant), so a normal
+        # limit hit matched by the class does not log a spurious drift warning.
+        assert selectors.LIMIT_MODAL.primary_count == 2
 
     def test_limit_true_marker_locked_icon_first(self):
-        assert selectors.LIMIT_TRUE_MARKER.candidates[0] == (
-            "svg[data-test-icon='locked']"
-        )
+        assert selectors.LIMIT_TRUE_MARKER.anchor == "svg[data-test-icon='locked']"
+        # _is_true_limit depends on the icon being the anchor and on at least
+        # one header candidate following it.
+        assert len(selectors.LIMIT_TRUE_MARKER.candidates) >= 2

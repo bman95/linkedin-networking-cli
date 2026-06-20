@@ -500,9 +500,9 @@ class LinkedInAutomation:
                 profiles_before_page = len(profiles)
 
                 # Legacy UI: structured result elements with a stable attribute
-                # (candidate #0 of the result-cards selector is that anchor).
+                # (the result-cards selector's stable anchor).
                 profile_elements = await self.page.query_selector_all(
-                    sel.SEARCH_RESULT_CARDS.candidates[0]
+                    sel.SEARCH_RESULT_CARDS.anchor
                 )
 
                 if profile_elements:
