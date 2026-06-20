@@ -168,10 +168,11 @@ class Selector:
         Callers that detect a missing element on a path other than
         :meth:`locate` (e.g. a ``wait_for_selector`` timeout) call this to get
         the same fail-loud behavior: a best-effort evidence bundle followed by a
-        ``SelectorNotFoundException``. The capture cannot raise and never masks
-        the exception, so a layout change always leaves a screenshot + DOM
-        snapshot plus a structured log line naming the selector, the full
-        candidate list, and the URL.
+        ``SelectorNotFoundException``. The capture never masks the
+        ``SelectorNotFoundException``, so a layout change always surfaces as a
+        selector-missing failure (and, when capture succeeds, also leaves a
+        screenshot + DOM snapshot plus a structured log line naming the
+        selector, the full candidate list, and the URL).
 
         Args:
             page: An async Playwright ``Page``.
@@ -188,12 +189,23 @@ class Selector:
         bundle_context = {"selector": self.name, "candidates": self.candidates}
         if context:
             bundle_context.update(context)
-        await capture_error_context(
-            page,
-            f"selector_not_found_{self.name}",
-            exc=not_found,
-            context=bundle_context,
-        )
+        # The diagnostics module is best-effort and is documented never to
+        # raise, but guard the call here so the fail-loud contract is
+        # self-enforcing: a regression inside diagnostics must never replace the
+        # selector-missing failure with an unrelated error.
+        try:
+            await capture_error_context(
+                page,
+                f"selector_not_found_{self.name}",
+                exc=not_found,
+                context=bundle_context,
+            )
+        except Exception as capture_exc:  # pragma: no cover - defensive backstop
+            logger.error(
+                "Evidence capture failed for selector %r: %s",
+                self.name,
+                capture_exc,
+            )
         raise not_found
 
 

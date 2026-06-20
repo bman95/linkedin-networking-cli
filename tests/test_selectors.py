@@ -204,15 +204,16 @@ class TestFailLoud:
 
     @pytest.mark.asyncio
     async def test_capture_failure_does_not_mask_selector_exception(self):
-        # capture_error_context is best-effort and itself never raises, but even
-        # if it somehow did, fail-loud must still surface the real failure.
+        # The fail-loud contract is self-enforcing: even if the (best-effort)
+        # diagnostics capture regresses and raises, fail-loud must still surface
+        # the real SelectorNotFoundException, not the capture's error.
         s = Selector("x", ["a"])
         page = _page({})
         with patch(
             "automation.selectors.capture_error_context",
             new=AsyncMock(side_effect=RuntimeError("capture exploded")),
         ):
-            with pytest.raises(RuntimeError):
+            with pytest.raises(SelectorNotFoundException):
                 await s.locate(page, required=True)
 
 
