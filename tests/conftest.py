@@ -186,7 +186,7 @@ def mock_page():
     def _make_locator(*_args, **_kwargs):
         locator = AsyncMock()
         locator.click = AsyncMock()
-        locator.type = AsyncMock()
+        locator.press_sequentially = AsyncMock()
         locator.bounding_box = AsyncMock(return_value=None)
         locator.count = AsyncMock(return_value=1)
         locator.first = locator

@@ -31,13 +31,25 @@ async def random_wait(
 
 
 async def scroll_down(page) -> None:
-    """Smooth scrolling down to the end of the page with natural behavior."""
+    """Smooth scrolling down to the end of the page with natural behavior.
+
+    Bounded by two guards so it terminates on LinkedIn's infinite/lazy-loading
+    lists (where ``document.body.scrollHeight`` grows as you approach the
+    bottom and a naive "scroll to the end" loop would never finish):
+
+    - ``MAX_STEPS``: a hard cap on iterations (a human skims, they don't scroll
+      an endless feed to its true end).
+    - ``MAX_STALLED_STEPS``: stop early once the real scroll position stops
+      advancing (already at the bottom, or the page clamped the scroll).
+    """
     MEAN_STEP = 120
     STEP_JITTER = 40
     MIN_PAUSE = 200
     MAX_PAUSE = 900
     LONG_PAUSE_CHANCE = 0.10
     LONG_PAUSE_MS = (1_500, 3_000)
+    MAX_STEPS = 40
+    MAX_STALLED_STEPS = 3
 
     logger.info("Scrolling down")
 
@@ -45,9 +57,13 @@ async def scroll_down(page) -> None:
     viewport = await page.evaluate("window.innerHeight")
     total = await page.evaluate("document.body.scrollHeight")
 
-    while current + viewport < total:
+    stalled = 0
+    for _ in range(MAX_STEPS):
+        if current + viewport >= total:
+            break
+
         # Calculate easing progress
-        progress = current / total
+        progress = current / total if total else 0
         easing = 0.5 * (1 - math.cos(math.pi * progress))
         base = MEAN_STEP * (1.5 - easing)
 
@@ -57,7 +73,6 @@ async def scroll_down(page) -> None:
 
         # Scroll with mouse wheel
         await page.mouse.wheel(0, delta + random.randint(-10, 10))
-        current += delta
 
         # Random pause between scrolls
         pause = random.randint(MIN_PAUSE, MAX_PAUSE)
@@ -66,10 +81,21 @@ async def scroll_down(page) -> None:
 
         await page.wait_for_timeout(pause)
 
-        # Update values
+        # Update values from the page (not the intended delta): the browser
+        # clamps scrollY at the bottom, which is how we detect a stall.
+        previous = current
         viewport = await page.evaluate("window.innerHeight")
         total = await page.evaluate("document.body.scrollHeight")
         current = await page.evaluate("window.scrollY")
+
+        # If the real position didn't advance, the page won't scroll further
+        # (or is clamped); bail after a few stalled iterations.
+        if current <= previous:
+            stalled += 1
+            if stalled >= MAX_STALLED_STEPS:
+                break
+        else:
+            stalled = 0
 
 
 async def human_type(
@@ -78,15 +104,17 @@ async def human_type(
     """Type ``text`` into ``box`` character-by-character like a human.
 
     Focuses the field with a short pause first, then types each key with a
-    randomized per-key delay (in ms). ``box`` is a Playwright Locator; the
-    underlying ``type`` call drives one keystroke at a time, unlike ``fill``
+    randomized per-key delay (in ms). ``box`` is a Playwright Locator;
+    ``press_sequentially`` drives one keystroke at a time, unlike ``fill``
     which sets the value instantly and reads as scripted.
     """
     await box.click()
     # Brief focus pause before the first keystroke.
     await asyncio.sleep(random.uniform(0.15, 0.4))
     for char in text:
-        await box.type(char, delay=random.randint(delay_min, delay_max))
+        await box.press_sequentially(
+            char, delay=random.randint(delay_min, delay_max)
+        )
 
 
 async def _human_mouse_move(page, x: float, y: float) -> None:
@@ -137,12 +165,13 @@ async def move_to_and_click(page, element, *, click_timeout: int = 5_000) -> Non
 
 
 # Probabilistic reading/dwell distribution: most pauses are a normal scan, with
-# occasional quick glances and slower careful reads. Multipliers scale the
-# configured (min, max) dwell window.
+# occasional quick glances and slower careful reads. Each profile's (low, high)
+# are fractions of the configured (min_s, max_s) window — 0.0 == min_s,
+# 1.0 == max_s — so the three profiles together span the whole window.
 _DWELL_PROFILES = (
-    (0.25, (0.4, 0.8)),   # quick scan
-    (0.55, (0.8, 1.2)),   # normal read
-    (0.20, (1.2, 2.0)),   # careful read
+    (0.25, (0.0, 0.35)),   # quick scan
+    (0.55, (0.30, 0.70)),  # normal read
+    (0.20, (0.65, 1.0)),   # careful read
 )
 
 
@@ -155,15 +184,15 @@ async def dwell(page, *, min_s: float = 1.0, max_s: float = 4.0) -> None:
     """
     roll = random.random()
     cumulative = 0.0
-    low_mult, high_mult = _DWELL_PROFILES[1][1]
+    low_frac, high_frac = _DWELL_PROFILES[1][1]
     for weight, (lo, hi) in _DWELL_PROFILES:
         cumulative += weight
         if roll <= cumulative:
-            low_mult, high_mult = lo, hi
+            low_frac, high_frac = lo, hi
             break
 
     span = max_s - min_s
-    seconds = min_s + span * random.uniform(low_mult, high_mult) / 2.0
+    seconds = min_s + span * random.uniform(low_frac, high_frac)
     seconds = max(min_s, min(seconds, max_s))
     logger.debug("Dwelling %.2fs between actions", seconds)
     await page.wait_for_timeout(int(seconds * 1_000))

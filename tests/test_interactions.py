@@ -147,19 +147,19 @@ class TestHumanType:
     async def test_types_one_key_per_character(self):
         box = AsyncMock()
         box.click = AsyncMock()
-        box.type = AsyncMock()
+        box.press_sequentially = AsyncMock()
 
         # Skip the real focus-pause sleep to keep the test fast.
         with patch("automation.interactions.asyncio.sleep", new=AsyncMock()):
             await human_type(box, "abc", delay_min=10, delay_max=10)
 
-        # Field is focused once, then one type() call per character.
+        # Field is focused once, then one keystroke call per character.
         box.click.assert_awaited_once()
-        assert box.type.await_count == 3
-        typed = "".join(call.args[0] for call in box.type.await_args_list)
+        assert box.press_sequentially.await_count == 3
+        typed = "".join(call.args[0] for call in box.press_sequentially.await_args_list)
         assert typed == "abc"
         # Per-key delay is passed through within the configured range.
-        for call in box.type.await_args_list:
+        for call in box.press_sequentially.await_args_list:
             assert call.kwargs["delay"] == 10
 
 
@@ -184,6 +184,12 @@ class TestMouseMoveAndClick:
 
         # Several jittered steps toward the element's center (5-10 per spec).
         assert 5 <= page.mouse.move.await_count <= 10
+        # The final move (no jitter) lands on the element's center.
+        center_x = 100 + 40 / 2
+        center_y = 200 + 20 / 2
+        final_x, final_y = page.mouse.move.await_args.args
+        assert final_x == pytest.approx(center_x)
+        assert final_y == pytest.approx(center_y)
 
     @pytest.mark.asyncio
     async def test_move_to_and_click_clicks_after_moving(self):
@@ -260,6 +266,60 @@ class TestScrollDown:
         await scroll_down(page)
 
         page.mouse.wheel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_terminates_on_infinite_lazy_loading_page(self):
+        """A page whose scrollHeight grows on every scroll must still finish.
+
+        Models LinkedIn's infinite results list: scrollHeight always stays
+        ahead of (scrollY + viewport), so a naive 'scroll to the end' loop
+        never ends. The hard step cap must bound it.
+        """
+        page = AsyncMock()
+        page.mouse = AsyncMock()
+        page.mouse.wheel = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        state = {"scroll_y": 0.0}
+
+        async def _evaluate(expr):
+            if "scrollY" in expr:
+                # The position advances a little each step (never clamped).
+                state["scroll_y"] += 300
+                return state["scroll_y"]
+            if "innerHeight" in expr:
+                return 800
+            # scrollHeight always grows faster than we scroll -> never "done".
+            return state["scroll_y"] + 5000
+
+        page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        # Must return (not hang) and be bounded by the hard step cap (40).
+        await scroll_down(page)
+        assert page.mouse.wheel.await_count <= 40
+        assert page.mouse.wheel.await_count > 0
+
+    @pytest.mark.asyncio
+    async def test_stalls_out_when_scroll_position_does_not_advance(self):
+        """If scrollY stops advancing (clamped at bottom), bail early."""
+        page = AsyncMock()
+        page.mouse = AsyncMock()
+        page.mouse.wheel = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        async def _evaluate(expr):
+            if "scrollY" in expr:
+                return 100  # never advances
+            if "innerHeight" in expr:
+                return 800
+            return 5000  # bottom never "reached" by the >= check
+
+        page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        await scroll_down(page)
+        # Stall guard breaks after MAX_STALLED_STEPS (3) iterations, well
+        # under the hard cap of 40.
+        assert page.mouse.wheel.await_count <= 4
 
 
 @pytest.mark.unit

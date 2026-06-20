@@ -212,7 +212,7 @@ class TestLogin:
         def _locator(selector):
             loc = AsyncMock()
             loc.click = AsyncMock()
-            loc.type = AsyncMock()
+            loc.press_sequentially = AsyncMock()
             loc.bounding_box = AsyncMock(return_value=None)
             loc.first = loc
             locators[selector] = loc
@@ -224,12 +224,12 @@ class TestLogin:
 
         assert result is True
         # Humanized typing: no instant fill, and each credential is typed key
-        # by key (one type() call per character).
+        # by key (one press_sequentially() call per character).
         assert mock_page.fill.call_count == 0
         email = app_settings.linkedin_email
         password = app_settings.linkedin_password
-        assert locators["input#username"].type.call_count == len(email)
-        assert locators["input#password"].type.call_count == len(password)
+        assert locators["input#username"].press_sequentially.call_count == len(email)
+        assert locators["input#password"].press_sequentially.call_count == len(password)
         # Submit button is clicked after a natural mouse move.
         assert locators["button[type=submit]"].click.called
 
