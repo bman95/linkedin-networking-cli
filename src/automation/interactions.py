@@ -33,14 +33,17 @@ async def random_wait(
 async def scroll_down(page) -> None:
     """Smooth scrolling down to the end of the page with natural behavior.
 
-    Bounded by two guards so it terminates on LinkedIn's infinite/lazy-loading
-    lists (where ``document.body.scrollHeight`` grows as you approach the
-    bottom and a naive "scroll to the end" loop would never finish):
+    Terminates via two guards:
 
-    - ``MAX_STEPS``: a hard cap on iterations (a human skims, they don't scroll
-      an endless feed to its true end).
-    - ``MAX_STALLED_STEPS``: stop early once the real scroll position stops
-      advancing (already at the bottom, or the page clamped the scroll).
+    - ``MAX_STALLED_STEPS`` (primary): stop once the real scroll position stops
+      advancing — i.e. the bottom of a finite page is reached and the browser
+      clamps ``scrollY``. This is what ends the scroll on normal pages, however
+      tall, so finite result lists are fully scrolled before harvesting.
+    - ``MAX_STEPS`` (safety backstop): a generous hard cap on iterations for
+      LinkedIn's infinite/lazy-loading lists, where ``scrollHeight`` keeps
+      growing as you approach the bottom so ``scrollY`` never stalls and the
+      stall guard never fires. The cap is set high enough (≈25k+ px of scroll)
+      that it does not cut off any realistic finite page short of its bottom.
     """
     MEAN_STEP = 120
     STEP_JITTER = 40
@@ -48,7 +51,7 @@ async def scroll_down(page) -> None:
     MAX_PAUSE = 900
     LONG_PAUSE_CHANCE = 0.10
     LONG_PAUSE_MS = (1_500, 3_000)
-    MAX_STEPS = 40
+    MAX_STEPS = 200
     MAX_STALLED_STEPS = 3
 
     logger.info("Scrolling down")

@@ -308,10 +308,44 @@ class TestScrollDown:
 
         page.evaluate = AsyncMock(side_effect=_evaluate)
 
-        # Must return (not hang) and be bounded by the hard step cap (40).
+        # Must return (not hang) and be bounded by the hard step cap (200).
         await scroll_down(page)
-        assert page.mouse.wheel.await_count <= 40
+        assert page.mouse.wheel.await_count <= 200
         assert page.mouse.wheel.await_count > 0
+
+    @pytest.mark.asyncio
+    async def test_finite_tall_page_reaches_bottom_not_cut_by_cap(self):
+        """A tall but finite page is fully scrolled to the bottom, not cut short.
+
+        The bottom is reached via the stall guard (scrollY clamps), well before
+        the hard step cap — so search harvesting sees the whole result list.
+        """
+        page = AsyncMock()
+        page.mouse = AsyncMock()
+        page.mouse.wheel = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        viewport = 800
+        total = 12_000  # tall finite page
+        state = {"scroll_y": 0.0}
+
+        async def _evaluate(expr):
+            if "scrollY" in expr:
+                # Advance toward the bottom, then clamp at (total - viewport).
+                state["scroll_y"] = min(state["scroll_y"] + 250, total - viewport)
+                return state["scroll_y"]
+            if "innerHeight" in expr:
+                return viewport
+            return total
+
+        page.evaluate = AsyncMock(side_effect=_evaluate)
+
+        await scroll_down(page)
+
+        # Reached the bottom (scrollY clamped at total - viewport) and stopped
+        # via the stall guard, not the hard cap of 200.
+        assert state["scroll_y"] == total - viewport
+        assert page.mouse.wheel.await_count < 200
 
     @pytest.mark.asyncio
     async def test_stalls_out_when_scroll_position_does_not_advance(self):
