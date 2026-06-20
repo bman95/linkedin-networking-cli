@@ -5,6 +5,7 @@ from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
 from rich.align import Align
+from rich.box import ROUNDED
 from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
@@ -19,13 +20,32 @@ import sys
 # LinkedIn brand blue, used across the welcome banner
 BRAND_BLUE = "#0A66C2"
 
-# ASCII logo (ANSI Shadow font) shown on startup
-LOGO = r"""██╗       ██╗  ███╗   ██╗  ██╗  ██╗  ███████╗  ██████╗   ██╗  ███╗   ██╗
-██║       ██║  ████╗  ██║  ██║ ██╔╝  ██╔════╝  ██╔══██╗  ██║  ████╗  ██║
-██║       ██║  ██╔██╗ ██║  █████╔╝   █████╗    ██║  ██║  ██║  ██╔██╗ ██║
-██║       ██║  ██║╚██╗██║  ██╔═██╗   ██╔══╝    ██║  ██║  ██║  ██║╚██╗██║
-███████╗  ██║  ██║ ╚████║  ██║  ██╗  ███████╗  ██████╔╝  ██║  ██║ ╚████║
-╚══════╝  ╚═╝  ╚═╝  ╚═══╝  ╚═╝  ╚═╝  ╚══════╝  ╚═════╝   ╚═╝  ╚═╝  ╚═══╝"""
+# ANSI Shadow font (6 rows per glyph) for the startup banner's big ASCII title
+_FONT = {
+    "N": ["███╗   ██╗", "████╗  ██║", "██╔██╗ ██║", "██║╚██╗██║", "██║ ╚████║", "╚═╝  ╚═══╝"],
+    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
+    "T": ["████████╗", "╚══██╔══╝", "   ██║   ", "   ██║   ", "   ██║   ", "   ╚═╝   "],
+    "W": ["██╗    ██╗", "██║    ██║", "██║ █╗ ██║", "██║███╗██║", "╚███╔███╔╝", " ╚══╝╚══╝ "],
+    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "R": ["██████╗ ", "██╔══██╗", "██████╔╝", "██╔══██╗", "██║  ██║", "╚═╝  ╚═╝"],
+    "K": ["██╗  ██╗", "██║ ██╔╝", "█████╔╝ ", "██╔═██╗ ", "██║  ██╗", "╚═╝  ╚═╝"],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "G": [" ██████╗ ", "██╔════╝ ", "██║  ███╗", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "L": ["██╗     ", "██║     ", "██║     ", "██║     ", "███████╗", "╚══════╝"],
+    " ": ["   "] * 6,
+}
+
+
+def _render_word(word: str, gap: str = " ") -> str:
+    """Render a word as 6-row ASCII art using the ANSI Shadow font."""
+    rows = [gap.join(_FONT[ch][r] for ch in word) for r in range(6)]
+    return "\n".join(rows)
+
+
+def _ascii_width(word: str, gap: str = " ") -> int:
+    """Return the rendered pixel width (columns) of an ASCII-art word."""
+    return len(gap.join(_FONT[ch][0] for ch in word))
 
 
 def _app_version() -> str:
@@ -86,39 +106,60 @@ class LinkedInCLI:
             return campaign.get(attr, default)
         return getattr(campaign, attr, default)
 
-    def display_welcome(self):
-        """Display a styled welcome banner."""
-        version = _app_version()
+    def _welcome_badge(self):
+        """Rounded blue 'in' badge with the small 'LinkedIn' label beside it."""
+        badge = Text()
+        badge.append("╭────╮\n", style=BRAND_BLUE)
+        badge.append("│ ", style=BRAND_BLUE)
+        badge.append("in", style="bold white")
+        badge.append(" │", style=BRAND_BLUE)
+        badge.append("   ")
+        badge.append("LinkedIn", style="bold white")
+        badge.append("\n")
+        badge.append("╰────╯", style=BRAND_BLUE)
+        return badge
 
-        # On narrow terminals the ASCII logo would wrap and look broken,
-        # so fall back to a compact title instead.
-        if self.console.width < 74:
-            body = Group(
-                Align.center(
-                    Text("LinkedIn Networking CLI", style=f"bold {BRAND_BLUE}")
-                ),
-                Align.center(
-                    Text("Professional networking automation", style="dim")
-                ),
-            )
-        else:
-            logo = Text(LOGO, style=f"bold {BRAND_BLUE}")
-            subtitle = Text.assemble(
-                ("Networking Automation", "italic white"),
-                ("   ·   ", "dim"),
-                (f"v{version}", f"bold {BRAND_BLUE}"),
-            )
-            body = Group(
-                Align.center(logo),
+    def _welcome_hero(self, content_width):
+        """Big ASCII title, scaled to the available width."""
+        hero_style = f"bold {BRAND_BLUE}"
+        # Widest first: full "NETWORKING CLI" on one line.
+        if content_width >= _ascii_width("NETWORKING CLI"):
+            return Align.center(Text(_render_word("NETWORKING CLI"), style=hero_style))
+        # Otherwise stack the two words, both still large.
+        if content_width >= _ascii_width("NETWORKING"):
+            return Group(
+                Align.center(Text(_render_word("NETWORKING"), style=hero_style)),
                 Text(""),
-                Align.center(subtitle),
+                Align.center(Text(_render_word("CLI"), style=hero_style)),
             )
+        # Too narrow for ASCII art: plain bold wordmark.
+        return Align.center(Text("Networking CLI", style=hero_style))
+
+    def display_welcome(self):
+        """Display a styled, width-aware welcome banner."""
+        version = _app_version()
+        # Panel uses padding=(1, 2) plus 1-col borders, so usable width = width - 6.
+        content_width = self.console.width - 6
+
+        subtitle = Text.assemble(
+            ("Professional networking automation", "italic white"),
+            ("   ·   ", "dim"),
+            (f"v{version}", f"bold {BRAND_BLUE}"),
+        )
+        body = Group(
+            Align.center(self._welcome_badge()),
+            Text(""),
+            self._welcome_hero(content_width),
+            Text(""),
+            Align.center(subtitle),
+        )
 
         self.console.print(
             Panel(
                 body,
                 border_style=BRAND_BLUE,
-                padding=(1, 4),
+                padding=(1, 2),
+                box=ROUNDED,
             )
         )
         self.console.print(
