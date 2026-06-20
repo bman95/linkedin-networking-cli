@@ -1072,3 +1072,27 @@ class TestErrorHandling:
 
         # Check that warning was logged
         assert any("Failed to extract profile info" in record.message for record in caplog.records)
+
+
+@pytest.mark.unit
+class TestLimitModalResolution:
+    """The weekly-limit modal must resolve to the OUTER wrapper via the combined
+    selector CSS (DOM-order), not the registry's candidate order — the handle is
+    the search root for _is_true_limit and the close-button queries."""
+
+    @pytest.mark.asyncio
+    async def test_limit_modal_resolved_via_combined_css(self, mock_linkedin_automation):
+        from automation import selectors as sel
+
+        # No modal present -> returns False, but the lookup must have used the
+        # combined comma-list CSS (DOM-order first match), guaranteeing the
+        # outer wrapper wins over an inner data-test node.
+        mock_linkedin_automation.page.query_selector = AsyncMock(return_value=None)
+        profile = LinkedInProfile(name="X", profile_url="u")
+
+        result = await mock_linkedin_automation._handle_invitation_limit_modal(profile)
+
+        assert result is False
+        mock_linkedin_automation.page.query_selector.assert_awaited_once_with(
+            sel.LIMIT_MODAL.css
+        )

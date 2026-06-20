@@ -1300,7 +1300,14 @@ class LinkedInAutomation:
         Returns True only when the real weekly limit was hit (caller should
         stop). A "near limit" warning is dismissed and returns False.
         """
-        modal = await sel.LIMIT_MODAL.locate(self.page)
+        # Resolve via the combined CSS (DOM-order first match), not .locate's
+        # candidate-order: the returned handle is the search root for
+        # _is_true_limit() and the close-button queries below, so we must get
+        # the *outer* modal wrapper. A nested layout (the data-test id on an
+        # inner node, the artdeco class on the outer wrapper) would otherwise
+        # have .locate prefer the inner node and scope those sub-queries to the
+        # wrong subtree, misclassifying a real weekly limit as a normal send.
+        modal = await self.page.query_selector(sel.LIMIT_MODAL.css)
         if not modal:
             return False
 

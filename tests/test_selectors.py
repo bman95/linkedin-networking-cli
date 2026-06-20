@@ -259,14 +259,17 @@ class TestRegistryShape:
             "button:text-is('Send')",
         ]
 
-    def test_limit_modal_anchor_first(self):
-        # The data-test anchor leads; component-class and dialog-text follow.
+    def test_limit_modal_outer_wrapper_first(self):
+        # The outer modal wrapper (component-class) leads so the returned handle
+        # is the correct search root for _is_true_limit / close-button queries;
+        # the data-test id (which LinkedIn may attach to an inner node) is a
+        # co-equal primary, not preferred over the wrapper.
         assert selectors.LIMIT_MODAL.candidates[0] == (
-            "[data-test-modal-id='ip-fuse-limit-alert']"
+            "div.artdeco-modal.ip-fuse-limit-alert"
         )
-        # The data-test anchor and the component-class are co-equal primaries
-        # (the test anchor is not guaranteed on every SDUI variant), so a normal
-        # limit hit matched by the class does not log a spurious drift warning.
+        assert "[data-test-modal-id='ip-fuse-limit-alert']" in (
+            selectors.LIMIT_MODAL.candidates
+        )
         assert selectors.LIMIT_MODAL.primary_count == 2
 
     def test_limit_true_marker_locked_icon_first(self):

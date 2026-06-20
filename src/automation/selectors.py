@@ -286,17 +286,20 @@ INVITE_SEND = Selector(
 )
 
 # --- Limit modal ---
-# The weekly-invitation-limit modal. The ``data-test-modal-id`` test anchor and
-# the ``ip-fuse-limit-alert`` component-class selector are co-equal primaries
-# (LinkedIn ships the component id consistently but the test anchor is not
-# guaranteed present on every SDUI variant, so neither alone is "the" primary);
-# only the ES/EN dialog-text last-resort candidates signal real drift. Hence
-# primary_count=2.
+# The weekly-invitation-limit modal. The returned handle is used as the search
+# *root* for the locked-icon/header check and the close-button queries, so it
+# must resolve to the OUTER modal wrapper. The ``ip-fuse-limit-alert``
+# component-class is that outer wrapper and leads; ``data-test-modal-id`` is a
+# co-equal primary that LinkedIn may attach to an inner node, so it must not be
+# preferred over the wrapper. ES/EN dialog-text variants are the last resort.
+# The detection site resolves this via ``.css`` (DOM-order first match) rather
+# than ``.locate`` precisely so an inner ``data-test`` node can never win over
+# the outer wrapper.
 LIMIT_MODAL = Selector(
     "limit_modal",
     [
-        "[data-test-modal-id='ip-fuse-limit-alert']",
         "div.artdeco-modal.ip-fuse-limit-alert",
+        "[data-test-modal-id='ip-fuse-limit-alert']",
         "dialog:has-text('límite semanal')",
         "dialog:has-text('weekly invitation limit')",
     ],
