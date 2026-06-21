@@ -2097,10 +2097,8 @@ class TestFindCardConnectControl:
     ):
         connect = self._control("Invitar a Jane Roe a conectar")
         card = self._card([connect])
-        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
-
         handle, kind = await mock_linkedin_automation._find_card_connect_control(
-            card, profile
+            card
         )
 
         assert kind == "connect"
@@ -2112,10 +2110,8 @@ class TestFindCardConnectControl:
     ):
         pending = self._control("Invitación pendiente para Jane Roe")
         card = self._card([pending])
-        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
-
         handle, kind = await mock_linkedin_automation._find_card_connect_control(
-            card, profile
+            card
         )
 
         assert kind == "pending"
@@ -2127,10 +2123,8 @@ class TestFindCardConnectControl:
     ):
         other = self._control("Enviar un mensaje a Jane Roe")
         card = self._card([other])
-        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
-
         handle, kind = await mock_linkedin_automation._find_card_connect_control(
-            card, profile
+            card
         )
 
         assert kind == "none"
@@ -2142,11 +2136,27 @@ class TestFindCardConnectControl:
     ):
         invisible = self._control("Conectar con Jane Roe", visible=False)
         card = self._card([invisible])
-        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
-
         handle, kind = await mock_linkedin_automation._find_card_connect_control(
-            card, profile
+            card
         )
 
         assert kind == "none"
         assert handle is None
+
+    @pytest.mark.asyncio
+    async def test_connect_wins_over_pending_in_same_card(
+        self, mock_linkedin_automation
+    ):
+        # A card exposing BOTH a Connect and a Pending control must resolve to
+        # Connect (the actionable invite). The keyword precedence wins
+        # regardless of DOM order, so put Pending first.
+        pending = self._control("Invitación pendiente para Jane Roe")
+        connect = self._control("Invitar a Jane Roe a conectar")
+        card = self._card([pending, connect])
+
+        handle, kind = await mock_linkedin_automation._find_card_connect_control(
+            card
+        )
+
+        assert kind == "connect"
+        assert handle is connect

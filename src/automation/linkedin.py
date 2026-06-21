@@ -1783,7 +1783,7 @@ class LinkedInAutomation:
 
         return None, "none"
 
-    async def _find_card_connect_control(self, card, profile) -> tuple:
+    async def _find_card_connect_control(self, card) -> tuple:
         """Find the Connect/Pending control INSIDE one search-result card.
 
         The card-scoped sibling of :meth:`_find_connect_control`: same idea, but
@@ -1803,9 +1803,14 @@ class LinkedInAutomation:
 
         async def match(keywords):
             for ctrl in controls:
-                if not await ctrl.is_visible():
+                try:
+                    if not await ctrl.is_visible():
+                        continue
+                    aria = self._normalize(await ctrl.get_attribute("aria-label"))
+                except Exception:
+                    # A handle can detach between enumeration and read; skip it,
+                    # mirroring the profile-page sibling _find_connect_control.
                     continue
-                aria = self._normalize(await ctrl.get_attribute("aria-label"))
                 if any(k in aria for k in keywords):
                     return ctrl
             return None
