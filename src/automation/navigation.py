@@ -73,6 +73,15 @@ logger = get_logger(__name__)
 _LOGIN_PATH_SEGMENTS = ("login", "uas")
 _CHALLENGE_PATH_SEGMENTS = ("checkpoint", "authwall")
 
+# Requested query params that are navigation *hints*, not load-bearing filters.
+# We send these (e.g. ``origin=FACETED_SEARCH``), but LinkedIn routinely drops
+# or rewrites them while still landing on the correct results page, so a change
+# to one of these is normal URL normalization — not a wrong landing. Excluding
+# them from the requested-param diff keeps the guard low-noise (the same intent
+# as ignoring the params LinkedIn *adds*): only the params that actually steer
+# the result set (keywords, geoUrn, industry, network, start, page) are checked.
+_NON_SEMANTIC_REQUEST_PARAMS = frozenset({"origin", "sid", "trk", "trackingid"})
+
 
 def _path_segments(path: str) -> set:
     """Return the set of non-empty path segments (already lower-cased)."""
@@ -124,7 +133,10 @@ def diff_redirect(requested_url: str, landed_url: str) -> Optional[Tuple[str, st
 
     Params LinkedIn *adds* (present in the landed URL but not requested —
     tracking/session noise) are deliberately ignored, so this never false-flags
-    on the params we didn't set. Returns None when the landing matches.
+    on the params we didn't set. Non-semantic *requested* hints
+    (``_NON_SEMANTIC_REQUEST_PARAMS``, e.g. ``origin``) are ignored too: LinkedIn
+    normalizes them away on a perfectly valid landing, so checking them would
+    abort good searches. Returns None when the landing matches.
     """
     req_path, req_query = _split(requested_url)
     land_path, land_query = _split(landed_url)
@@ -132,9 +144,13 @@ def diff_redirect(requested_url: str, landed_url: str) -> Optional[Tuple[str, st
     if req_path != land_path:
         return ("path_changed", land_path or "/")
 
-    # Only the params WE requested are checked; a param LinkedIn appended (in
-    # land_query but not req_query) is ignored as tracking/session noise.
+    # Only the *load-bearing* params WE requested are checked: a param LinkedIn
+    # appended (in land_query but not req_query) is ignored as tracking/session
+    # noise, and a requested non-semantic hint (origin/sid/trk...) is ignored as
+    # normal normalization rather than a reset of a filter we depend on.
     for key, req_value in req_query.items():
+        if key.lower() in _NON_SEMANTIC_REQUEST_PARAMS:
+            continue
         land_value = land_query.get(key)
         if land_value != req_value:
             return ("param_reset", f"{key}={req_value}->{land_value}")

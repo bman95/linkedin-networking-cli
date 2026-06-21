@@ -176,6 +176,34 @@ class TestDiffRedirect:
         )
         assert drift is None
 
+    def test_non_semantic_requested_param_dropped_ignored(self):
+        # origin=FACETED_SEARCH is a navigation hint we always send; LinkedIn
+        # dropping it on a correct landing is normalization, not a wrong landing.
+        drift = nav.diff_redirect(
+            "https://x/search/results/people?keywords=eng&origin=FACETED_SEARCH",
+            "https://x/search/results/people?keywords=eng",
+        )
+        assert drift is None
+
+    def test_non_semantic_requested_param_rewritten_ignored(self):
+        # A rewritten non-semantic hint is likewise ignored, while a real filter
+        # change on the same URL would still be caught (covered elsewhere).
+        drift = nav.diff_redirect(
+            "https://x/search?keywords=eng&origin=FACETED_SEARCH",
+            "https://x/search?keywords=eng&origin=CLUSTER_EXPANSION",
+        )
+        assert drift is None
+
+    def test_semantic_param_still_flagged_with_non_semantic_present(self):
+        # The non-semantic ignore must not mask a real load-bearing param reset.
+        drift = nav.diff_redirect(
+            "https://x/search?keywords=eng&origin=FACETED_SEARCH",
+            "https://x/search?keywords=other&origin=FACETED_SEARCH",
+        )
+        assert drift is not None
+        assert drift[0] == "param_reset"
+        assert "keywords=eng->other" in drift[1]
+
 
 # ---------------------------------------------------------------------------
 # navigate_guarded
