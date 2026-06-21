@@ -436,6 +436,11 @@ async def _goto_with_retry(
     if wait_until is not None:
         goto_kwargs["wait_until"] = wait_until
 
+    # Clamp to >= 0: a misconfigured negative retry count must still perform the
+    # navigation once. Without this, range(max_retries + 1) would be range(0) for
+    # max_retries == -1 and skip page.goto() entirely (returning as if navigated).
+    max_retries = max(max_retries, 0)
+
     for attempt in range(max_retries + 1):
         try:
             await asyncio.wait_for(page.goto(url, **goto_kwargs), timeout=hard)

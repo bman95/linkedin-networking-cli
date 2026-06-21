@@ -709,6 +709,31 @@ class TestGotoRetry:
         assert page.goto.await_count == 3
         assert slept.await_count == 2
 
+    @pytest.mark.parametrize("max_retries", [-1, 0])
+    @pytest.mark.asyncio
+    async def test_non_positive_max_retries_still_navigates_once(self, max_retries):
+        """A clamped (negative/zero) retry count still performs the navigation.
+
+        ``range(max_retries + 1)`` is ``range(0)`` for ``max_retries == -1``,
+        which would skip ``page.goto`` entirely and return as if navigated. The
+        helper clamps ``max_retries`` to ``>= 0`` so a misconfigured negative —
+        or a legitimate zero (no retries) — value still attempts ``goto`` once.
+        """
+        page = _quiet_page()
+
+        async def _goto(target, *_a, **_k):
+            page.url = target
+
+        page.goto = AsyncMock(side_effect=_goto)
+        await nav.navigate_guarded(
+            page,
+            "https://www.linkedin.com/search/results/people/",
+            strict_path="/search/results/people",
+            settle_timeout_ms=0,
+            max_retries=max_retries,
+        )
+        page.goto.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_non_transient_playwright_error_not_retried(self):
         """A non-``net::ERR_*`` Playwright error is raised on the first attempt."""
