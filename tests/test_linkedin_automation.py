@@ -296,6 +296,10 @@ class TestLogin:
         mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
 
         with patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": False},
+        ), patch.object(
             mock_linkedin_automation,
             "_wait_for_login_redirect",
             new=AsyncMock(),
@@ -316,6 +320,40 @@ class TestLogin:
         assert all(
             "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_checkpoint_headless_fails_fast(
+        self, mock_linkedin_automation
+    ):
+        """A /checkpoint under headless fails fast instead of hanging 10 minutes.
+
+        A checkpoint needs a human to complete the verification in a visible
+        browser; headless has no window for that. The checkpoint deferral must
+        therefore raise an actionable LoginFailedException immediately rather than
+        blocking a CI/background run on the full manual-login timeout.
+        """
+        from exceptions import LoginFailedException
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": True},
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(),
+        ) as redirect:
+            with pytest.raises(LoginFailedException):
+                await mock_linkedin_automation.login()
+
+        # Never waited on the 10-minute redirect under headless.
+        redirect.assert_not_awaited()
+        assert mock_linkedin_automation.is_authenticated is False
 
     @pytest.mark.asyncio
     async def test_slow_feed_landmark_count_fallback_confirms_session(

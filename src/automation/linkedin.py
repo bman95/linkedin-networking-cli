@@ -434,6 +434,16 @@ class LinkedInAutomation:
             # straight to the redirect-confirmation logic, which waits for the
             # URL to leave the login/challenge flow and a logged-in landmark.
             if checkpoint_in_progress:
+                # A checkpoint needs a human to complete the verification (2FA
+                # code / approval) in a visible browser. Headless has no window
+                # to do that in, so fail fast with an actionable error instead of
+                # blocking a CI/background run for the full 10-minute wait.
+                if self.settings.get_browser_settings().get("headless"):
+                    raise LoginFailedException(
+                        "Login verification (/checkpoint) requires manual "
+                        "completion, but the browser is headless. Run with "
+                        "HEADLESS=0 to complete the verification."
+                    )
                 await self._wait_for_login_redirect(timeout_ms=600_000)
                 self.is_authenticated = True
                 if progress_callback:
