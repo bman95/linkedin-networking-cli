@@ -8,9 +8,23 @@ import os
 import pytest
 from pathlib import Path
 from unittest.mock import patch
-from zoneinfo import available_timezones
+from zoneinfo import available_timezones, TZPATH
 
 from config.settings import AppSettings
+
+
+def _zone_bytes(name):
+    """Return the raw zoneinfo bytes for an IANA ``name`` from the on-disk DB.
+
+    Used to compare two zone names for equivalence without instantiating
+    ``ZoneInfo`` (which can raise on hosts whose tzdata lacks a given alias).
+    Two names are equivalent when their zoneinfo files are byte-identical.
+    """
+    for base in TZPATH:
+        path = Path(base) / name
+        if path.is_file():
+            return path.read_bytes()
+    return None
 
 
 # ============================================================================
@@ -429,7 +443,16 @@ class TestTimezoneDetection:
             return real_read_bytes(self)
 
         monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
-        assert AppSettings._detect_host_timezone() == target_zone
+        detected = AppSettings._detect_host_timezone()
+        # The byte-matcher returns *an* IANA name whose zoneinfo data is
+        # identical to the target. Several aliases (e.g. "America/New_York" and
+        # "US/Eastern") can ship byte-for-byte identical files, and which one
+        # wins depends on the host's tzdata build and set iteration order. Any
+        # equivalent alias is correct, so accept any valid IANA name whose
+        # zoneinfo bytes match the target rather than a single expected string.
+        assert detected is not None
+        assert detected in available_timezones()
+        assert _zone_bytes(detected) == target_bytes
 
     def test_no_sources_returns_none(self, monkeypatch):
         """Host with no TZ, no symlink, no /etc/timezone and an unreadable
