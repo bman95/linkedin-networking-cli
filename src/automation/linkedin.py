@@ -4,6 +4,7 @@ import subprocess
 import time
 import unicodedata
 import urllib.parse
+from collections import namedtuple
 from datetime import datetime, timezone, date
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
@@ -64,6 +65,16 @@ from exceptions import (
 
 
 logger = get_logger(__name__)
+
+
+# Outcome of one per-profile connect attempt (see _attempt_connect). ``outcome``
+# is the terminal state string the send loop branches on ("sent", "day_full",
+# "limit_reached", "email_required", "blocked", "modal_not_found",
+# "send_failed"); ``total_today`` is only set on a confirmed send (the
+# cumulative day count the caller uses to decide whether to stop), and defaults
+# to None for every non-send outcome.
+ConnectResult = namedtuple("ConnectResult", ["outcome", "total_today"])
+ConnectResult.__new__.__defaults__ = (None,)
 
 
 # Passive automation hardening: drop the two most obvious "this is a bot"
@@ -951,9 +962,6 @@ class LinkedInAutomation:
         backoff_cap_seconds = 300
 
         for i, profile in enumerate(profiles):
-            # Tracks whether THIS iteration has claimed a daily slot, so any
-            # path that doesn't end in a confirmed send can give it back.
-            slot_reserved = False
             today = date.today().isoformat()
             try:
                 # Recompute the local-day key each iteration so a run that
@@ -1085,270 +1093,45 @@ class LinkedInAutomation:
                         progress_callback(f"⚠️ No Connect button for {profile.name}")
                     continue
 
-                # Reserve a daily slot atomically BEFORE sending. This closes
-                # the check-then-send window: a concurrent run cannot also pass
-                # the cap while we are mid-send, because only one process can
-                # claim the slot that brings the count to the limit. If the
-                # reservation is refused, the day is full and we stop.
-                reserved_count = self.db_manager.reserve_daily_slot(today, daily_limit)
-                if reserved_count is None:
-                    if progress_callback:
-                        progress_callback(
-                            f"Daily connection limit reached "
-                            f"({daily_limit}/{daily_limit} used today)"
-                        )
-                    break
-                slot_reserved = True
-
-                # Click Connect and wait for the invitation modal — under the
-                # SAME per-item watchdog as the read unit. ``move_to_and_click``,
-                # ``query_selector`` and the modal-polling ``locator.count()``
-                # loop are all untimeouted page operations a wedged renderer can
-                # hang forever (a crashed renderer defeats even ``count()``); the
-                # ``click`` has its own 5s timeout but the surrounding reads do
-                # not. Bounding the click+poll here means a wedge after the page
-                # loaded (e.g. right after clicking Connect, or while waiting for
-                # the modal) caps the item, refreshes, and the outer
-                # ``except asyncio.TimeoutError`` skips this profile and releases
-                # its reserved slot — instead of wedging the rest of the run.
-                async def _click_connect_and_await_modal():
-                    # The top-card control is already in view at scroll-top, so a
-                    # natural mouse move reaches it and the SDUI opens the
-                    # invitation modal (a JS click is a last resort for the rare
-                    # case the control is still occluded).
-                    logger.info("Clicking 'Connect' button")
-                    await self._throttle_action()
-                    await move_to_and_click(self.page, connect_button)
-                    await random_wait(self.page, min_ms=2500, max_ms=4000)
-
-                    email_present = (
-                        await self.page.query_selector('label[for="email"]')
-                        is not None
-                    )
-                    if email_present:
-                        return "email_required", False, False
-
-                    note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
-                    send_no_note_loc = self.page.locator(
-                        sel.INVITE_SEND_NO_NOTE.css
-                    ).first
-                    send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
-                    blocked_inner = False
-                    modal_ready_inner = False
-                    for _ in range(8):
-                        # LinkedIn blocks re-inviting for 3 weeks after a
-                        # withdrawal; clicking Connect then shows an error toast
-                        # and no modal.
-                        if await self._invitation_blocked_toast():
-                            blocked_inner = True
-                            break
-                        if (
-                            await note_loc.count()
-                            or await send_no_note_loc.count()
-                            or await send_exact_loc.count()
-                        ):
-                            modal_ready_inner = True
-                            break
-                        await self.page.wait_for_timeout(1000)
-                    return "modal_check", blocked_inner, modal_ready_inner
-
-                modal_outcome, blocked, modal_ready = await run_bounded(
-                    _click_connect_and_await_modal(),
-                    timeout_s=self.settings.get_navigation_settings()[
-                        "interaction_watchdog_s"
-                    ],
-                    recover=self._recover,
-                    label=f"invite:{profile.name}",
+                # Reserve a slot, click Connect, and send the invitation. The
+                # helper owns the daily-slot lifecycle for this attempt: a
+                # confirmed send keeps the reserved slot; every other outcome
+                # (including a watchdog timeout or crash propagating out of the
+                # bounded click) releases it exactly once. The bounded-click
+                # watchdog still raises asyncio.TimeoutError out of the helper,
+                # caught by the except arm below after the slot was released.
+                result = await self._attempt_connect(
+                    campaign, profile, connect_button, progress_callback
                 )
-
-                # Check if email is required to connect (dismiss and skip). The
-                # ``email`` field is the modal's fingerprint; the dismiss control
-                # comes from the selector registry (EMAIL_REQUIRED_DISMISS) so the
-                # ES/EN aria-label variants live in one maintained place. This is
-                # the *in-flow* handler that runs right after the Connect click
-                # (when the modal actually appears and we must record the skip);
-                # surf_benign_interstitials' email-modal dismiss is a cross-
-                # navigation backstop for a stray leftover. They intentionally
-                # share the selector — don't dedupe one away.
-                email_label = (
-                    await self.page.query_selector('label[for="email"]')
-                    if modal_outcome == "email_required"
-                    else None
-                )
-                if email_label:
-                    logger.info(
-                        f"Email request modal detected for {profile.name}. Dismissing..."
-                    )
-                    dismiss_btn = await sel.EMAIL_REQUIRED_DISMISS.locate(self.page)
-                    if dismiss_btn:
-                        await dismiss_btn.click()
-
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Email required for connection",
-                    }
-                    self.db_manager.create_contact(contact_data)
-                    failed_count += 1
-                    if progress_callback:
-                        progress_callback(f"❌ Email required for {profile.name}")
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-                    continue
-
-                # ``blocked`` / ``modal_ready`` were computed inside the bounded
-                # click+poll unit above. The invitation modal is not a standard
-                # <dialog>, so its buttons were located by text and polled until
-                # they appeared (":text-is" matches the exact label so "Enviar"
-                # never collides with "Enviar sin nota" / "Enviar mensaje").
-                if blocked:
-                    logger.info(
-                        f"Invitation to {profile.name} blocked (recently withdrawn / cooldown)"
-                    )
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Invitation blocked (recently withdrawn / 3-week cooldown)",
-                    }
-                    self.db_manager.create_contact(contact_data)
-                    failed_count += 1
-                    if progress_callback:
-                        progress_callback(f"⚠️ Invitation blocked for {profile.name} (cooldown)")
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-                    continue
-
-                if not modal_ready:
-                    logger.warning(f"Invitation modal did not appear for {profile.name}")
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Invitation modal did not appear after clicking Connect",
-                    }
-                    self.db_manager.create_contact(contact_data)
-                    failed_count += 1
-                    if progress_callback:
-                        progress_callback(f"❌ Invitation modal not found for {profile.name}")
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-                    continue
-
-                # Send without a personalized note. LinkedIn gates custom notes
-                # behind Premium (and a small free quota); attempting "Add a note"
-                # leads to an upsell with no note field, so "Send without a note"
-                # is the reliable path that always delivers the invitation.
-                if campaign.message_template and campaign.message_template.strip():
-                    logger.info(
-                        "Campaign has a message template, but custom notes require "
-                        "LinkedIn Premium; sending without a note"
-                    )
-
-                # NOTE: The send/finalize tail below (locate the send control,
-                # humanized move+click, weekly-limit check) is intentionally left
-                # UNBOUNDED — it is not wrapped in run_bounded like the read and
-                # click+modal units above. Bounding it under the per-item watchdog
-                # mis-accounts the irreversible send (a watchdog timeout after the
-                # click has already fired would skip the profile as "not sent"
-                # while LinkedIn actually delivered the invitation). Designing a
-                # resilient wrapper that is safe around the irreversible send is
-                # tracked separately in issue #31.
-                send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
-                send_exact = self.page.locator(sel.INVITE_SEND.css).first
-                send_target = send_no_note if await send_no_note.count() else send_exact
-
-                logger.info("Clicking 'Send without a note' button")
-                # Natural mouse move to the send button before clicking. The
-                # click keeps its own failure handling (records the contact and
-                # skips), so don't route it through move_to_and_click's JS
-                # fallback — only humanize the approach.
-                await self._throttle_action()
-                await move_to_element(self.page, send_target)
-                try:
-                    await send_target.click(timeout=5000)
-                except Exception as send_error:
-                    logger.warning(f"Send click failed for {profile.name}: {send_error}")
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Send button not clickable after clicking Connect",
-                    }
-                    self.db_manager.create_contact(contact_data)
-                    failed_count += 1
-                    if progress_callback:
-                        progress_callback(f"❌ Send button not clickable for {profile.name}")
-                    await random_wait(self.page, min_ms=1000, max_ms=2000)
-                    continue
-                await random_wait(self.page, min_ms=2000, max_ms=3000)
-
-                # Check for the weekly invitation limit, distinguishing the real
-                # limit from the "near limit" warning.
-                if await self._handle_invitation_limit_modal(profile):
-                    if progress_callback:
-                        progress_callback("❌ LinkedIn weekly invitation limit reached!")
+                if result.outcome in ("day_full", "limit_reached"):
                     break
-
-                # Success - connection sent
-                contact_data = {
-                    "campaign_id": campaign.id,
-                    "name": profile.name,
-                    "profile_url": profile.profile_url,
-                    "headline": profile.headline,
-                    "location": profile.location,
-                    "company": profile.company,
-                    "status": "sent",
-                    "connection_sent_at": datetime.now(timezone.utc),
-                }
-                self.db_manager.create_contact(contact_data)
-                sent_count += 1
-                consecutive_failures = 0  # successful action resets backoff
-                # The slot was reserved (and persisted) before the send, so the
-                # request is now confirmed and the reservation is consumed —
-                # don't release it. reserved_count is the cumulative day total.
-                slot_reserved = False
-                total_today = reserved_count
-                # Stamp the cooldown timestamp now (only on a real send, not on
-                # reservation), so a failed send never triggers a false cooldown.
-                self.db_manager.mark_connection_sent(today)
-                logger.info(f"Successfully sent connection request to {profile.name}")
-
-                if progress_callback:
-                    progress_callback(f"✅ Sent connection request to {profile.name}")
-                    progress_callback(
-                        f"📊 {total_today}/{daily_limit} used today"
+                if result.outcome == "sent":
+                    sent_count += 1
+                    consecutive_failures = 0  # successful action resets backoff
+                    # Random delay between connections
+                    delay = random.randint(
+                        automation_settings["connection_delay_min"],
+                        automation_settings["connection_delay_max"],
                     )
-
-                # Random delay between connections
-                delay = random.randint(
-                    automation_settings["connection_delay_min"],
-                    automation_settings["connection_delay_max"],
-                )
-                await self.page.wait_for_timeout(delay * 1000)
-
-                # Check the persisted daily limit (cumulative across restarts).
-                if total_today >= daily_limit:
-                    if progress_callback:
-                        progress_callback(
-                            f"Daily connection limit reached "
-                            f"({total_today}/{daily_limit} used today)"
-                        )
-                    break
+                    await self.page.wait_for_timeout(delay * 1000)
+                    # Check the persisted daily limit (cumulative across restarts).
+                    if (
+                        result.total_today is not None
+                        and result.total_today >= daily_limit
+                    ):
+                        if progress_callback:
+                            progress_callback(
+                                f"Daily connection limit reached "
+                                f"({result.total_today}/{daily_limit} used today)"
+                            )
+                        break
+                    continue
+                # Soft failures (email_required, blocked, modal_not_found,
+                # send_failed): the helper already recorded the contact and
+                # released the reserved slot. These do NOT bump the consecutive-
+                # failure backoff counter (only hard exceptions do).
+                failed_count += 1
+                continue
 
             except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
                 # The guarded navigation bounced this profile to a
@@ -1432,13 +1215,6 @@ class LinkedInAutomation:
                     # out of this handler and abort the whole run.
                     await asyncio.sleep(wait_seconds)
                 continue
-            finally:
-                # Give back a reserved slot that wasn't consumed by a confirmed
-                # send (email-required, blocked, modal-not-found, failed send,
-                # or any exception). Success clears the flag, so this is a
-                # no-op there. Runs on every continue/break/exception exit.
-                if slot_reserved:
-                    self.db_manager.release_daily_slot(today)
 
         # Update campaign statistics
         self.db_manager.update_campaign_stats(campaign.id)
@@ -1449,6 +1225,286 @@ class LinkedInAutomation:
             "existing": existing_count,
             "total_processed": sent_count + failed_count + existing_count,
         }
+
+    async def _attempt_connect(
+        self, campaign, profile, connect_button, progress_callback=None
+    ) -> ConnectResult:
+        """Reserve a slot, click Connect, send the invitation — the connect core.
+
+        Extracted verbatim from ``send_connection_requests``' per-profile loop so
+        the same reserve-before-send → click+modal → send sequence can be reused
+        (foundation for issue #25's connect-from-search-card flow). Behavior is
+        identical to the inline version: this helper OWNS the daily-slot lifecycle
+        for the attempt — it reserves the slot, and its ``finally`` releases the
+        slot on every outcome except a confirmed send (which consumes it).
+
+        The bounded click+modal unit raises ``asyncio.TimeoutError`` (or a crash
+        exception) on a wedged renderer; those propagate OUT of this method (the
+        ``finally`` still releases the reserved slot), so the caller's
+        ``except asyncio.TimeoutError`` / ``except Exception`` arms catch them.
+
+        Returns a :class:`ConnectResult` whose ``outcome`` is one of "day_full",
+        "email_required", "blocked", "modal_not_found", "send_failed",
+        "limit_reached", or "sent". ``total_today`` is only set on "sent".
+        """
+        today = date.today().isoformat()
+        automation_settings = self.settings.get_automation_settings()
+        daily_limit = automation_settings["daily_connection_limit"]
+
+        # Reserve a daily slot atomically BEFORE sending. This closes
+        # the check-then-send window: a concurrent run cannot also pass
+        # the cap while we are mid-send, because only one process can
+        # claim the slot that brings the count to the limit. If the
+        # reservation is refused, the day is full and we stop.
+        reserved_count = self.db_manager.reserve_daily_slot(today, daily_limit)
+        if reserved_count is None:
+            if progress_callback:
+                progress_callback(
+                    f"Daily connection limit reached "
+                    f"({daily_limit}/{daily_limit} used today)"
+                )
+            return ConnectResult("day_full")
+
+        # Tracks whether this attempt has consumed (vs. merely reserved) its
+        # slot; the finally gives back any slot a non-send outcome left reserved.
+        slot_consumed = False
+        try:
+            # Click Connect and wait for the invitation modal — under the
+            # SAME per-item watchdog as the read unit. ``move_to_and_click``,
+            # ``query_selector`` and the modal-polling ``locator.count()``
+            # loop are all untimeouted page operations a wedged renderer can
+            # hang forever (a crashed renderer defeats even ``count()``); the
+            # ``click`` has its own 5s timeout but the surrounding reads do
+            # not. Bounding the click+poll here means a wedge after the page
+            # loaded (e.g. right after clicking Connect, or while waiting for
+            # the modal) caps the item, refreshes, and the outer
+            # ``except asyncio.TimeoutError`` skips this profile and releases
+            # its reserved slot — instead of wedging the rest of the run.
+            async def _click_connect_and_await_modal():
+                # The top-card control is already in view at scroll-top, so a
+                # natural mouse move reaches it and the SDUI opens the
+                # invitation modal (a JS click is a last resort for the rare
+                # case the control is still occluded).
+                logger.info("Clicking 'Connect' button")
+                await self._throttle_action()
+                await move_to_and_click(self.page, connect_button)
+                await random_wait(self.page, min_ms=2500, max_ms=4000)
+
+                email_present = (
+                    await self.page.query_selector('label[for="email"]')
+                    is not None
+                )
+                if email_present:
+                    return "email_required", False, False
+
+                note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
+                send_no_note_loc = self.page.locator(
+                    sel.INVITE_SEND_NO_NOTE.css
+                ).first
+                send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
+                blocked_inner = False
+                modal_ready_inner = False
+                for _ in range(8):
+                    # LinkedIn blocks re-inviting for 3 weeks after a
+                    # withdrawal; clicking Connect then shows an error toast
+                    # and no modal.
+                    if await self._invitation_blocked_toast():
+                        blocked_inner = True
+                        break
+                    if (
+                        await note_loc.count()
+                        or await send_no_note_loc.count()
+                        or await send_exact_loc.count()
+                    ):
+                        modal_ready_inner = True
+                        break
+                    await self.page.wait_for_timeout(1000)
+                return "modal_check", blocked_inner, modal_ready_inner
+
+            modal_outcome, blocked, modal_ready = await run_bounded(
+                _click_connect_and_await_modal(),
+                timeout_s=self.settings.get_navigation_settings()[
+                    "interaction_watchdog_s"
+                ],
+                recover=self._recover,
+                label=f"invite:{profile.name}",
+            )
+
+            # Check if email is required to connect (dismiss and skip). The
+            # ``email`` field is the modal's fingerprint; the dismiss control
+            # comes from the selector registry (EMAIL_REQUIRED_DISMISS) so the
+            # ES/EN aria-label variants live in one maintained place. This is
+            # the *in-flow* handler that runs right after the Connect click
+            # (when the modal actually appears and we must record the skip);
+            # surf_benign_interstitials' email-modal dismiss is a cross-
+            # navigation backstop for a stray leftover. They intentionally
+            # share the selector — don't dedupe one away.
+            email_label = (
+                await self.page.query_selector('label[for="email"]')
+                if modal_outcome == "email_required"
+                else None
+            )
+            if email_label:
+                logger.info(
+                    f"Email request modal detected for {profile.name}. Dismissing..."
+                )
+                dismiss_btn = await sel.EMAIL_REQUIRED_DISMISS.locate(self.page)
+                if dismiss_btn:
+                    await dismiss_btn.click()
+
+                contact_data = {
+                    "campaign_id": campaign.id,
+                    "name": profile.name,
+                    "profile_url": profile.profile_url,
+                    "headline": profile.headline,
+                    "location": profile.location,
+                    "company": profile.company,
+                    "status": "found",
+                    "notes": "Email required for connection",
+                }
+                self.db_manager.create_contact(contact_data)
+                if progress_callback:
+                    progress_callback(f"❌ Email required for {profile.name}")
+                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                return ConnectResult("email_required")
+
+            # ``blocked`` / ``modal_ready`` were computed inside the bounded
+            # click+poll unit above. The invitation modal is not a standard
+            # <dialog>, so its buttons were located by text and polled until
+            # they appeared (":text-is" matches the exact label so "Enviar"
+            # never collides with "Enviar sin nota" / "Enviar mensaje").
+            if blocked:
+                logger.info(
+                    f"Invitation to {profile.name} blocked (recently withdrawn / cooldown)"
+                )
+                contact_data = {
+                    "campaign_id": campaign.id,
+                    "name": profile.name,
+                    "profile_url": profile.profile_url,
+                    "headline": profile.headline,
+                    "location": profile.location,
+                    "company": profile.company,
+                    "status": "found",
+                    "notes": "Invitation blocked (recently withdrawn / 3-week cooldown)",
+                }
+                self.db_manager.create_contact(contact_data)
+                if progress_callback:
+                    progress_callback(f"⚠️ Invitation blocked for {profile.name} (cooldown)")
+                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                return ConnectResult("blocked")
+
+            if not modal_ready:
+                logger.warning(f"Invitation modal did not appear for {profile.name}")
+                contact_data = {
+                    "campaign_id": campaign.id,
+                    "name": profile.name,
+                    "profile_url": profile.profile_url,
+                    "headline": profile.headline,
+                    "location": profile.location,
+                    "company": profile.company,
+                    "status": "found",
+                    "notes": "Invitation modal did not appear after clicking Connect",
+                }
+                self.db_manager.create_contact(contact_data)
+                if progress_callback:
+                    progress_callback(f"❌ Invitation modal not found for {profile.name}")
+                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                return ConnectResult("modal_not_found")
+
+            # Send without a personalized note. LinkedIn gates custom notes
+            # behind Premium (and a small free quota); attempting "Add a note"
+            # leads to an upsell with no note field, so "Send without a note"
+            # is the reliable path that always delivers the invitation.
+            if campaign.message_template and campaign.message_template.strip():
+                logger.info(
+                    "Campaign has a message template, but custom notes require "
+                    "LinkedIn Premium; sending without a note"
+                )
+
+            # NOTE: The send/finalize tail below (locate the send control,
+            # humanized move+click, weekly-limit check) is intentionally left
+            # UNBOUNDED — it is not wrapped in run_bounded like the read and
+            # click+modal units above. Bounding it under the per-item watchdog
+            # mis-accounts the irreversible send (a watchdog timeout after the
+            # click has already fired would skip the profile as "not sent"
+            # while LinkedIn actually delivered the invitation). Designing a
+            # resilient wrapper that is safe around the irreversible send is
+            # tracked separately in issue #31.
+            send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
+            send_exact = self.page.locator(sel.INVITE_SEND.css).first
+            send_target = send_no_note if await send_no_note.count() else send_exact
+
+            logger.info("Clicking 'Send without a note' button")
+            # Natural mouse move to the send button before clicking. The
+            # click keeps its own failure handling (records the contact and
+            # skips), so don't route it through move_to_and_click's JS
+            # fallback — only humanize the approach.
+            await self._throttle_action()
+            await move_to_element(self.page, send_target)
+            try:
+                await send_target.click(timeout=5000)
+            except Exception as send_error:
+                logger.warning(f"Send click failed for {profile.name}: {send_error}")
+                contact_data = {
+                    "campaign_id": campaign.id,
+                    "name": profile.name,
+                    "profile_url": profile.profile_url,
+                    "headline": profile.headline,
+                    "location": profile.location,
+                    "company": profile.company,
+                    "status": "found",
+                    "notes": "Send button not clickable after clicking Connect",
+                }
+                self.db_manager.create_contact(contact_data)
+                if progress_callback:
+                    progress_callback(f"❌ Send button not clickable for {profile.name}")
+                await random_wait(self.page, min_ms=1000, max_ms=2000)
+                return ConnectResult("send_failed")
+            await random_wait(self.page, min_ms=2000, max_ms=3000)
+
+            # Check for the weekly invitation limit, distinguishing the real
+            # limit from the "near limit" warning.
+            if await self._handle_invitation_limit_modal(profile):
+                if progress_callback:
+                    progress_callback("❌ LinkedIn weekly invitation limit reached!")
+                return ConnectResult("limit_reached")
+
+            # Success - connection sent
+            contact_data = {
+                "campaign_id": campaign.id,
+                "name": profile.name,
+                "profile_url": profile.profile_url,
+                "headline": profile.headline,
+                "location": profile.location,
+                "company": profile.company,
+                "status": "sent",
+                "connection_sent_at": datetime.now(timezone.utc),
+            }
+            self.db_manager.create_contact(contact_data)
+            # The slot was reserved (and persisted) before the send, so the
+            # request is now confirmed and the reservation is consumed —
+            # don't release it. reserved_count is the cumulative day total.
+            slot_consumed = True
+            total_today = reserved_count
+            # Stamp the cooldown timestamp now (only on a real send, not on
+            # reservation), so a failed send never triggers a false cooldown.
+            self.db_manager.mark_connection_sent(today)
+            logger.info(f"Successfully sent connection request to {profile.name}")
+
+            if progress_callback:
+                progress_callback(f"✅ Sent connection request to {profile.name}")
+                progress_callback(
+                    f"📊 {total_today}/{daily_limit} used today"
+                )
+
+            return ConnectResult("sent", total_today=total_today)
+        finally:
+            # Give back a reserved slot that wasn't consumed by a confirmed
+            # send (email-required, blocked, modal-not-found, failed send,
+            # or any exception propagating out of the bounded click). Success
+            # sets slot_consumed, so this is a no-op there.
+            if not slot_consumed:
+                self.db_manager.release_daily_slot(today)
 
     def _build_search_params(self, campaign: Campaign) -> str:
         """Build LinkedIn search parameters from campaign criteria"""
@@ -1725,6 +1781,46 @@ class LinkedInAutomation:
                 return pending, "pending"
             await self.page.wait_for_timeout(1000)
 
+        return None, "none"
+
+    async def _find_card_connect_control(self, card) -> tuple:
+        """Find the Connect/Pending control INSIDE one search-result card.
+
+        The card-scoped sibling of :meth:`_find_connect_control`: same idea, but
+        it queries ``CONNECT_CONTROL`` *within* a single card element handle
+        instead of across the whole profile page. Because one card is exactly one
+        person, there is no name to disambiguate against and no top-card vs.
+        sticky-header y-preference to resolve — the first visible Connect/Pending
+        control in the card is THE control. The card is already rendered when we
+        enumerate it, so there is no polling loop either.
+
+        Returns ``(handle, kind)`` where kind is 'connect', 'pending' or 'none'.
+
+        NOT wired into any flow yet — this is foundation for issue #25 (connect
+        directly from a search-result card); PR 2 wires it into the card flow.
+        """
+        controls = await card.query_selector_all(sel.CONNECT_CONTROL.css)
+
+        async def match(keywords):
+            for ctrl in controls:
+                try:
+                    if not await ctrl.is_visible():
+                        continue
+                    aria = self._normalize(await ctrl.get_attribute("aria-label"))
+                except Exception:
+                    # A handle can detach between enumeration and read; skip it,
+                    # mirroring the profile-page sibling _find_connect_control.
+                    continue
+                if any(k in aria for k in keywords):
+                    return ctrl
+            return None
+
+        connect = await match(("conectar", "connect"))
+        if connect:
+            return connect, "connect"
+        pending = await match(("pendiente", "pending"))
+        if pending:
+            return pending, "pending"
         return None, "none"
 
     async def _invitation_blocked_toast(self) -> bool:
