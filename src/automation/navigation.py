@@ -120,6 +120,20 @@ def landed_on_challenge(landed_url: str) -> Optional[str]:
     return None
 
 
+def landed_on_checkpoint(landed_url: str) -> bool:
+    """Return True if the landed path is a ``/checkpoint/`` step.
+
+    A ``/checkpoint`` is the verification/2FA interstitial LinkedIn routes a
+    *successful* login through, so it is a legitimate "login in progress" step —
+    distinct from ``/authwall`` (a genuine block). The general
+    ``landed_on_challenge`` collapses both into ``"challenge"`` because the
+    navigation landing guard treats either as a stop; the login probe needs the
+    finer distinction so it can hand a checkpoint off to the login-redirect logic
+    instead of aborting it as a CAPTCHA.
+    """
+    return "checkpoint" in _path_segments(_split(landed_url)[0])
+
+
 def diff_redirect(requested_url: str, landed_url: str) -> Optional[Tuple[str, str]]:
     """Compare requested vs landed URL; return ``(reason, detail)`` or None.
 

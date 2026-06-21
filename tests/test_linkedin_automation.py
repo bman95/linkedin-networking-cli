@@ -224,6 +224,12 @@ class TestLogin:
         # "already authenticated" return is correctly skipped.
         mock_page.url = "https://www.linkedin.com/feed/"
         mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("no landmark"))
+        # ...and the secondary count fallback (issue #16 P2) also finds nothing,
+        # so the slow-feed grace period does not mistake a soft block for a live
+        # session: the landmark is genuinely absent on both the wait and the count.
+        _no_landmark = MagicMock()
+        _no_landmark.count = AsyncMock(return_value=0)
+        mock_page.locator = MagicMock(return_value=_no_landmark)
         # No stored credentials + headless => the manual-login branch fails loud,
         # proving the URL-only "already logged in" shortcut did NOT fire. No
         # CAPTCHA on the login page so the flow reaches the headless guard.
@@ -244,19 +250,20 @@ class TestLogin:
         assert mock_linkedin_automation.is_authenticated is False
 
     @pytest.mark.asyncio
-    async def test_feed_probe_challenge_raises_captcha(self, mock_linkedin_automation):
-        """A stored session already challenged on the feed probe is surfaced.
+    async def test_feed_probe_authwall_raises_captcha(self, mock_linkedin_automation):
+        """A stored session blocked by /authwall on the feed probe is surfaced.
 
-        If the /feed probe lands on /checkpoint or /authwall, the login flow must
-        raise CaptchaDetectedException (with evidence) instead of quietly routing
-        to /login and pushing through the challenge.
+        A non-checkpoint challenge (/authwall) is a genuine block: the login flow
+        must raise CaptchaDetectedException (with evidence) instead of quietly
+        routing to /login and pushing through the wall. A /checkpoint landing is
+        different (a routine verification step) and is covered separately.
         """
         from exceptions import CaptchaDetectedException
 
         mock_linkedin_automation.is_authenticated = False
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
-        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+        mock_page.url = "https://www.linkedin.com/authwall"
 
         with patch(
             "automation.linkedin.capture_error_context", new=AsyncMock()
@@ -266,6 +273,83 @@ class TestLogin:
         cap.assert_awaited()
         assert cap.await_args.args[1] == "login_feed_probe_challenge"
         # Never routed to the login page after a challenge.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_checkpoint_defers_to_login_redirect(
+        self, mock_linkedin_automation
+    ):
+        """A /checkpoint landing is login-in-progress, not a CAPTCHA abort.
+
+        Regression for issue #16 P1: LinkedIn's routine login verification/2FA
+        uses /checkpoint, and the existing _wait_for_login_redirect flow EXPECTS
+        a checkpoint step during a SUCCESSFUL login. The feed probe must hand the
+        checkpoint off to that logic (NOT raise CaptchaDetectedException, NOT
+        re-route to /login, which would discard the verification step) so a
+        legitimate 2FA login completes.
+        """
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(),
+        ) as redirect, patch(
+            "automation.linkedin.capture_error_context", new=AsyncMock()
+        ) as cap:
+            result = await mock_linkedin_automation.login()
+
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        # Handed off to the redirect-confirmation logic instead of aborting.
+        redirect.assert_awaited_once()
+        # No CAPTCHA evidence bundle was captured: this is not treated as a block.
+        assert all(
+            c.args[1] != "login_feed_probe_challenge" for c in cap.await_args_list
+        )
+        # The checkpoint step was never discarded by a re-route to /login.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_feed_landmark_count_fallback_confirms_session(
+        self, mock_linkedin_automation
+    ):
+        """A landmark that paints just past the wait still confirms the session.
+
+        Regression for issue #16 P2: a valid stored session on a slow feed gets a
+        generous landmark wait, and on a wait timeout a secondary count is checked
+        before concluding "not logged in" — so a slow-but-healthy feed is not
+        misclassified as logged out and re-driven through /login (which can
+        corrupt a good session).
+        """
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/feed/"
+        # The bounded wait times out, but the landmark IS present on the page —
+        # the secondary count fallback (returns 1) rescues the slow session.
+        mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("slow"))
+        _landmark = MagicMock()
+        _landmark.count = AsyncMock(return_value=1)
+        mock_page.locator = MagicMock(return_value=_landmark)
+
+        result = await mock_linkedin_automation.login()
+
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        # The wait was given a generous (>5s) budget for the slow feed.
+        wait_kwargs = mock_page.wait_for_selector.await_args.kwargs
+        assert wait_kwargs.get("timeout", 0) > 5_000
+        # Never fell through to /login for a session that was actually live.
         assert all(
             "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
         )

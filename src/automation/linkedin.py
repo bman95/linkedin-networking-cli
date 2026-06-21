@@ -47,6 +47,8 @@ from automation.navigation import (
     navigate_guarded,
     confirm_logged_in_dom,
     verify_listing_rendered,
+    landed_on_challenge,
+    landed_on_checkpoint,
 )
 from automation import selectors as sel
 from utils.logging import get_logger
@@ -362,13 +364,16 @@ class LinkedInAutomation:
 
             current_url = self.page.url
 
-            from automation.navigation import landed_on_challenge
-
             wall = landed_on_challenge(current_url)
-            if wall == "challenge":
-                # The stored session was already challenged (/checkpoint, /authwall):
-                # surface it as a typed exception with evidence rather than quietly
-                # routing to /login, so the caller stops instead of pushing through.
+            checkpoint_in_progress = landed_on_checkpoint(current_url)
+            # A /checkpoint landing is LinkedIn's routine login verification/2FA
+            # step, which the existing _wait_for_login_redirect flow already
+            # EXPECTS during a successful login — so it must NOT be aborted here
+            # as a CAPTCHA. Defer it to the login-redirect logic below (without
+            # re-routing to /login, which would discard the verification step).
+            # A non-checkpoint challenge (/authwall) is a genuine block, so it
+            # still surfaces as a typed exception with evidence.
+            if wall == "challenge" and not checkpoint_in_progress:
                 challenge_exc = CaptchaDetectedException(
                     "Stored session challenged on feed probe "
                     f"({current_url!r}); manual verification required"
@@ -384,17 +389,30 @@ class LinkedInAutomation:
             # DOM-backed "already logged in?" check: not on a login wall AND the
             # logged-in nav landmark renders. The URL alone is not enough — a soft
             # block served from a non-login URL would pass a URL-only check but
-            # renders no nav landmark. Wait briefly for the landmark (instead of
-            # an instantaneous count) so a slow-but-valid feed isn't misread as
-            # logged out and needlessly re-driven to /login.
+            # renders no nav landmark. A /checkpoint in progress is skipped here:
+            # the landmark cannot render on a verification page, so it is handed
+            # straight to _wait_for_login_redirect below.
             if wall is None:
+                # Give the logged-in landmark a generous budget: a valid but slow
+                # feed can take longer than a couple of seconds to paint the nav,
+                # and a too-tight wait would misread it as logged out and re-drive
+                # a healthy session through /login (which can corrupt it). On a
+                # timeout, fall back to a direct count before concluding "not
+                # logged in" — the landmark may have rendered just past the wait.
+                landmark_present = False
                 try:
                     await self.page.wait_for_selector(
-                        sel.GLOBAL_NAV_ME.css, timeout=5_000
+                        sel.GLOBAL_NAV_ME.css, timeout=20_000
                     )
                     landmark_present = True
                 except TimeoutError:
-                    landmark_present = False
+                    try:
+                        landmark_present = await sel.GLOBAL_NAV_ME.count(self.page) > 0
+                    except Exception as count_error:
+                        logger.debug(
+                            "Logged-in landmark fallback count failed: %s",
+                            count_error,
+                        )
                 if landmark_present:
                     self.is_authenticated = True
                     if progress_callback:
@@ -404,7 +422,30 @@ class LinkedInAutomation:
             # We were redirected to login (or the feed never confirmed a session),
             # proceed with authentication.
             if progress_callback:
-                progress_callback("Not logged in, proceeding with login...")
+                if checkpoint_in_progress:
+                    progress_callback(
+                        "Login verification in progress, awaiting confirmation..."
+                    )
+                else:
+                    progress_callback("Not logged in, proceeding with login...")
+
+            # A /checkpoint verification step is already mid-login: do NOT route
+            # back to /login (that discards it) or re-enter credentials. Hand it
+            # straight to the redirect-confirmation logic, which waits for the
+            # URL to leave the login/challenge flow and a logged-in landmark.
+            if checkpoint_in_progress:
+                await self._wait_for_login_redirect(timeout_ms=600_000)
+                self.is_authenticated = True
+                if progress_callback:
+                    progress_callback("Login completed successfully!")
+                try:
+                    await self.context.storage_state(
+                        path=str(self.settings.session_path)
+                    )
+                    logger.info("Session state saved successfully")
+                except Exception as save_error:
+                    logger.warning("Failed to save session state: %s", save_error)
+                return True
 
             # Ensure we're on the login page
             if "/login" not in current_url:

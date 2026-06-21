@@ -146,6 +146,41 @@ class TestLandedOnChallenge:
 
 
 @pytest.mark.unit
+class TestLandedOnCheckpoint:
+    """The finer checkpoint-vs-authwall distinction the login probe relies on."""
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # A /checkpoint is a routine login verification step (login probe
+            # defers it instead of aborting as a CAPTCHA).
+            ("https://www.linkedin.com/checkpoint/challenge/", True),
+            ("https://www.linkedin.com/checkpoint/lg/login-submit", True),
+            # /authwall is a genuine block, not a checkpoint.
+            ("https://www.linkedin.com/authwall", False),
+            # Non-challenge paths.
+            ("https://www.linkedin.com/feed/", False),
+            ("https://www.linkedin.com/login", False),
+        ],
+    )
+    def test_classification(self, url, expected):
+        assert nav.landed_on_checkpoint(url) is expected
+
+    def test_segment_boundary_avoids_substring_false_positive(self):
+        # Whole-segment match: a path that merely contains "checkpoint" is not one.
+        assert (
+            nav.landed_on_checkpoint("https://www.linkedin.com/in/checkpointer")
+            is False
+        )
+
+    def test_checkpoint_in_query_does_not_trip(self):
+        # Path-only match: a /checkpoint in the query string is not a checkpoint.
+        assert (
+            nav.landed_on_checkpoint("https://x/feed?next=/checkpoint/x") is False
+        )
+
+
+@pytest.mark.unit
 class TestDiffRedirect:
     def test_clean_landing(self):
         url = "https://x/search?start=0&keywords=eng"
