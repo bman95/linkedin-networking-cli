@@ -29,11 +29,11 @@ from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
 from automation.interactions import random_wait, _is_true_limit
 from automation.diagnostics import (
-    capture_error_context,
     capture_anomaly_context,
     snapshot_page,
     reset_diagnostics_run,
 )
+from automation import selectors as sel
 from utils.logging import get_logger
 from exceptions import (
     NotAuthenticatedException,
@@ -349,11 +349,11 @@ class LinkedInAutomation:
                 if progress_callback:
                     progress_callback("Entering credentials...")
 
-                await self.page.fill("input#username", email)
-                await self.page.fill("input#password", password)
+                await self.page.fill(sel.LOGIN_USERNAME.css, email)
+                await self.page.fill(sel.LOGIN_PASSWORD.css, password)
 
                 # Submit login
-                await self.page.click("button[type=submit]")
+                await self.page.click(sel.LOGIN_SUBMIT.css)
 
                 # Wait a moment for the page to respond
                 await self.page.wait_for_timeout(2000)
@@ -450,28 +450,24 @@ class LinkedInAutomation:
                 progress_callback("Starting profile search...")
 
             await self.page.goto(search_url, timeout=30000)
-            # Legacy UI exposes .search-results-container; the SDUI rollout
-            # (2026) only renders profile links inside <main>.
+            # Wait for any readiness candidate to appear (legacy container or
+            # SDUI profile links — see the registry). On timeout, fail loud:
+            # the registry captures an evidence bundle (screenshot + DOM + a
+            # structured line naming the selector, candidates, and URL) and
+            # raises. Best-effort: capture never masks the original timeout.
             try:
                 await self.page.wait_for_selector(
-                    ".search-results-container, main a[href*='/in/']", timeout=15000
+                    sel.SEARCH_RESULTS_READY.css, timeout=15000
                 )
             except TimeoutError as exc:
-                not_found = SelectorNotFoundException(
-                    "Search results not found - LinkedIn page structure may have changed",
-                    selector=".search-results-container, main a[href*='/in/']",
-                    timeout=15000
-                )
-                # Capture an evidence bundle before raising so a layout change
-                # leaves a screenshot + DOM snapshot to inspect. Best-effort:
-                # this never raises and never masks the original failure.
-                await capture_error_context(
-                    self.page,
-                    "search_results_readiness_wait",
-                    exc=not_found,
-                    context={"campaign": campaign.name},
-                )
-                raise not_found from exc
+                try:
+                    await sel.SEARCH_RESULTS_READY.fail_loud(
+                        self.page,
+                        context={"campaign": campaign.name},
+                        timeout=15000,
+                    )
+                except SelectorNotFoundException as not_found:
+                    raise not_found from exc
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops
@@ -487,13 +483,13 @@ class LinkedInAutomation:
                 # Wait for profiles to load (legacy attribute or SDUI links)
                 try:
                     await self.page.wait_for_selector(
-                        "[data-chameleon-result-urn], main a[href*='/in/']",
+                        sel.SEARCH_RESULT_CARDS.css,
                         timeout=10000,
                     )
                 except TimeoutError:
                     raise SelectorNotFoundException(
                         "Profile elements not found on search results page",
-                        selector="[data-chameleon-result-urn], main a[href*='/in/']",
+                        selector=sel.SEARCH_RESULT_CARDS.css,
                         timeout=10000
                     )
 
@@ -504,8 +500,9 @@ class LinkedInAutomation:
                 profiles_before_page = len(profiles)
 
                 # Legacy UI: structured result elements with a stable attribute
+                # (the result-cards selector's stable anchor).
                 profile_elements = await self.page.query_selector_all(
-                    "[data-chameleon-result-urn]"
+                    sel.SEARCH_RESULT_CARDS.anchor
                 )
 
                 if profile_elements:
@@ -538,14 +535,11 @@ class LinkedInAutomation:
                         context={"campaign": campaign.name, "page": page_count},
                     )
 
-                # Check for next page (EN/ES aria-labels, then SDUI text button)
-                next_button = await self.page.query_selector(
-                    "button[aria-label='Next'], button[aria-label='Siguiente']"
-                )
-                if not next_button:
-                    next_button = await self.page.query_selector(
-                        "main button:has-text('Siguiente'), main button:has-text('Next')"
-                    )
+                # Check for next page. Absence is the normal end-of-results
+                # signal, so this is a non-required locate (no fail-loud); the
+                # registry handles the EN/ES aria-label → SDUI text fallback
+                # ordering and warns if it drifts off the primary.
+                next_button = await sel.PAGINATION_NEXT.locate(self.page)
                 if next_button and not await next_button.is_disabled():
                     await next_button.scroll_into_view_if_needed()
                     await next_button.click()
@@ -795,15 +789,11 @@ class LinkedInAutomation:
                 # not a standard <dialog>, so locate its buttons by text and
                 # poll until they appear. ":text-is" matches the exact label so
                 # "Enviar" never collides with "Enviar sin nota" / "Enviar mensaje".
-                note_loc = self.page.locator(
-                    "button:has-text('Añadir una nota'), button:has-text('Add a note')"
-                ).first
+                note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
                 send_no_note_loc = self.page.locator(
-                    "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
+                    sel.INVITE_SEND_NO_NOTE.css
                 ).first
-                send_exact_loc = self.page.locator(
-                    "button:text-is('Enviar'), button:text-is('Send')"
-                ).first
+                send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
 
                 blocked = False
                 modal_ready = False
@@ -872,12 +862,8 @@ class LinkedInAutomation:
                         "LinkedIn Premium; sending without a note"
                     )
 
-                send_no_note = self.page.locator(
-                    "button:has-text('Enviar sin nota'), button:has-text('Send without a note')"
-                ).first
-                send_exact = self.page.locator(
-                    "button:text-is('Enviar'), button:text-is('Send')"
-                ).first
+                send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
+                send_exact = self.page.locator(sel.INVITE_SEND.css).first
                 send_target = send_no_note if await send_no_note.count() else send_exact
 
                 logger.info("Clicking 'Send without a note' button")
@@ -1239,7 +1225,7 @@ class LinkedInAutomation:
         # overlapped by the floating "Probar Premium" promo.
         async def match(keywords) -> Optional[Any]:
             controls = await self.page.query_selector_all(
-                "a[aria-label], button[aria-label], [role='button'][aria-label]"
+                sel.CONNECT_CONTROL.css
             )
             best = None
             best_y = -1.0
@@ -1314,11 +1300,14 @@ class LinkedInAutomation:
         Returns True only when the real weekly limit was hit (caller should
         stop). A "near limit" warning is dismissed and returns False.
         """
-        modal = await self.page.query_selector(
-            "div.artdeco-modal.ip-fuse-limit-alert, "
-            "[data-test-modal-id='ip-fuse-limit-alert'], "
-            "dialog:has-text('límite semanal'), dialog:has-text('weekly invitation limit')"
-        )
+        # Resolve via the combined CSS (DOM-order first match), not .locate's
+        # candidate-order: the returned handle is the search root for
+        # _is_true_limit() and the close-button queries below, so we must get
+        # the *outer* modal wrapper. A nested layout (the data-test id on an
+        # inner node, the artdeco class on the outer wrapper) would otherwise
+        # have .locate prefer the inner node and scope those sub-queries to the
+        # wrong subtree, misclassifying a real weekly limit as a normal send.
+        modal = await self.page.query_selector(sel.LIMIT_MODAL.css)
         if not modal:
             return False
 
