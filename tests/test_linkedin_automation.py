@@ -4,6 +4,7 @@ Unit tests for LinkedIn automation module.
 Tests LinkedInAutomation class with mocked Playwright interactions.
 """
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from datetime import datetime, timezone, date
@@ -2123,6 +2124,11 @@ class TestSearchAndConnect:
         async def _find(card):
             return card._wanted
 
+        # Phase 1 collects the full target list; stub it to the canned profiles
+        # so search_and_connect's card pass + profile pass operate on them.
+        automation.search_profiles = AsyncMock(
+            return_value=[profile for profile, _ in cards]
+        )
         automation._walk_search_pages = _walk
         automation._extract_profile_cards = AsyncMock(return_value=pairs)
         automation._find_card_connect_control = AsyncMock(side_effect=_find)
@@ -2300,6 +2306,40 @@ class TestSearchAndConnect:
         auto._attempt_connect.assert_not_called()
         auto.send_connection_requests.assert_not_called()
         assert any("captcha" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_card_timeout_defers_remaining_to_profile_pass(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A card-connect timeout ends the card pass without losing later targets.
+
+        The timed-out card and every still-unscanned target fall through to the
+        resilient profile-page pass — parity with the old per-profile loop, which
+        a single wedge could not abort.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        p0, p1 = self._profile(0), self._profile(1)
+        self._wire(auto, [(p0, "connect"), (p1, "connect")], monkeypatch)
+
+        # The first card-connect wedges (bounded click+modal raises TimeoutError).
+        auto._attempt_connect = AsyncMock(side_effect=asyncio.TimeoutError())
+        fallback = AsyncMock(
+            return_value={"sent": 2, "failed": 0, "existing": 0, "total_processed": 2}
+        )
+        auto.send_connection_requests = fallback
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        # Card pass stopped after the first wedge (p1 never card-attempted)...
+        auto._attempt_connect.assert_awaited_once()
+        # ...but nothing is lost: the timed-out p0 AND the unscanned p1 both go to
+        # the profile-page pass.
+        fallback.assert_awaited_once()
+        deferred = [p.profile_url for p in fallback.await_args.args[1]]
+        assert deferred == [p0.profile_url, p1.profile_url]
+        assert result["sent"] == 2
 
 
 @pytest.mark.unit

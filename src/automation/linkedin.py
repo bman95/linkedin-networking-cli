@@ -921,50 +921,76 @@ class LinkedInAutomation:
     ) -> Dict[str, int]:
         """Search and connect from the result cards, falling back to profiles.
 
-        The card-first path for issue #25: walk the people-search results and, for
-        each card that exposes a Connect control, send the invitation straight from
-        the results page via :meth:`_attempt_connect` — no per-profile navigation
-        (lower bot-detection signal, one fewer page load). Cards already showing
-        Pending are recorded and skipped; cards with no actionable Connect control
-        are deferred to the profile-page path.
+        The card-first path for issue #25, in three phases:
 
-        Staleness drives the two-pass shape: a profile ``goto`` would navigate off
-        the results page and detach every remaining card handle, so the fallback
-        can't run inline. Instead this drains each page's cards (Connect clicks
-        open an overlay modal and never navigate), collects the no-control
-        profiles, and runs the existing :meth:`send_connection_requests` on them as
-        a second pass. The persisted daily cap is shared across both passes, so a
-        day-full or weekly-limit stop ends the whole run.
+        1. **Collect** the full target list with :meth:`search_profiles` (fully
+           resilient: guarded nav, full pagination, per-page watchdogs). Doing
+           this up front is what makes phase 2 safe to interrupt — see below.
+        2. **Card pass:** re-walk the results and, for each card that exposes a
+           Connect control, send the invitation straight from the results page via
+           :meth:`_attempt_connect` — no per-profile navigation (lower
+           bot-detection signal, one fewer page load). Cards already showing
+           Pending are recorded; cards with no actionable Connect control are left
+           for phase 3.
+        3. **Profile-page pass:** run the unchanged :meth:`send_connection_requests`
+           over every collected target the card pass did *not* act on (no-control
+           cards, plus anything skipped when the card pass stopped early).
+
+        Staleness drives the shape. A profile ``goto`` would navigate off the
+        results page and detach every remaining card handle, so a card-connect and
+        a profile-visit can't interleave. And because a wedged card forces a
+        browser refresh (stale handles for the rest of the page), the card pass
+        can't recover mid-page the way the per-profile loop does — so it stops on a
+        wedge. Collecting the full list in phase 1 means that stop loses nothing:
+        every un-acted target still flows to the resilient phase-3 pass. The
+        persisted daily cap is shared across phases 2 and 3 (so they can't jointly
+        exceed it), and a day-full / weekly-limit / inline-CAPTCHA / challenge stop
+        ends the whole run.
 
         Returns the same aggregate shape as :meth:`send_connection_requests`, plus
-        ``scanned`` (unique profiles seen across the result pages).
+        ``scanned`` (the number of collected targets).
         """
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
         from .interactions import detect_captcha
 
+        # Phase 1 — collect the full target list. search_profiles re-raises a
+        # challenge/wrong-landing bounce (don't drive the rest through a wall) and
+        # returns [] on a clean no-results page.
+        profiles = await self.search_profiles(campaign, limit, progress_callback)
+        if not profiles:
+            return {
+                "sent": 0,
+                "failed": 0,
+                "existing": 0,
+                "total_processed": 0,
+                "scanned": 0,
+            }
+
         automation_settings = self.settings.get_automation_settings()
         daily_limit = automation_settings["daily_connection_limit"]
-
-        sent_count = 0
-        failed_count = 0
-        existing_count = 0
-        seen_urls: set = set()
-        fallback_profiles: List[LinkedInProfile] = []
-        scan_done = False  # stop walking result pages
-        stop_all = False  # also skip the profile-page fallback pass
 
         # Inter-session cooldown notice (advisory; mirrors the profile path so a
         # pure card-connect run isn't silently exempt from the warning).
         self._emit_cooldown_notice(automation_settings, progress_callback)
 
-        # New run boundary: clear per-run diagnostics state (see search_profiles).
+        target_urls = {p.profile_url for p in profiles}
+        handled: set = set()  # targets the card pass acted on (phase 3 skips them)
+        seen_in_pass: set = set()  # within-pass card dedup
+        card_sent = 0
+        card_failed = 0
+        card_existing = 0
+        scan_done = False  # stop the card walk
+        stop_all = False  # also skip the phase-3 profile pass (cap/limit/wall)
+
+        # New run boundary for the card pass: clear per-run diagnostics state so
+        # its evidence ring doesn't mix with phase 1's (see search_profiles).
         reset_diagnostics_run()
 
         try:
             if progress_callback:
-                progress_callback("Searching and connecting from result cards...")
+                progress_callback("Connecting from result cards...")
 
             async for _page in self._walk_search_pages(campaign, progress_callback):
                 # Inline CAPTCHA can render on the results page without a URL
@@ -983,12 +1009,12 @@ class LinkedInAutomation:
                 # Card handles are valid only until the walk paginates, so act on
                 # every card on this page before letting the loop advance.
                 for profile, card in await self._extract_profile_cards():
-                    if len(seen_urls) >= limit:
-                        scan_done = True
-                        break
-                    if profile.profile_url in seen_urls:
+                    url = profile.profile_url
+                    # Only act on collected targets (respects ``limit``); a card
+                    # outside the list, or already seen this pass, is skipped.
+                    if url not in target_urls or url in seen_in_pass:
                         continue
-                    seen_urls.add(profile.profile_url)
+                    seen_in_pass.add(url)
 
                     # Recompute the local-day key each card so a run crossing
                     # midnight starts a fresh bucket. Cheap early stop only — the
@@ -1003,17 +1029,16 @@ class LinkedInAutomation:
                         scan_done = stop_all = True
                         break
 
-                    # Skip profiles already in the contact book (any prior run).
+                    # Skip targets already in the contact book (any prior run).
                     with self.db_manager.get_session() as session:
                         from sqlmodel import select
 
                         existing_contact = session.exec(
-                            select(Contact).where(
-                                Contact.profile_url == profile.profile_url
-                            )
+                            select(Contact).where(Contact.profile_url == url)
                         ).first()
                     if existing_contact:
-                        existing_count += 1
+                        handled.add(url)
+                        card_existing += 1
                         continue
 
                     try:
@@ -1021,13 +1046,12 @@ class LinkedInAutomation:
                             await self._find_card_connect_control(card)
                         )
                     except Exception as e:
-                        # A detached/wedged card read shouldn't kill the run; defer
-                        # this one to the resilient profile-page path.
+                        # A detached/wedged card read shouldn't kill the run; leave
+                        # this target UNHANDLED so the phase-3 profile pass takes it.
                         logger.warning(
                             "Card connect-control read failed for %s; deferring to "
                             "profile path: %s", profile.name, e,
                         )
-                        fallback_profiles.append(profile)
                         continue
 
                     if control_kind == "pending":
@@ -1038,23 +1062,23 @@ class LinkedInAutomation:
                         self.db_manager.create_contact({
                             "campaign_id": campaign.id,
                             "name": profile.name,
-                            "profile_url": profile.profile_url,
+                            "profile_url": url,
                             "headline": profile.headline,
                             "location": profile.location,
                             "company": profile.company,
                             "status": "pending",
                             "notes": "Already sent (found Pending button on card)",
                         })
-                        existing_count += 1
+                        handled.add(url)
+                        card_existing += 1
                         if progress_callback:
                             progress_callback(f"⚠️ Already pending for {profile.name}")
                         continue
 
                     if control_kind != "connect" or not connect_button:
-                        # No actionable Connect control on the card — defer to the
-                        # profile-page path, which can read controls (and the name
-                        # disambiguation) the card view doesn't expose.
-                        fallback_profiles.append(profile)
+                        # No actionable Connect control on the card — leave it
+                        # UNHANDLED for the profile-page path, which can read
+                        # controls (and the name disambiguation) the card can't.
                         continue
 
                     if progress_callback:
@@ -1082,20 +1106,20 @@ class LinkedInAutomation:
                         scan_done = stop_all = True
                         break
                     except asyncio.TimeoutError:
-                        # The bounded click wedged; run_bounded already refreshed
-                        # the browser, so the remaining card handles on this page
-                        # are stale. End the card scan; the profile-page fallback
-                        # still runs on the no-control profiles gathered so far.
+                        # The bounded click+modal wedged (pre-send, so nothing was
+                        # delivered); run_bounded already refreshed the browser, so
+                        # the remaining card handles on this page are stale. Stop
+                        # the card walk — but leave this target UNHANDLED so the
+                        # phase-3 pass retries it, and every still-unscanned target
+                        # is processed there too (no campaign work is lost).
                         logger.warning(
-                            "Card-connect watchdog fired for %s; ending card scan "
-                            "after browser refresh", profile.name,
+                            "Card-connect watchdog fired for %s; ending card pass "
+                            "(profile pass will cover the rest)", profile.name,
                         )
-                        failed_count += 1
                         scan_done = True
                         break
                     except Exception as e:
                         logger.error("Card connect failed for %s: %s", profile.name, e)
-                        failed_count += 1
                         if _is_crash_error(e):
                             try:
                                 await self._refresh_context()
@@ -1105,15 +1129,19 @@ class LinkedInAutomation:
                                     "failure failed: %s", refresh_exc,
                                 )
                         # Page state is uncertain after a crash/refresh; end the
-                        # card scan and let the fallback pass take over.
+                        # card pass and let the profile-page pass take over (this
+                        # target stays UNHANDLED so it is retried there).
                         scan_done = True
                         break
 
+                    # A terminal ConnectResult: this target was acted on, so the
+                    # phase-3 pass must not touch it again.
+                    handled.add(url)
                     if result.outcome in ("day_full", "limit_reached"):
                         scan_done = stop_all = True
                         break
                     if result.outcome == "sent":
-                        sent_count += 1
+                        card_sent += 1
                         # Random delay between connections (mirrors the profile path).
                         delay = random.randint(
                             automation_settings["connection_delay_min"],
@@ -1134,37 +1162,41 @@ class LinkedInAutomation:
                         continue
                     # Soft failure (email_required / blocked / modal_not_found /
                     # send_failed): _attempt_connect already recorded the contact
-                    # and released the reserved slot. Don't add to the fallback —
-                    # the profile path would only re-hit the same wall.
-                    failed_count += 1
+                    # and released the reserved slot. Counted here (and handled, so
+                    # the profile path won't re-hit the same wall).
+                    card_failed += 1
 
                 if scan_done:
                     break
 
-            # Profile-page fallback for cards with no actionable Connect control.
-            # send_connection_requests owns its own cap preamble, cooldown notice,
-            # per-item watchdogs and backoff; the persisted cap is shared, so the
-            # two passes can't jointly exceed the daily limit.
-            if not stop_all and fallback_profiles:
-                if progress_callback:
-                    progress_callback(
-                        f"Visiting {len(fallback_profiles)} profile(s) with no card "
-                        "Connect button..."
+            # Phase 3 — profile-page path for every collected target the card pass
+            # did not act on (no-control cards, plus anything left unscanned when
+            # the card pass stopped on a wedge). send_connection_requests owns its
+            # own cap preamble, cooldown notice, per-item watchdogs and backoff;
+            # the persisted cap is shared, so the passes can't jointly exceed it.
+            fb = {"sent": 0, "failed": 0, "existing": 0}
+            if not stop_all:
+                remaining = [p for p in profiles if p.profile_url not in handled]
+                if remaining:
+                    if progress_callback:
+                        progress_callback(
+                            f"Visiting {len(remaining)} profile(s) the card pass "
+                            "did not connect..."
+                        )
+                    fb = await self.send_connection_requests(
+                        campaign, remaining, progress_callback
                     )
-                fb = await self.send_connection_requests(
-                    campaign, fallback_profiles, progress_callback
-                )
-                sent_count += fb["sent"]
-                failed_count += fb["failed"]
-                existing_count += fb["existing"]
 
             self.db_manager.update_campaign_stats(campaign.id)
+            sent_count = card_sent + fb["sent"]
+            failed_count = card_failed + fb["failed"]
+            existing_count = card_existing + fb["existing"]
             return {
                 "sent": sent_count,
                 "failed": failed_count,
                 "existing": existing_count,
                 "total_processed": sent_count + failed_count + existing_count,
-                "scanned": len(seen_urls),
+                "scanned": len(profiles),
             }
 
         except (
@@ -1172,9 +1204,9 @@ class LinkedInAutomation:
             NotAuthenticatedException,
             UnexpectedLandingException,
         ) as challenge:
-            # The page-walk guard bounced search to a challenge/login wall or the
-            # wrong path (evidence already captured). Re-raise so the run stops
-            # loudly, mirroring search_profiles.
+            # The card-pass walk bounced to a challenge/login wall or the wrong
+            # path (evidence already captured). Re-raise so the run stops loudly,
+            # mirroring search_profiles.
             logger.warning(
                 "Search-and-connect hit a challenge/wrong landing; aborting: %s",
                 challenge,
@@ -1191,11 +1223,11 @@ class LinkedInAutomation:
                 progress_callback(f"Search-and-connect failed: {e}")
             self.db_manager.update_campaign_stats(campaign.id)
             return {
-                "sent": sent_count,
-                "failed": failed_count,
-                "existing": existing_count,
-                "total_processed": sent_count + failed_count + existing_count,
-                "scanned": len(seen_urls),
+                "sent": card_sent,
+                "failed": card_failed,
+                "existing": card_existing,
+                "total_processed": card_sent + card_failed + card_existing,
+                "scanned": len(profiles),
             }
 
     def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
