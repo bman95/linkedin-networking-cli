@@ -22,8 +22,26 @@ class LinkedInAutomationError(Exception):
 
     All custom exceptions in this module inherit from this class,
     allowing for easy catching of any automation-related error.
+
+    Attributes:
+        evidence: Optional diagnostics bundle (the dict returned by
+            ``capture_error_context``) attached at the raise site when the
+            lower layers captured a screenshot/DOM snapshot before raising.
+            It carries the on-disk artifact paths (``screenshot``/``dom``) so
+            the CLI can point the user at the saved evidence. ``None`` when no
+            bundle was captured (the CLI falls back to the artifacts directory).
     """
-    pass
+
+    def __init__(self, *args, evidence=None):
+        """Initialize the error, optionally carrying an evidence bundle.
+
+        Args:
+            *args: Standard exception positional arguments (typically the
+                message). Forwarded to ``Exception.__init__``.
+            evidence: Optional diagnostics bundle dict (artifact paths).
+        """
+        super().__init__(*args)
+        self.evidence = evidence
 
 
 class LinkedInAuthenticationError(LinkedInAutomationError):

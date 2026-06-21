@@ -468,7 +468,7 @@ class LinkedInAutomation:
                     "Stored session challenged on feed probe "
                     f"({current_url!r}); manual verification required"
                 )
-                await capture_error_context(
+                challenge_exc.evidence = await capture_error_context(
                     self.page,
                     "login_feed_probe_challenge",
                     exc=challenge_exc,
@@ -758,11 +758,18 @@ class LinkedInAutomation:
                         timeout=10000,
                     )
                 except TimeoutError:
-                    raise SelectorNotFoundException(
+                    selector_exc = SelectorNotFoundException(
                         "Profile elements not found on search results page",
                         selector=sel.SEARCH_RESULT_CARDS.css,
                         timeout=10000
                     )
+                    selector_exc.evidence = await capture_error_context(
+                        self.page,
+                        "search_results_selector_missing",
+                        exc=selector_exc,
+                        context={"selector": sel.SEARCH_RESULT_CARDS.css},
+                    )
+                    raise selector_exc
 
                 # Record the landed search page into the rolling ring buffer so
                 # a later failure can be traced back through how we got here.
