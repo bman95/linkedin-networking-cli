@@ -4,13 +4,14 @@ Unit tests for LinkedIn automation module.
 Tests LinkedInAutomation class with mocked Playwright interactions.
 """
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from datetime import datetime, timezone, date
 
-from automation.linkedin import LinkedInAutomation, LinkedInProfile
+from automation.linkedin import LinkedInAutomation, LinkedInProfile, ConnectResult
 from automation import selectors as sel
-from database.models import Campaign
+from database.models import Campaign, Contact
 
 
 # ============================================================================
@@ -2077,3 +2078,396 @@ class TestFindCardConnectControl:
 
         assert kind == "connect"
         assert handle is connect
+
+
+@pytest.mark.unit
+class TestSearchAndConnect:
+    """search_and_connect invites straight from result cards and defers cards
+    with no Connect control to the profile-page path (issue #25, PR 2)."""
+
+    @staticmethod
+    def _profile(i):
+        return LinkedInProfile(
+            name=f"Person {i}",
+            profile_url=f"https://www.linkedin.com/in/person{i}/",
+        )
+
+    def _wire(self, automation, cards, monkeypatch):
+        """Drive the card scan from canned data (one results page).
+
+        ``cards`` is a list of ``(profile, kind)`` where kind is
+        'connect'/'pending'/'none'. Replaces the page-walk with a one-page async
+        generator and wires _extract_profile_cards / _find_card_connect_control to
+        return the canned profiles/controls. Each card carries the intended
+        ``(button, kind)`` on ``_wanted`` so the lookup is deterministic. Patches
+        detect_captcha to False so the results-page CAPTCHA guard (which would
+        otherwise fire against the truthy mock page) stays clear.
+        """
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha", AsyncMock(return_value=False)
+        )
+
+        pairs = []
+        for profile, kind in cards:
+            card = AsyncMock(name=f"card:{profile.name}")
+            button = (
+                AsyncMock(name=f"button:{profile.name}")
+                if kind in ("connect", "pending")
+                else None
+            )
+            card._wanted = (button, kind)
+            pairs.append((profile, card))
+
+        async def _walk(campaign, progress_callback=None):
+            yield 1
+
+        async def _find(card):
+            return card._wanted
+
+        # Phase 1 collects the full target list; stub it to the canned profiles
+        # so search_and_connect's card pass + profile pass operate on them.
+        automation.search_profiles = AsyncMock(
+            return_value=[profile for profile, _ in cards]
+        )
+        automation._walk_search_pages = _walk
+        automation._extract_profile_cards = AsyncMock(return_value=pairs)
+        automation._find_card_connect_control = AsyncMock(side_effect=_find)
+        return pairs
+
+    @pytest.mark.asyncio
+    async def test_card_connect_happy_path_skips_profile_visit(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A card exposing Connect is invited from the card — no profile goto."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        pairs = self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+
+        attempt = AsyncMock(return_value=ConnectResult("sent", total_today=1))
+        auto._attempt_connect = attempt
+        auto.send_connection_requests = AsyncMock()  # fallback must NOT run
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["sent"] == 1
+        attempt.assert_awaited_once()
+        # The card's own connect button reached the shared connect core...
+        assert attempt.await_args.args[2] is pairs[0][1]._wanted[0]
+        # ...without any per-profile navigation or profile-page fallback.
+        assert not auto.page.goto.called
+        auto.send_connection_requests.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_card_without_connect_falls_back_to_profile_path(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A card with no actionable Connect control is deferred to the profile path."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        profile = self._profile(0)
+        self._wire(auto, [(profile, "none")], monkeypatch)
+
+        auto._attempt_connect = AsyncMock()  # never invoked for a none card
+        fallback = AsyncMock(
+            return_value={"sent": 1, "failed": 0, "existing": 0, "total_processed": 1}
+        )
+        auto.send_connection_requests = fallback
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        auto._attempt_connect.assert_not_called()
+        fallback.assert_awaited_once()
+        # The deferred profile (and only it) is handed to the profile-page path.
+        fb_profiles = fallback.await_args.args[1]
+        assert [p.profile_url for p in fb_profiles] == [profile.profile_url]
+        assert result["sent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_card_is_recorded_and_skipped(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A card already showing Pending is recorded without a send or visit."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        db = auto.db_manager
+        campaign = db.create_campaign({"name": "Cards"})
+        profile = self._profile(0)
+        self._wire(auto, [(profile, "pending")], monkeypatch)
+
+        auto._attempt_connect = AsyncMock()
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["existing"] == 1
+        assert result["sent"] == 0
+        auto._attempt_connect.assert_not_called()
+        auto.send_connection_requests.assert_not_called()
+        assert not auto.page.goto.called
+        # A pending contact row was persisted (no profile visit needed).
+        with db.get_session() as session:
+            from sqlmodel import select
+
+            row = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert row is not None
+        assert row.status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_daily_cap_hit_during_cards_skips_fallback(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """Hitting the cap mid-scan stops the run, skipping the fallback pass.
+
+        The persisted cap is shared across the card pass and the profile-page
+        pass, so a no-control profile queued before the cap is reached is NOT
+        visited once the cap stops the run.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "1")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        # none card first (queued for fallback), then a connect card hitting the cap.
+        self._wire(
+            auto,
+            [(self._profile(0), "none"), (self._profile(1), "connect")],
+            monkeypatch,
+        )
+
+        auto._attempt_connect = AsyncMock(
+            return_value=ConnectResult("sent", total_today=1)
+        )
+        fallback = AsyncMock(
+            return_value={"sent": 0, "failed": 0, "existing": 0, "total_processed": 0}
+        )
+        auto.send_connection_requests = fallback
+
+        messages = []
+        result = await auto.search_and_connect(
+            campaign, limit=10, progress_callback=messages.append
+        )
+
+        assert result["sent"] == 1
+        fallback.assert_not_called()
+        assert any("limit reached" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_prior_run_at_cap_sends_nothing(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A cap reached by a prior run blocks the card path before any send."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "2")
+        auto = mock_linkedin_automation
+        db = auto.db_manager
+        campaign = db.create_campaign({"name": "Cards"})
+        today = date.today().isoformat()
+        for _ in range(2):  # prior run already used the day's quota
+            db.increment_daily_connection_count(today)
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+
+        auto._attempt_connect = AsyncMock()
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["sent"] == 0
+        auto._attempt_connect.assert_not_called()
+        auto.send_connection_requests.assert_not_called()
+        assert db.get_daily_connection_count(today) == 2
+
+    @pytest.mark.asyncio
+    async def test_inline_captcha_on_results_stops_run(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """An inline CAPTCHA on the results page stops before reading any card."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+        # Override the _wire default: LinkedIn renders a verification widget
+        # inline on /search/results/people (no URL bounce for the guard to catch).
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha",
+            AsyncMock(return_value=True),
+        )
+        auto._attempt_connect = AsyncMock()
+        auto.send_connection_requests = AsyncMock()
+
+        messages = []
+        result = await auto.search_and_connect(
+            campaign, limit=10, progress_callback=messages.append
+        )
+
+        # Stopped to protect the account: no cards read, no fallback pass.
+        assert result["sent"] == 0
+        auto._extract_profile_cards.assert_not_called()
+        auto._attempt_connect.assert_not_called()
+        auto.send_connection_requests.assert_not_called()
+        assert any("captcha" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_card_timeout_defers_remaining_to_profile_pass(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A card-connect timeout ends the card pass without losing later targets.
+
+        The timed-out card and every still-unscanned target fall through to the
+        resilient profile-page pass — parity with the old per-profile loop, which
+        a single wedge could not abort.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        p0, p1 = self._profile(0), self._profile(1)
+        self._wire(auto, [(p0, "connect"), (p1, "connect")], monkeypatch)
+
+        # The first card-connect wedges (bounded click+modal raises TimeoutError).
+        auto._attempt_connect = AsyncMock(side_effect=asyncio.TimeoutError())
+        fallback = AsyncMock(
+            return_value={"sent": 2, "failed": 0, "existing": 0, "total_processed": 2}
+        )
+        auto.send_connection_requests = fallback
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        # Card pass stopped after the first wedge (p1 never card-attempted)...
+        auto._attempt_connect.assert_awaited_once()
+        # ...but nothing is lost: the timed-out p0 AND the unscanned p1 both go to
+        # the profile-page pass.
+        fallback.assert_awaited_once()
+        deferred = [p.profile_url for p in fallback.await_args.args[1]]
+        assert deferred == [p0.profile_url, p1.profile_url]
+        assert result["sent"] == 2
+
+    @pytest.mark.asyncio
+    async def test_unexpected_card_pass_error_propagates(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """An unexpected card-pass error propagates so the CLI surfaces a failure,
+        rather than being swallowed into a partial 'success' result."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+        # Card extraction blows up unexpectedly (e.g. selector drift in the walk).
+        auto._extract_profile_cards = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await auto.search_and_connect(campaign, limit=10)
+
+
+@pytest.mark.unit
+class TestParseCardProfile:
+    """_parse_card_profile turns a card's href + visible text into a profile."""
+
+    def test_parses_name_dropping_degree_marker_and_actions(self):
+        profile = LinkedInAutomation._parse_card_profile(
+            "https://www.linkedin.com/in/jane/",
+            "Jane Roe • 2º\nSenior Engineer\nMadrid, Spain\nConectar",
+        )
+        assert profile is not None
+        assert profile.name == "Jane Roe"
+        # The "Conectar" action label is dropped, so headline/location land right.
+        assert profile.headline == "Senior Engineer"
+        assert profile.location == "Madrid, Spain"
+        assert profile.profile_url == "https://www.linkedin.com/in/jane/"
+
+    def test_action_words_filtered_case_insensitively(self):
+        profile = LinkedInAutomation._parse_card_profile(
+            "https://www.linkedin.com/in/x/",
+            "John Doe\nConnect\nMessage\nCEO at Foo",
+        )
+        # Both EN action words are dropped; the first real line becomes headline.
+        assert profile.headline == "CEO at Foo"
+
+    def test_empty_text_returns_none(self):
+        assert LinkedInAutomation._parse_card_profile("https://x/in/y/", "") is None
+        assert LinkedInAutomation._parse_card_profile("https://x/in/y/", None) is None
+
+    def test_blank_name_returns_none(self):
+        # First line is only the degree marker → no usable name.
+        assert (
+            LinkedInAutomation._parse_card_profile("https://x/in/y/", "• 2º\nfoo")
+            is None
+        )
+
+
+@pytest.mark.unit
+class TestExtractProfileCards:
+    """_extract_profile_cards keeps a card handle per profile and normalizes URLs."""
+
+    @staticmethod
+    def _card(href, text="Jane Roe • 2º\nEngineer", *, has_link=True, raises=False):
+        card = AsyncMock(name=f"card:{href}")
+        if raises:
+            card.query_selector = AsyncMock(side_effect=RuntimeError("detached"))
+        elif has_link:
+            link = AsyncMock()
+            link.get_attribute = AsyncMock(return_value=href)
+            card.query_selector = AsyncMock(return_value=link)
+        else:
+            card.query_selector = AsyncMock(return_value=None)
+        card.inner_text = AsyncMock(return_value=text)
+        return card
+
+    @pytest.mark.asyncio
+    async def test_relative_href_normalized_to_absolute(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        card = self._card("/in/jane/")
+        auto._enumerate_card_handles = AsyncMock(return_value=[card])
+
+        pairs = await auto._extract_profile_cards()
+
+        assert len(pairs) == 1
+        profile, handle = pairs[0]
+        # Relative href is resolved against BASE_URL so the fallback goto and the
+        # contact-book dedup match the other harvest paths.
+        assert profile.profile_url == "https://www.linkedin.com/in/jane/"
+        assert handle is card
+
+    @pytest.mark.asyncio
+    async def test_absolute_href_query_stripped_and_passed_through(
+        self, mock_linkedin_automation
+    ):
+        auto = mock_linkedin_automation
+        card = self._card("https://www.linkedin.com/in/bob/?miniProfileUrn=x")
+        auto._enumerate_card_handles = AsyncMock(return_value=[card])
+
+        pairs = await auto._extract_profile_cards()
+
+        assert pairs[0][0].profile_url == "https://www.linkedin.com/in/bob/"
+
+    @pytest.mark.asyncio
+    async def test_card_without_in_link_is_skipped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/x/", has_link=False)]
+        )
+
+        assert await auto._extract_profile_cards() == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_href_deduped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/jane/"), self._card("/in/jane/")]
+        )
+
+        pairs = await auto._extract_profile_cards()
+        assert len(pairs) == 1
+
+    @pytest.mark.asyncio
+    async def test_detached_handle_is_skipped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        good = self._card("/in/jane/")
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/x/", raises=True), good]
+        )
+
+        pairs = await auto._extract_profile_cards()
+        # The detached card is skipped; the live one still harvests.
+        assert [p.profile_url for p, _ in pairs] == [
+            "https://www.linkedin.com/in/jane/"
+        ]
