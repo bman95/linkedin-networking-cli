@@ -227,6 +227,21 @@ class TestRegistryShape:
         assert selectors.LOGIN_PASSWORD.css == "input#password"
         assert selectors.LOGIN_SUBMIT.css == "button[type=submit]"
 
+    def test_global_nav_me_landmark_anchor_first(self):
+        # The DOM proof of an authenticated session (issue #16). The data-test
+        # nav-item is the stable anchor; the member-photo class is the fallback.
+        assert selectors.GLOBAL_NAV_ME.anchor == "[data-test-global-nav-item='me']"
+        assert "img.global-nav__me-photo" in selectors.GLOBAL_NAV_ME.candidates
+
+    def test_blocking_overlay_modal_and_alertdialog(self):
+        # Swept before interaction; both candidates are co-equal primaries (a
+        # real overlay either way), restricted to a visible/rendered node.
+        assert selectors.BLOCKING_OVERLAY.candidates == [
+            ".artdeco-modal:visible",
+            "[role='alertdialog']:visible",
+        ]
+        assert selectors.BLOCKING_OVERLAY.primary_count == 2
+
     def test_search_readiness_keeps_legacy_and_sdui_variants(self):
         assert selectors.SEARCH_RESULTS_READY.candidates == [
             ".search-results-container",

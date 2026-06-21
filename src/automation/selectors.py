@@ -224,6 +224,35 @@ LOGIN_USERNAME = Selector("login_username", ["input#username"])
 LOGIN_PASSWORD = Selector("login_password", ["input#password"])
 LOGIN_SUBMIT = Selector("login_submit", ["button[type=submit]"])
 
+# --- Logged-in navigation landmark ---
+# The "Me" control in the global nav only renders for an authenticated session,
+# so it is the DOM proof that a login actually succeeded (vs. landing on a soft
+# block served from a non-login URL, which a URL-only check would misread as
+# logged in). ``data-test-global-nav-item='me'`` is the stable anchor; the
+# member photo class is the legacy/fallback rendering.
+GLOBAL_NAV_ME = Selector(
+    "global_nav_me",
+    [
+        "[data-test-global-nav-item='me']",
+        "img.global-nav__me-photo",
+        "div.global-nav__me",
+    ],
+)
+
+# --- Unexpected blocking overlay ---
+# Swept *before* the workflow interacts: a visible blocking modal the workflow
+# did not itself open is an anomaly (an interstitial, a forced upsell, a survey)
+# that would otherwise eat the next click. ``artdeco-modal`` is LinkedIn's modal
+# class; ``role='alertdialog'`` is the ARIA blocking-dialog role. ``:visible``
+# restricts to a rendered overlay so a hidden, pre-staged modal node is ignored.
+# Both candidates are co-equal primaries (either is a real overlay, neither
+# signals drift); consumed via ``.css`` for a presence-only ``count`` sweep.
+BLOCKING_OVERLAY = Selector(
+    "blocking_overlay",
+    [".artdeco-modal:visible", "[role='alertdialog']:visible"],
+    primary_count=2,
+)
+
 # --- Search readiness / result cards ---
 # Legacy UI exposes ``.search-results-container``; the SDUI rollout (2026) only
 # renders profile links inside <main>.

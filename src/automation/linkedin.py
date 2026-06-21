@@ -42,6 +42,11 @@ from automation.diagnostics import (
     snapshot_page,
     reset_diagnostics_run,
 )
+from automation.navigation import (
+    navigate_guarded,
+    confirm_logged_in_dom,
+    verify_listing_rendered,
+)
 from automation import selectors as sel
 from utils.logging import get_logger
 from exceptions import (
@@ -49,6 +54,7 @@ from exceptions import (
     LoginFailedException,
     SelectorNotFoundException,
     CaptchaDetectedException,
+    UnexpectedLandingException,
 )
 
 
@@ -345,20 +351,29 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback("Checking LinkedIn session...")
 
-            # Check if already logged in by attempting to access feed
-            # If redirected to login, we need to authenticate
+            # Check if already logged in by attempting to access feed.
+            # A bounce to /login here is the *expected* "need to authenticate"
+            # path, so this probe uses a bare goto (not navigate_guarded, which
+            # would raise on the login bounce).
             await self.page.goto(f"{self.BASE_URL}/feed", timeout=30_000, wait_until="domcontentloaded")
             # Give a moment for redirect to happen if not logged in
             await self.page.wait_for_timeout(2000)
 
             current_url = self.page.url
 
-            # If we're NOT on a login page, we're already logged in
-            if "/login" not in current_url and "/uas/login" not in current_url:
-                self.is_authenticated = True
-                if progress_callback:
-                    progress_callback("Session already active on LinkedIn!")
-                return True
+            # DOM-backed "already logged in?" check: not on a login/challenge
+            # wall AND the logged-in nav landmark is present. The URL alone is
+            # not enough — a soft block served from a non-login URL would pass a
+            # URL-only check but renders no nav landmark.
+            from automation.navigation import landed_on_challenge
+
+            if landed_on_challenge(current_url) is None:
+                me_landmark = await sel.GLOBAL_NAV_ME.count(self.page)
+                if me_landmark > 0:
+                    self.is_authenticated = True
+                    if progress_callback:
+                        progress_callback("Session already active on LinkedIn!")
+                    return True
 
             # We were redirected to login, proceed with authentication
             if progress_callback:
@@ -461,18 +476,17 @@ class LinkedInAutomation:
             raise LoginFailedException(f"Login failed: {str(e)}")
 
     async def _wait_for_login_redirect(self, timeout_ms: int) -> None:
-        """Wait until the page leaves the login/checkpoint flow.
+        """Confirm login by URL leaving the login flow *and* a DOM landmark.
 
-        URL-based detection survives LinkedIn UI redesigns better than
-        waiting for a specific nav element.
+        Delegates to ``confirm_logged_in_dom``: the URL leaving the
+        login/challenge flow is the cheap, redesign-robust first signal, but it
+        is no longer sufficient on its own — a soft block served from a
+        non-login URL would pass a URL-only check. A logged-in nav landmark
+        (``GLOBAL_NAV_ME``) must also render, so the confirmation is DOM-backed.
+        Raises a typed exception (with an evidence bundle) on a challenge/login
+        bounce or a missing landmark.
         """
-        def logged_in(url) -> bool:
-            value = str(url)
-            return not any(
-                part in value for part in ("/login", "/uas/", "/checkpoint/")
-            )
-
-        await self.page.wait_for_url(logged_in, timeout=timeout_ms)
+        await confirm_logged_in_dom(self.page, timeout=timeout_ms)
 
     async def search_profiles(
         self,
@@ -499,25 +513,30 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback("Starting profile search...")
 
-            await self.page.goto(search_url, timeout=30000)
-            # Wait for any readiness candidate to appear (legacy container or
-            # SDUI profile links — see the registry). On timeout, fail loud:
-            # the registry captures an evidence bundle (screenshot + DOM + a
-            # structured line naming the selector, candidates, and URL) and
-            # raises. Best-effort: capture never masks the original timeout.
-            try:
-                await self.page.wait_for_selector(
-                    sel.SEARCH_RESULTS_READY.css, timeout=15000
-                )
-            except TimeoutError as exc:
-                try:
-                    await sel.SEARCH_RESULTS_READY.fail_loud(
-                        self.page,
-                        context={"campaign": campaign.name},
-                        timeout=15000,
-                    )
-                except SelectorNotFoundException as not_found:
-                    raise not_found from exc
+            # Guarded navigation: goto -> settle -> landing guard. A bounce to a
+            # challenge/login wall or a wrong path raises a typed exception with
+            # an evidence bundle; ``strict_path`` asserts we are still on the
+            # people-search results path even when LinkedIn rewrites the rest of
+            # the URL. The humanized scroll below still runs after this returns.
+            await navigate_guarded(
+                self.page,
+                search_url,
+                strict_path="/search/results/people",
+                timeout=30000,
+                context={"campaign": campaign.name},
+            )
+            # Disambiguate "empty" from "not rendered yet": race the readiness
+            # selector and, if the listing does not render, reload ONCE before
+            # trusting "no results" (re-checking for a challenge that replaced
+            # the listing). Only a still-missing listing after the reload fails
+            # loud through the registry (evidence bundle + raise). A genuine
+            # empty/no-results page returns False without a spurious failure.
+            await verify_listing_rendered(
+                self.page,
+                sel.SEARCH_RESULTS_READY,
+                ready_timeout_ms=15000,
+                context={"campaign": campaign.name},
+            )
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops
@@ -727,12 +746,24 @@ class LinkedInAutomation:
                     continue
 
                 # Navigate to profile (throttled by the per-minute action cap).
+                # Guarded: goto -> settle -> landing guard. A bounce to a
+                # challenge/login wall raises a typed exception (caught below);
+                # path-diff is OFF because LinkedIn canonicalizes vanity profile
+                # URLs (a normal redirect, not a wrong landing). The challenge
+                # detection and overlay sweep still run.
                 await self._throttle_action()
-                await self.page.goto(profile.profile_url, timeout=30000)
-                await self.page.wait_for_timeout(2000)
+                await navigate_guarded(
+                    self.page,
+                    profile.profile_url,
+                    check_path=False,
+                    timeout=30000,
+                    context={"profile_url": profile.profile_url},
+                )
 
                 # Stop early if LinkedIn challenges us — pushing through a
-                # CAPTCHA is the fastest way to get an account restricted.
+                # CAPTCHA is the fastest way to get an account restricted. The
+                # guard already catches a URL-level challenge bounce; this is the
+                # DOM-level captcha check (an in-page widget on a non-wall URL).
                 if await detect_captcha(self.page):
                     logger.warning("CAPTCHA detected during connection run; stopping")
                     if progress_callback:
@@ -741,9 +772,10 @@ class LinkedInAutomation:
                         )
                     break
 
-                # Read the profile like a human (scroll + dwell) before acting.
-                # _find_connect_control scrolls back to the top afterward to
-                # bring the top-card action into view.
+                # Read the profile like a human (scroll + dwell) before acting,
+                # right after the guarded navigation verified the landing (#15
+                # humanization preserved). _find_connect_control scrolls back to
+                # the top afterward to bring the top-card action into view.
                 await scroll_down(self.page)
                 await self._dwell()
 
@@ -1008,6 +1040,22 @@ class LinkedInAutomation:
                         )
                     break
 
+            except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
+                # The guarded navigation bounced this profile to a
+                # challenge/login wall (evidence already captured). Pushing
+                # through is the fastest way to get the account restricted, so
+                # stop the whole run, mirroring the in-page CAPTCHA break above.
+                logger.warning(
+                    "Navigation guard hit a challenge/login wall for %s; stopping: %s",
+                    profile.name,
+                    challenge,
+                )
+                if progress_callback:
+                    progress_callback(
+                        "⚠️ Challenge/login wall detected — stopping automation "
+                        "to protect the account"
+                    )
+                break
             except Exception as e:
                 logger.error(f"Failed to process {profile.name}: {str(e)}")
                 failed_count += 1

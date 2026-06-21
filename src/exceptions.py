@@ -12,7 +12,8 @@ Exception Hierarchy:
         │   └── LoginFailedException (login attempt failed)
         ├── SelectorNotFoundException (element not found on page)
         ├── RateLimitExceededException (connection limits reached)
-        └── CaptchaDetectedException (captcha challenge detected)
+        ├── CaptchaDetectedException (captcha challenge detected)
+        └── UnexpectedLandingException (navigation landed somewhere unexpected)
 """
 
 
@@ -162,3 +163,63 @@ class CaptchaDetectedException(LinkedInAutomationError):
         raise CaptchaDetectedException("CAPTCHA detected - manual verification required")
     """
     pass
+
+
+class UnexpectedLandingException(LinkedInAutomationError):
+    """Exception raised when a navigation lands somewhere unexpected.
+
+    Raised by the navigation landing guard when, after a ``page.goto``, the
+    browser is not where it was meant to be. Reserved for the *non-challenge*
+    mismatch (a challenge/login bounce raises ``CaptchaDetectedException`` /
+    ``NotAuthenticatedException`` instead): a requested path the page diverged
+    from, an explicitly-requested query param that LinkedIn reset, or an
+    unexpected blocking overlay the workflow did not open.
+
+    Attributes:
+        requested_url: The URL the navigation asked for.
+        landed_url: The URL the browser actually ended up on.
+        reason: A short machine-readable reason (e.g. ``"path_changed"``,
+            ``"param_reset"``, ``"unexpected_overlay"``).
+
+    Example:
+        raise UnexpectedLandingException(
+            "Requested /search but landed on /feed",
+            requested_url="https://www.linkedin.com/search/...",
+            landed_url="https://www.linkedin.com/feed/",
+            reason="path_changed",
+        )
+    """
+
+    def __init__(
+        self,
+        message: str,
+        requested_url: str = None,
+        landed_url: str = None,
+        reason: str = None,
+    ):
+        """Initialize the exception with landing details.
+
+        Args:
+            message: Error message
+            requested_url: The URL the navigation asked for
+            landed_url: The URL the browser actually ended up on
+            reason: Short machine-readable reason for the mismatch
+        """
+        super().__init__(message)
+        self.requested_url = requested_url
+        self.landed_url = landed_url
+        self.reason = reason
+
+    def __str__(self):
+        """Return a formatted error message with landing details."""
+        base_msg = super().__str__()
+        details = []
+        if self.reason:
+            details.append(f"reason: '{self.reason}'")
+        if self.requested_url:
+            details.append(f"requested: '{self.requested_url}'")
+        if self.landed_url:
+            details.append(f"landed: '{self.landed_url}'")
+        if details:
+            base_msg += f" ({', '.join(details)})"
+        return base_msg
