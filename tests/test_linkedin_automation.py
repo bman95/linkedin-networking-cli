@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from datetime import datetime, timezone, date
 
 from automation.linkedin import LinkedInAutomation, LinkedInProfile
+from automation import selectors as sel
 from database.models import Campaign
 
 
@@ -181,7 +182,10 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_with_existing_session(self, mock_linkedin_automation):
         """Test login when session already exists (feed loads without redirect)."""
-        # Login detection is URL-based: staying on /feed means we are authenticated.
+        # Login detection is DOM-backed (issue #16): a non-login URL alone is no
+        # longer enough — the logged-in nav landmark must also be present. The
+        # default mock locator reports the landmark present (count 1), so the
+        # feed landing is recognized as an authenticated session.
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
         mock_page.url = "https://www.linkedin.com/feed/"
@@ -194,6 +198,308 @@ class TestLogin:
         assert mock_page.fill.call_count == 0
 
     @pytest.mark.asyncio
+    async def test_existing_session_requires_dom_landmark(
+        self, mock_linkedin_automation
+    ):
+        """A non-login URL with NO logged-in landmark is not 'already logged in'.
+
+        Guards the DOM-backed login check (issue #16): a soft block served from
+        a non-login URL would pass a URL-only check but renders no nav landmark,
+        so the early "already authenticated" return must be skipped and the
+        login flow proceeds. Here no credentials are configured and the browser
+        is headless, so the flow raises rather than silently treating the soft
+        block as a live session.
+        """
+        from unittest.mock import PropertyMock
+        from playwright.async_api import TimeoutError as PWTimeoutError
+        from exceptions import LoginFailedException
+        from config.settings import AppSettings
+
+        # Precondition: not yet authenticated (the fixture pre-sets True).
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        # Non-login URL, but the logged-in landmark never renders: the probe's
+        # bounded wait_for_selector for GLOBAL_NAV_ME times out, so the early
+        # "already authenticated" return is correctly skipped.
+        mock_page.url = "https://www.linkedin.com/feed/"
+        mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("no landmark"))
+        # ...and the secondary count fallback (issue #16 P2) also finds nothing,
+        # so the slow-feed grace period does not mistake a soft block for a live
+        # session: the landmark is genuinely absent on both the wait and the count.
+        _no_landmark = MagicMock()
+        _no_landmark.count = AsyncMock(return_value=0)
+        mock_page.locator = MagicMock(return_value=_no_landmark)
+        # No stored credentials + headless => the manual-login branch fails loud,
+        # proving the URL-only "already logged in" shortcut did NOT fire. No
+        # CAPTCHA on the login page so the flow reaches the headless guard.
+        with patch.object(
+            AppSettings, "linkedin_email", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            AppSettings, "linkedin_password", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": True},
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            with pytest.raises(LoginFailedException):
+                await mock_linkedin_automation.login()
+
+        assert mock_linkedin_automation.is_authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_authwall_raises_captcha(self, mock_linkedin_automation):
+        """A stored session blocked by /authwall on the feed probe is surfaced.
+
+        A non-checkpoint challenge (/authwall) is a genuine block: the login flow
+        must raise CaptchaDetectedException (with evidence) instead of quietly
+        routing to /login and pushing through the wall. A /checkpoint landing is
+        different (a routine verification step) and is covered separately.
+        """
+        from exceptions import CaptchaDetectedException
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/authwall"
+
+        with patch(
+            "automation.linkedin.capture_error_context", new=AsyncMock()
+        ) as cap:
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.login()
+        cap.assert_awaited()
+        assert cap.await_args.args[1] == "login_feed_probe_challenge"
+        # Never routed to the login page after a challenge.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_checkpoint_defers_to_login_redirect(
+        self, mock_linkedin_automation
+    ):
+        """A /checkpoint landing is login-in-progress, not a CAPTCHA abort.
+
+        Regression for issue #16 P1: LinkedIn's routine login verification/2FA
+        uses /checkpoint, and the existing _wait_for_login_redirect flow EXPECTS
+        a checkpoint step during a SUCCESSFUL login. The feed probe must hand the
+        checkpoint off to that logic (NOT raise CaptchaDetectedException, NOT
+        re-route to /login, which would discard the verification step) so a
+        legitimate 2FA login completes.
+        """
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": False},
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(),
+        ) as redirect, patch(
+            "automation.linkedin.capture_error_context", new=AsyncMock()
+        ) as cap:
+            result = await mock_linkedin_automation.login()
+
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        # Handed off to the redirect-confirmation logic instead of aborting.
+        redirect.assert_awaited_once()
+        # No CAPTCHA evidence bundle was captured: this is not treated as a block.
+        assert all(
+            c.args[1] != "login_feed_probe_challenge" for c in cap.await_args_list
+        )
+        # The checkpoint step was never discarded by a re-route to /login.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_checkpoint_headless_fails_fast(
+        self, mock_linkedin_automation
+    ):
+        """A /checkpoint under headless fails fast instead of hanging 10 minutes.
+
+        A checkpoint needs a human to complete the verification in a visible
+        browser; headless has no window for that. The checkpoint deferral must
+        therefore raise an actionable LoginFailedException immediately rather than
+        blocking a CI/background run on the full manual-login timeout.
+        """
+        from exceptions import LoginFailedException
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": True},
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(),
+        ) as redirect:
+            with pytest.raises(LoginFailedException):
+                await mock_linkedin_automation.login()
+
+        # Never waited on the 10-minute redirect under headless.
+        redirect.assert_not_awaited()
+        assert mock_linkedin_automation.is_authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_slow_feed_landmark_count_fallback_confirms_session(
+        self, mock_linkedin_automation
+    ):
+        """A landmark that paints just past the wait still confirms the session.
+
+        Regression for issue #16 P2: a valid stored session on a slow feed gets a
+        generous landmark wait, and on a wait timeout a secondary count is checked
+        before concluding "not logged in" — so a slow-but-healthy feed is not
+        misclassified as logged out and re-driven through /login (which can
+        corrupt a good session).
+        """
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/feed/"
+        # The bounded wait times out, but the landmark IS present on the page —
+        # the secondary count fallback (returns 1) rescues the slow session.
+        mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("slow"))
+        _landmark = MagicMock()
+        _landmark.count = AsyncMock(return_value=1)
+        mock_page.locator = MagicMock(return_value=_landmark)
+
+        result = await mock_linkedin_automation.login()
+
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        # The wait was given a generous (>5s) budget for the slow feed.
+        wait_kwargs = mock_page.wait_for_selector.await_args.kwargs
+        assert wait_kwargs.get("timeout", 0) > 5_000
+        # Never fell through to /login for a session that was actually live.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_manual_login_preserves_typed_challenge(
+        self, mock_linkedin_automation
+    ):
+        """Manual login surfaces a challenge as its typed self, not a timeout.
+
+        The DOM-backed confirmation can now raise CaptchaDetectedException; the
+        manual-login branch must let it propagate (not wrap it into a generic
+        "manual login timed out" LoginFailedException) so the caller stops.
+        """
+        from unittest.mock import PropertyMock
+        from exceptions import CaptchaDetectedException
+        from config.settings import AppSettings
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        # Feed probe lands on /login (a wall) -> proceed to authenticate.
+        mock_page.url = "https://www.linkedin.com/login"
+
+        with patch.object(
+            AppSettings, "linkedin_email", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            AppSettings, "linkedin_password", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": False},
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(side_effect=CaptchaDetectedException("wall")),
+        ):
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.login()
+
+    @pytest.mark.asyncio
+    async def test_login_preserves_unexpected_landing(
+        self, mock_linkedin_automation
+    ):
+        """A soft-block wrong landing during login keeps its typed self.
+
+        confirm_logged_in_dom raises UnexpectedLandingException when the URL
+        leaves the login flow but no logged-in nav landmark renders (a soft
+        block / interstitial). The outer login handler must let it propagate, not
+        wrap it into a generic LoginFailedException, so the caller can stop to
+        protect the account rather than retrying credentials into a wall. This
+        exercises the credentials path, whose _wait_for_login_redirect call has
+        no inner guard and relies on the outer handler.
+        """
+        from unittest.mock import PropertyMock
+        from exceptions import UnexpectedLandingException
+        from config.settings import AppSettings
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/login"
+
+        with patch.object(
+            AppSettings, "linkedin_email", new_callable=PropertyMock,
+            return_value="user@example.com",
+        ), patch.object(
+            AppSettings, "linkedin_password", new_callable=PropertyMock,
+            return_value="secret",
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(
+                side_effect=UnexpectedLandingException(
+                    "soft block", reason="login_landmark_missing"
+                )
+            ),
+        ):
+            with pytest.raises(UnexpectedLandingException):
+                await mock_linkedin_automation.login()
+
+    @pytest.mark.asyncio
+    async def test_slow_feed_landmark_wait_confirms_session(
+        self, mock_linkedin_automation
+    ):
+        """A slow-but-valid feed is recognized via the bounded landmark wait.
+
+        The probe waits for GLOBAL_NAV_ME (not an instantaneous count), so a
+        landmark that renders a beat late still confirms the session instead of
+        misclassifying it as logged out.
+        """
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/feed/"
+        # The landmark resolves (no timeout) -> authenticated.
+        mock_page.wait_for_selector = AsyncMock()
+
+        result = await mock_linkedin_automation.login()
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        mock_page.wait_for_selector.assert_awaited()
+        # The wait targets the logged-in nav landmark.
+        assert sel.GLOBAL_NAV_ME.css in str(
+            mock_page.wait_for_selector.await_args.args[0]
+        )
+
+    @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
         """Login types credentials character-by-character (no instant fill)."""
         automation = LinkedInAutomation(db_manager, app_settings)
@@ -201,7 +507,14 @@ class TestLogin:
         automation.context = AsyncMock()
 
         # Visiting /feed redirects to /login -> credentials flow is triggered.
+        # The redirect is modeled by having goto always land on /login, so the
+        # DOM-confirmed session probe (issue #16) reads a login wall and the
+        # "already authenticated" early-return is correctly skipped.
+        async def _goto(url, *_a, **_k):
+            mock_page.url = "https://www.linkedin.com/login"
+
         mock_page.url = "https://www.linkedin.com/login"
+        mock_page.goto = AsyncMock(side_effect=_goto)
         # No CAPTCHA present on the page.
         mock_page.query_selector = AsyncMock(return_value=None)
         mock_page.content = AsyncMock(return_value="")
@@ -215,6 +528,7 @@ class TestLogin:
             loc.clear = AsyncMock()
             loc.press_sequentially = AsyncMock()
             loc.bounding_box = AsyncMock(return_value=None)
+            loc.count = AsyncMock(return_value=0)
             loc.first = loc
             locators[selector] = loc
             return loc
@@ -810,11 +1124,24 @@ class TestLinkedInAutomationIntegration:
             "geo_urn": "90000084",
         })
 
-        # Mock page
+        # Mock page. goto sets page.url to the navigated target so the
+        # navigation landing guard (issue #16) sees a clean, on-path landing
+        # (a real browser reports the landed URL after goto). The overlay sweep
+        # counts the blocking-overlay selector via page.locator(...).count().
         mock_page = AsyncMock()
-        mock_page.goto = AsyncMock()
+
+        async def _goto(url, *_a, **_k):
+            mock_page.url = url
+
+        mock_page.url = "https://www.linkedin.com/feed/"
+        mock_page.goto = AsyncMock(side_effect=_goto)
         mock_page.wait_for_selector = AsyncMock()
+        mock_page.wait_for_load_state = AsyncMock()
+        mock_page.wait_for_timeout = AsyncMock()
         mock_page.query_selector_all = AsyncMock(return_value=[])
+        overlay_loc = MagicMock()
+        overlay_loc.count = AsyncMock(return_value=0)
+        mock_page.locator = MagicMock(return_value=overlay_loc)
 
         automation.page = mock_page
 
@@ -1065,6 +1392,210 @@ class TestPersistedDailyCap:
                 campaign, self._profiles(1), progress_callback=None
             )
         assert db.get_last_connection_at() is not None
+
+
+# ============================================================================
+# Navigation Landing Guard Wiring (issue #16)
+# ============================================================================
+
+@pytest.mark.unit
+class TestNavigationGuardWiring:
+    """The login/search/per-profile navigations go through the landing guard."""
+
+    def _profiles(self, n):
+        return [
+            LinkedInProfile(
+                name=f"Person {i}",
+                profile_url=f"https://www.linkedin.com/in/person{i}/",
+            )
+            for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_search_navigation_uses_guard_with_strict_path(
+        self, mock_linkedin_automation
+    ):
+        """The search goto is routed through navigate_guarded(strict_path=...)."""
+        campaign = Campaign(name="Wiring", keywords="eng")
+        with patch(
+            "automation.linkedin.navigate_guarded", new=AsyncMock()
+        ) as guarded:
+            await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+        guarded.assert_awaited()
+        call = guarded.await_args
+        # Second positional arg is the search URL; strict_path pins the people
+        # results path.
+        assert "/search/results/people" in call.args[1]
+        assert call.kwargs["strict_path"] == "/search/results/people"
+        assert call.kwargs["context"]["campaign"] == "Wiring"
+
+    @pytest.mark.asyncio
+    async def test_search_disambiguates_via_verify_listing_rendered(
+        self, mock_linkedin_automation
+    ):
+        """The search readiness wait goes through verify_listing_rendered."""
+        campaign = Campaign(name="Listing")
+        with patch(
+            "automation.linkedin.verify_listing_rendered", new=AsyncMock(return_value=True)
+        ) as verify, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+        verify.assert_awaited()
+        # Wired with the readiness selector and the campaign context.
+        assert verify.await_args.args[1] is sel.SEARCH_RESULTS_READY
+        assert verify.await_args.kwargs["context"]["campaign"] == "Listing"
+
+    @pytest.mark.asyncio
+    async def test_search_empty_results_returns_clean_empty_list(
+        self, mock_linkedin_automation
+    ):
+        """A genuine no-results page returns [] cleanly (not a harvest-loop failure)."""
+        campaign = Campaign(name="Empty")
+        # verify_listing_rendered reports a rendered-but-empty page (False).
+        with patch(
+            "automation.linkedin.verify_listing_rendered",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "automation.linkedin.snapshot_page", new=AsyncMock()
+        ) as snapshot:
+            messages = []
+            result = await mock_linkedin_automation.search_profiles(
+                campaign, limit=10, progress_callback=messages.append
+            )
+
+        assert result == []
+        # Short-circuited before the harvest loop: no page snapshot, no
+        # result-cards wait that would otherwise time out and raise.
+        snapshot.assert_not_awaited()
+        assert any("no results" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_search_guard_challenge_reraises(self, mock_linkedin_automation):
+        """A challenge raised during the search nav is NOT swallowed as 'no results'."""
+        from exceptions import CaptchaDetectedException
+
+        campaign = Campaign(name="Wall")
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=CaptchaDetectedException("search wall")),
+        ):
+            # Must propagate (a walled session read as [] would let the caller
+            # drive the connection run straight through the wall).
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+    @pytest.mark.asyncio
+    async def test_search_guard_wrong_landing_reraises(self, mock_linkedin_automation):
+        """A wrong landing (path/param) during search is NOT swallowed as 'no results'.
+
+        navigate_guarded raises UnexpectedLandingException on a strict_path miss
+        or a reset requested param. That is a hard navigation failure, not an
+        empty result set, so search_profiles must re-raise it (not return []).
+        """
+        from exceptions import UnexpectedLandingException
+
+        campaign = Campaign(name="WrongLanding")
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(
+                side_effect=UnexpectedLandingException(
+                    "landed elsewhere", reason="strict_path_miss"
+                )
+            ),
+        ):
+            with pytest.raises(UnexpectedLandingException):
+                await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+    @pytest.mark.asyncio
+    async def test_search_scroll_runs_after_guard(self, mock_linkedin_automation):
+        """#15's humanized scroll_down survives and runs after the guard."""
+        campaign = Campaign(name="Order")
+        order = []
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda *a, **k: order.append("guard")),
+        ), patch(
+            "automation.linkedin.scroll_down",
+            new=AsyncMock(side_effect=lambda *a, **k: order.append("scroll")),
+        ), patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+        # The guard ran before the humanized scroll (landing verified first).
+        assert order.index("guard") < order.index("scroll")
+
+    @pytest.mark.asyncio
+    async def test_profile_navigation_uses_guard_check_path_off(
+        self, mock_linkedin_automation
+    ):
+        """The per-profile goto uses navigate_guarded(check_path=False)."""
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Wiring"})
+        # Make _find_connect_control a no-op so the loop reaches navigation only.
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+        with patch(
+            "automation.linkedin.navigate_guarded", new=AsyncMock()
+        ) as guarded, patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(1)
+            )
+
+        guarded.assert_awaited()
+        assert guarded.await_args.kwargs["check_path"] is False
+        assert guarded.await_args.args[1] == "https://www.linkedin.com/in/person0/"
+
+    @pytest.mark.asyncio
+    async def test_profile_guard_challenge_stops_run(self, mock_linkedin_automation):
+        """A guard challenge bounce stops the whole run (protects the account)."""
+        from exceptions import CaptchaDetectedException
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Wiring"})
+        find = AsyncMock(return_value=(None, "none"))
+        mock_linkedin_automation._find_connect_control = find
+
+        # First profile bounces to a challenge; the run must break, never
+        # reaching _find_connect_control for any profile.
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=CaptchaDetectedException("challenge")),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            messages = []
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=messages.append
+            )
+
+        find.assert_not_awaited()  # broke out before the connect lookup
+        assert result["sent"] == 0
+        assert any("Challenge/login wall" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_login_redirect_delegates_to_dom_confirmation(
+        self, mock_linkedin_automation
+    ):
+        """_wait_for_login_redirect is now DOM-backed (confirm_logged_in_dom)."""
+        with patch(
+            "automation.linkedin.confirm_logged_in_dom", new=AsyncMock()
+        ) as confirm:
+            await mock_linkedin_automation._wait_for_login_redirect(timeout_ms=1234)
+        confirm.assert_awaited_once()
+        assert confirm.await_args.kwargs["timeout"] == 1234
 
 
 # ============================================================================

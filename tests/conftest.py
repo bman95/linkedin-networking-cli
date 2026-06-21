@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from database.models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
 from database.operations import DatabaseManager
 from config.settings import AppSettings
+from automation import selectors as sel
 
 
 # ============================================================================
@@ -158,9 +159,21 @@ def app_settings(mock_env_vars, temp_db_path) -> AppSettings:
 def mock_page():
     """Create a mock Playwright page object."""
     page = AsyncMock()
-    page.goto = AsyncMock()
+    # A real Page reports the landed URL after a goto. Default to an
+    # authenticated feed URL so the navigation landing guard (issue #16) sees a
+    # clean, non-challenge landing; ``goto`` then updates ``url`` to the
+    # navigated target, mirroring a browser with no redirect. Tests that
+    # simulate a bounce override ``page.url`` (or ``goto``) explicitly.
+    page.url = "https://www.linkedin.com/feed/"
+
+    async def _goto(url, *_args, **_kwargs):
+        page.url = url
+
+    page.goto = AsyncMock(side_effect=_goto)
     page.wait_for_selector = AsyncMock()
     page.wait_for_timeout = AsyncMock()
+    page.wait_for_load_state = AsyncMock()
+    page.reload = AsyncMock()
     page.query_selector = AsyncMock()
     page.query_selector_all = AsyncMock(return_value=[])
     page.fill = AsyncMock()
@@ -183,13 +196,19 @@ def mock_page():
     # page.locator() is synchronous in Playwright and returns a Locator. The
     # default locator supports the methods the humanized paths touch (click,
     # type, bounding_box, count, first); individual tests override this.
-    def _make_locator(*_args, **_kwargs):
+    def _make_locator(selector="", *_args, **_kwargs):
         locator = AsyncMock()
         locator.click = AsyncMock()
         locator.clear = AsyncMock()
         locator.press_sequentially = AsyncMock()
         locator.bounding_box = AsyncMock(return_value=None)
-        locator.count = AsyncMock(return_value=1)
+        # The navigation guard's overlay sweep (issue #16) counts the
+        # blocking-overlay selector; default to "no overlay" so a guarded
+        # navigation doesn't spuriously fire an anomaly capture. Other
+        # selectors keep the present-by-default count of 1.
+        overlay_css = sel.BLOCKING_OVERLAY.css if isinstance(selector, str) else ""
+        present = 0 if (isinstance(selector, str) and selector == overlay_css) else 1
+        locator.count = AsyncMock(return_value=present)
         locator.first = locator
         return locator
 
