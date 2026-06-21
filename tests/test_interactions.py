@@ -366,7 +366,7 @@ class TestScrollDown:
 
         await scroll_down(page)
         # Stall guard breaks after MAX_STALLED_STEPS (3) iterations, well
-        # under the hard cap of 40.
+        # under the hard cap of 200.
         assert page.mouse.wheel.await_count <= 4
 
 
