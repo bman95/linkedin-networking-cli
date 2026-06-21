@@ -1671,9 +1671,11 @@ class TestNavigationGuardWiring:
         mock_linkedin_automation._find_connect_control = find
 
         calls = {"n": 0}
-        # The recovered page the watchdog rebinds to; the second iteration must
-        # run on THIS page, proving the skip leaves a live page behind.
-        fresh_page = mock_linkedin_automation.page
+        # A DISTINCT sentinel page (not the one already on self.page) so the
+        # final assertion truly proves the recover rebind happened, rather than
+        # passing trivially because both sides reference the same starting page.
+        fresh_page = MagicMock(name="recovered_page")
+        assert fresh_page is not mock_linkedin_automation.page
         seen_pages = []
 
         async def _run_bounded(awaitable, **kwargs):
@@ -1809,6 +1811,59 @@ class TestNavigationGuardWiring:
             )
 
         refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_crash_with_failing_refresh_does_not_abort_run(
+        self, mock_linkedin_automation
+    ):
+        """A failed crash-refresh + backoff must not abort the whole run.
+
+        Regression guard: _refresh_context nulls self.page before relaunching,
+        so a *failing* refresh leaves self.page = None. The post-failure backoff
+        sleep must therefore not be a page operation (else AttributeError on None
+        escapes the handler and kills the run). Drive 4 crash-shaped failures so
+        the >=3 backoff branch runs, with a refresh that always fails.
+        """
+        from playwright.async_api import Error as PWError
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "CrashNoAbort"})
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+
+        async def _run_bounded(awaitable, **kwargs):
+            awaitable.close()
+            raise PWError("Page crashed")
+
+        async def _failing_refresh():
+            # Mirror _refresh_context's contract: it nulls self.page, then the
+            # relaunch fails — leaving self.page None.
+            mock_linkedin_automation.page = None
+            raise RuntimeError("relaunch failed")
+
+        with patch.object(
+            mock_linkedin_automation, "_refresh_context",
+            new=AsyncMock(side_effect=_failing_refresh),
+        ), patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch(
+            "automation.linkedin.asyncio.sleep", new=AsyncMock()
+        ):
+            # Must complete (not raise AttributeError out of the loop).
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(4)
+            )
+
+        # All four were attempted and counted as failures; the run survived.
+        assert result["failed"] == 4
 
 
 # ============================================================================

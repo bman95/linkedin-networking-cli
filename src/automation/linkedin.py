@@ -1343,7 +1343,12 @@ class LinkedInAutomation:
                             f"⚠️ {consecutive_failures} consecutive failures — "
                             f"backing off {wait_seconds}s"
                         )
-                    await self.page.wait_for_timeout(wait_seconds * 1000)
+                    # A wall-clock pause, not a page operation — use asyncio so
+                    # it never depends on a live page. A crash-shaped failure
+                    # above may have left self.page None (a failed refresh), and
+                    # the old page-based sleep would then throw AttributeError
+                    # out of this handler and abort the whole run.
+                    await asyncio.sleep(wait_seconds)
                 continue
             finally:
                 # Give back a reserved slot that wasn't consumed by a confirmed
