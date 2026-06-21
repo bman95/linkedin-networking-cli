@@ -404,12 +404,14 @@ class LinkedInAutomation:
     async def close_browser(self):
         """Close browser and cleanup.
 
-        The ``storage_state`` snapshot is best-effort: on a *crashed/closed*
-        context (the exact situation ``_refresh_context`` calls this to recover
-        from) it throws, and an unguarded throw here would skip ``context.close``
-        / ``browser.close`` / ``playwright.stop`` and orphan the Playwright node
-        driver. Guarding it keeps the teardown total so a crash-recovery refresh
-        never leaks a driver subprocess.
+        Every step is independently best-effort. ``_refresh_context`` calls this
+        specifically against *crashed/half-closed* objects, where the snapshot,
+        ``context.close``, ``browser.close`` or ``playwright.stop`` can each
+        throw. An unguarded throw on any of them would skip the *later* steps and
+        orphan the still-running Chrome/Playwright node driver, so a repeated
+        crash-recovery refresh would leak a process per crash. Guarding each step
+        keeps the teardown total — every handle gets a close attempt, and
+        ``stop`` (which frees the driver subprocess) always runs.
         """
         if self.context:
             # Save session state (best-effort — a dead context can't snapshot).
@@ -419,11 +421,20 @@ class LinkedInAutomation:
                 )
             except Exception as exc:
                 logger.debug("Could not save storage_state on close: %s", exc)
-            await self.context.close()
+            try:
+                await self.context.close()
+            except Exception as exc:
+                logger.debug("Could not close context: %s", exc)
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception as exc:
+                logger.debug("Could not close browser: %s", exc)
         if self.playwright:
-            await self.playwright.stop()
+            try:
+                await self.playwright.stop()
+            except Exception as exc:
+                logger.debug("Could not stop playwright: %s", exc)
 
     async def login(self, progress_callback: Optional[Callable] = None) -> bool:
         """Login to LinkedIn with enhanced session detection"""
@@ -1067,14 +1078,66 @@ class LinkedInAutomation:
                     break
                 slot_reserved = True
 
-                # Click Connect. The top-card control is already in view at
-                # scroll-top, so a natural mouse move reaches it and the SDUI
-                # opens the invitation modal (a JS click is a last resort for
-                # the rare case the control is still occluded).
-                logger.info("Clicking 'Connect' button")
-                await self._throttle_action()
-                await move_to_and_click(self.page, connect_button)
-                await random_wait(self.page, min_ms=2500, max_ms=4000)
+                # Click Connect and wait for the invitation modal — under the
+                # SAME per-item watchdog as the read unit. ``move_to_and_click``,
+                # ``query_selector`` and the modal-polling ``locator.count()``
+                # loop are all untimeouted page operations a wedged renderer can
+                # hang forever (a crashed renderer defeats even ``count()``); the
+                # ``click`` has its own 5s timeout but the surrounding reads do
+                # not. Bounding the click+poll here means a wedge after the page
+                # loaded (e.g. right after clicking Connect, or while waiting for
+                # the modal) caps the item, refreshes, and the outer
+                # ``except asyncio.TimeoutError`` skips this profile and releases
+                # its reserved slot — instead of wedging the rest of the run.
+                async def _click_connect_and_await_modal():
+                    # The top-card control is already in view at scroll-top, so a
+                    # natural mouse move reaches it and the SDUI opens the
+                    # invitation modal (a JS click is a last resort for the rare
+                    # case the control is still occluded).
+                    logger.info("Clicking 'Connect' button")
+                    await self._throttle_action()
+                    await move_to_and_click(self.page, connect_button)
+                    await random_wait(self.page, min_ms=2500, max_ms=4000)
+
+                    email_present = (
+                        await self.page.query_selector('label[for="email"]')
+                        is not None
+                    )
+                    if email_present:
+                        return "email_required", False, False
+
+                    note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
+                    send_no_note_loc = self.page.locator(
+                        sel.INVITE_SEND_NO_NOTE.css
+                    ).first
+                    send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
+                    blocked_inner = False
+                    modal_ready_inner = False
+                    for _ in range(8):
+                        # LinkedIn blocks re-inviting for 3 weeks after a
+                        # withdrawal; clicking Connect then shows an error toast
+                        # and no modal.
+                        if await self._invitation_blocked_toast():
+                            blocked_inner = True
+                            break
+                        if (
+                            await note_loc.count()
+                            or await send_no_note_loc.count()
+                            or await send_exact_loc.count()
+                        ):
+                            modal_ready_inner = True
+                            break
+                        await self.page.wait_for_timeout(1000)
+                    return "modal_check", blocked_inner, modal_ready_inner
+
+                modal_outcome, blocked, modal_ready = await run_bounded(
+                    _click_connect_and_await_modal(),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"invite:{profile.name}",
+                )
 
                 # Check if email is required to connect (dismiss and skip). The
                 # ``email`` field is the modal's fingerprint; the dismiss control
@@ -1085,7 +1148,11 @@ class LinkedInAutomation:
                 # surf_benign_interstitials' email-modal dismiss is a cross-
                 # navigation backstop for a stray leftover. They intentionally
                 # share the selector — don't dedupe one away.
-                email_label = await self.page.query_selector('label[for="email"]')
+                email_label = (
+                    await self.page.query_selector('label[for="email"]')
+                    if modal_outcome == "email_required"
+                    else None
+                )
                 if email_label:
                     logger.info(
                         f"Email request modal detected for {profile.name}. Dismissing..."
@@ -1111,33 +1178,11 @@ class LinkedInAutomation:
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
 
-                # The invitation modal renders a moment after the click and is
-                # not a standard <dialog>, so locate its buttons by text and
-                # poll until they appear. ":text-is" matches the exact label so
-                # "Enviar" never collides with "Enviar sin nota" / "Enviar mensaje".
-                note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
-                send_no_note_loc = self.page.locator(
-                    sel.INVITE_SEND_NO_NOTE.css
-                ).first
-                send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
-
-                blocked = False
-                modal_ready = False
-                for _ in range(8):
-                    # LinkedIn blocks re-inviting for 3 weeks after a withdrawal;
-                    # clicking Connect then shows an error toast and no modal.
-                    if await self._invitation_blocked_toast():
-                        blocked = True
-                        break
-                    if (
-                        await note_loc.count()
-                        or await send_no_note_loc.count()
-                        or await send_exact_loc.count()
-                    ):
-                        modal_ready = True
-                        break
-                    await self.page.wait_for_timeout(1000)
-
+                # ``blocked`` / ``modal_ready`` were computed inside the bounded
+                # click+poll unit above. The invitation modal is not a standard
+                # <dialog>, so its buttons were located by text and polled until
+                # they appeared (":text-is" matches the exact label so "Enviar"
+                # never collides with "Enviar sin nota" / "Enviar mensaje").
                 if blocked:
                     logger.info(
                         f"Invitation to {profile.name} blocked (recently withdrawn / cooldown)"

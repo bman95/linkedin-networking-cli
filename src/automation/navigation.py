@@ -617,6 +617,15 @@ async def navigate_guarded(
         hard_timeout_margin_s=hard_timeout_margin_s,
     )
 
+    # Outer watchdog for the post-goto steps. The goto has its own inner
+    # asyncio.wait_for; settle/surf/guard each issue *untimeouted* page reads
+    # (surf's locator.count()/query_selector, the guard's URL/overlay reads) that
+    # a wedged renderer can hang forever. Bounding them here means a crash that
+    # *hangs* (not just one that raises) during the post-goto phase is converted
+    # to a crash-shaped error and recovered, instead of deadlocking a caller
+    # (e.g. search_profiles) that is not itself wrapped in run_bounded.
+    post_goto_hard_s = settle_timeout_ms / 1000 + hard_timeout_margin_s
+
     async def _navigate_once(target_page):
         """goto -> settle -> surf -> guard on ``target_page``.
 
@@ -630,16 +639,28 @@ async def navigate_guarded(
         lets them propagate unchanged — recovery never swallows a real wall.
         """
         await _goto_with_retry(target_page, url, **retry_kwargs)
-        await _settle(target_page, settle_timeout_ms)
-        if surf:
-            await surf_benign_interstitials(target_page, context=context)
-        await _guard_landing(
-            target_page,
-            url,
-            strict_path=strict_path,
-            check_path=check_path,
-            context=context,
-        )
+
+        async def _post_goto():
+            await _settle(target_page, settle_timeout_ms)
+            if surf:
+                await surf_benign_interstitials(target_page, context=context)
+            await _guard_landing(
+                target_page,
+                url,
+                strict_path=strict_path,
+                check_path=check_path,
+                context=context,
+            )
+
+        try:
+            await asyncio.wait_for(_post_goto(), timeout=post_goto_hard_s)
+        except asyncio.TimeoutError as exc:
+            # A wedged renderer hung the post-goto reads. Surface it crash-shaped
+            # so the outer recovery refreshes the context and retries.
+            raise PlaywrightError(
+                f"Post-navigation page work for {url!r} hung past "
+                f"{post_goto_hard_s:.0f}s — renderer unresponsive"
+            ) from exc
 
     try:
         await _navigate_once(page)

@@ -1773,6 +1773,84 @@ class TestNavigationGuardWiring:
         assert mock_linkedin_automation.page is fresh_page
 
     @pytest.mark.asyncio
+    async def test_close_browser_stops_playwright_even_if_context_close_raises(
+        self, mock_linkedin_automation
+    ):
+        """A throwing context.close() must not skip browser.close()/playwright.stop().
+
+        On a crash-recovery refresh close_browser runs against half-closed
+        objects; an unguarded throw on any step would leak the still-running
+        Chrome/Playwright driver. Every step must get its own attempt.
+        """
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock(side_effect=RuntimeError("dead context"))
+        ctx.close = AsyncMock(side_effect=RuntimeError("close failed"))
+        browser = AsyncMock()
+        playwright = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = browser
+        mock_linkedin_automation.playwright = playwright
+
+        # Must not raise despite storage_state AND context.close throwing.
+        await mock_linkedin_automation.close_browser()
+
+        # browser.close and (critically) playwright.stop still ran — the driver
+        # subprocess is freed.
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_invite_flow_runs_under_run_bounded(self, mock_linkedin_automation):
+        """The connect-click + modal-poll page work is bounded by run_bounded too.
+
+        The read unit and the invite unit are BOTH wrapped, so a wedge after the
+        page loaded (clicking Connect / waiting for the modal) is bounded, not
+        just the navigation/read.
+        """
+        from automation.linkedin import LinkedInProfile
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "InviteBounded"})
+        # A real Connect control so the flow reaches the invite unit.
+        connect_btn = AsyncMock()
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(connect_btn, "connect")
+        )
+
+        labels_seen = []
+
+        async def _passthrough(awaitable, **kwargs):
+            labels_seen.append(kwargs.get("label", ""))
+            return await awaitable
+
+        with patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)
+        ) as bounded, patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_and_click", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.random_wait", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation, "_invitation_blocked_toast",
+            new=AsyncMock(return_value=False),
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                [LinkedInProfile(name="P", profile_url="https://x/in/p/")],
+            )
+
+        # run_bounded was used for BOTH the profile read and the invite flow.
+        assert any(lbl.startswith("profile:") for lbl in labels_seen)
+        assert any(lbl.startswith("invite:") for lbl in labels_seen)
+        bounded.assert_awaited()
+
+    @pytest.mark.asyncio
     async def test_dom_captcha_in_read_unit_stops_run(self, mock_linkedin_automation):
         """A DOM-level CAPTCHA detected inside the bounded read unit stops the run.
 

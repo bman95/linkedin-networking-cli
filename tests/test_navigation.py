@@ -856,6 +856,35 @@ class TestCrashRecovery:
         assert result is fresh
 
     @pytest.mark.asyncio
+    async def test_post_goto_hang_is_bounded_and_recovered(self):
+        """A renderer that HANGS (not raises) during settle/surf/guard recovers.
+
+        navigate_guarded bounds the whole post-goto sequence with its own outer
+        watchdog, so a wedge there is converted to a crash-shaped error and
+        refreshed+retried — search_profiles (not wrapped in run_bounded) can't
+        deadlock on it.
+        """
+        crashed = _quiet_page("https://www.linkedin.com/in/jane/")
+        fresh = _quiet_page("https://www.linkedin.com/in/jane/")
+        recover = AsyncMock(return_value=fresh)
+
+        async def _settle(page, _ms):
+            if page is crashed:
+                await asyncio.sleep(30)  # wedge: never returns within the budget
+
+        with patch("automation.navigation._settle", new=_settle):
+            result = await nav.navigate_guarded(
+                crashed,
+                "https://www.linkedin.com/in/jane/",
+                check_path=False,
+                settle_timeout_ms=0,
+                hard_timeout_margin_s=1,     # post-goto budget ~1s
+                recover=recover,
+            )
+        recover.assert_awaited_once()
+        assert result is fresh
+
+    @pytest.mark.asyncio
     async def test_typed_landing_exception_is_not_recovered(self):
         """A challenge bounce is NOT crash-shaped, so it propagates (no refresh)."""
         page = _quiet_page("https://www.linkedin.com/feed/")
