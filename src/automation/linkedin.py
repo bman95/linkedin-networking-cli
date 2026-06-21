@@ -49,6 +49,7 @@ from automation.navigation import (
     verify_listing_rendered,
     landed_on_challenge,
     landed_on_checkpoint,
+    run_bounded,
 )
 from automation import selectors as sel
 from utils.logging import get_logger
@@ -151,6 +152,68 @@ class LinkedInAutomation:
             min_s=auto["action_delay_min"],
             max_s=auto["action_delay_max"],
         )
+
+    async def _refresh_context(self) -> Page:
+        """Close and reopen the browser context, keeping the persistent profile.
+
+        Recovery primitive for the resilient-navigation layer (issue #17): when
+        a renderer crashes or a per-item watchdog fires, the wedged context is
+        torn down and a fresh one launched so one crash does not cascade across
+        the rest of the worklist. Login state survives because the persistent
+        Chrome profile on disk (and the ``session.json`` ``close_browser``
+        writes for the transient path) carries the cookies — ``start_browser``
+        re-reads them, so the refreshed context resumes the same session.
+
+        The teardown is bounded by an ``asyncio`` watchdog: on a frozen,
+        memory-thrashing renderer an individual ``close`` can hang, which would
+        otherwise wedge the very refresh meant to recover from it. On timeout (or
+        any close error) the partial handles are dropped and ``start_browser``
+        relaunches from a clean slate.
+
+        Returns the fresh ``Page``.
+        """
+        logger.warning("Refreshing browser context to recover from a wedged renderer")
+        nav = self.settings.get_navigation_settings()
+        close_budget = nav["hard_timeout_margin_s"]
+        try:
+            await asyncio.wait_for(self.close_browser(), timeout=close_budget)
+        except Exception as exc:
+            logger.warning("Error closing context during refresh: %s", exc)
+        finally:
+            # Drop any partial handles so start_browser launches from scratch
+            # rather than reusing a half-dead context.
+            self.context = None
+            self.browser = None
+            self.page = None
+            self.playwright = None
+
+        await self.start_browser()
+        return self.page
+
+    async def _recover(self) -> Page:
+        """The ``recover`` callback handed to the navigation helpers.
+
+        Thin wrapper around :meth:`_refresh_context` so the navigation layer
+        stays page-agnostic (it receives a zero-arg async callable returning the
+        fresh page) without importing the automation engine.
+        """
+        return await self._refresh_context()
+
+    def _nav_kwargs(self) -> Dict[str, Any]:
+        """Resilient-navigation kwargs shared by every ``navigate_guarded`` call.
+
+        Bundles the env-tuned retry/watchdog tunables plus the crash-recovery
+        callback so each call site stays a single readable statement and the two
+        navigations cannot drift apart in how they retry/recover.
+        """
+        nav = self.settings.get_navigation_settings()
+        return {
+            "timeout": nav["goto_timeout_ms"],
+            "max_retries": nav["max_retries"],
+            "retry_backoff_base_s": nav["retry_backoff_base_s"],
+            "hard_timeout_margin_s": nav["hard_timeout_margin_s"],
+            "recover": self._recover,
+        }
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -613,17 +676,21 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback("Starting profile search...")
 
-            # Guarded navigation: goto -> settle -> landing guard. A bounce to a
+            # Guarded navigation: resilient goto (transient-error retry +
+            # renderer-crash watchdog + one crash-recovery refresh) -> settle ->
+            # surf benign interstitials -> landing guard. A bounce to a
             # challenge/login wall or a wrong path raises a typed exception with
             # an evidence bundle; ``strict_path`` asserts we are still on the
             # people-search results path even when LinkedIn rewrites the rest of
-            # the URL. The humanized scroll below still runs after this returns.
-            await navigate_guarded(
+            # the URL. navigate_guarded returns the page it finished on (a fresh
+            # one if a crash was recovered), so rebind self.page. The humanized
+            # scroll below still runs after this returns.
+            self.page = await navigate_guarded(
                 self.page,
                 search_url,
                 strict_path="/search/results/people",
-                timeout=30000,
                 context={"campaign": campaign.name},
+                **self._nav_kwargs(),
             )
             # Disambiguate "empty" from "not rendered yet": race the readiness
             # selector against the explicit no-results marker and, if neither
@@ -874,18 +941,34 @@ class LinkedInAutomation:
                     continue
 
                 # Navigate to profile (throttled by the per-minute action cap).
-                # Guarded: goto -> settle -> landing guard. A bounce to a
+                # Guarded + resilient: transient-error retry + renderer-crash
+                # watchdog + one crash-recovery refresh, then goto -> settle ->
+                # surf benign interstitials -> landing guard. A bounce to a
                 # challenge/login wall raises a typed exception (caught below);
                 # path-diff is OFF because LinkedIn canonicalizes vanity profile
                 # URLs (a normal redirect, not a wrong landing). The challenge
                 # detection and overlay sweep still run.
+                #
+                # The whole per-profile navigation runs under run_bounded: a
+                # crashed renderer defeats even untimeouted page calls, so the
+                # interaction watchdog caps the unit, refreshes the browser, and
+                # re-raises TimeoutError so this profile is skipped (caught
+                # below) without wedging the rest of the worklist. On a recovered
+                # crash navigate_guarded returns a fresh page — rebind self.page.
                 await self._throttle_action()
-                await navigate_guarded(
-                    self.page,
-                    profile.profile_url,
-                    check_path=False,
-                    timeout=30000,
-                    context={"profile_url": profile.profile_url},
+                self.page = await run_bounded(
+                    navigate_guarded(
+                        self.page,
+                        profile.profile_url,
+                        check_path=False,
+                        context={"profile_url": profile.profile_url},
+                        **self._nav_kwargs(),
+                    ),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"profile:{profile.name}",
                 )
 
                 # Stop early if LinkedIn challenges us — pushing through a
@@ -973,20 +1056,18 @@ class LinkedInAutomation:
                 await move_to_and_click(self.page, connect_button)
                 await random_wait(self.page, min_ms=2500, max_ms=4000)
 
-                # Check if email is required to connect (dismiss and skip)
+                # Check if email is required to connect (dismiss and skip). The
+                # ``email`` field is the modal's fingerprint; the dismiss control
+                # comes from the selector registry (EMAIL_REQUIRED_DISMISS) so the
+                # ES/EN aria-label variants live in one maintained place.
                 email_label = await self.page.query_selector('label[for="email"]')
                 if email_label:
                     logger.info(
                         f"Email request modal detected for {profile.name}. Dismissing..."
                     )
-                    for dismiss_sel in (
-                        'button[aria-label="Descartar"]',
-                        'button[aria-label="Dismiss"]',
-                    ):
-                        dismiss_btn = await self.page.query_selector(dismiss_sel)
-                        if dismiss_btn:
-                            await dismiss_btn.click()
-                            break
+                    dismiss_btn = await sel.EMAIL_REQUIRED_DISMISS.locate(self.page)
+                    if dismiss_btn:
+                        await dismiss_btn.click()
 
                     contact_data = {
                         "campaign_id": campaign.id,
@@ -1184,6 +1265,22 @@ class LinkedInAutomation:
                         "to protect the account"
                     )
                 break
+            except asyncio.TimeoutError:
+                # The interaction watchdog fired: a wedged renderer exceeded the
+                # per-item budget. run_bounded already refreshed the browser
+                # (self.page rebound via the recover callback), so skip just this
+                # profile and keep processing the rest of the worklist.
+                logger.warning(
+                    "Per-profile interaction watchdog fired for %s; "
+                    "skipping after browser refresh",
+                    profile.name,
+                )
+                failed_count += 1
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Timed out on {profile.name} — refreshed browser and skipped"
+                    )
+                continue
             except Exception as e:
                 logger.error(f"Failed to process {profile.name}: {str(e)}")
                 failed_count += 1

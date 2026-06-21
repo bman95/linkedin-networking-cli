@@ -253,6 +253,38 @@ BLOCKING_OVERLAY = Selector(
     primary_count=2,
 )
 
+# --- Benign dismissible interstitials (issue #17) ---
+# Surfed *automatically* before/after a navigation because they are safe to
+# click away: unlike a CAPTCHA or a security checkpoint (which hard-stop via the
+# landing guard), these are decoy overlays that merely eat the next click.
+#
+# The guest cookie-consent banner. LinkedIn serves it from a guest/SDUI surface
+# on a fresh profile; ``action-type='ACCEPT'`` carries the accept control.
+# ``OneTrust`` is the legacy consent widget. The EN/ES "Accept"/"Aceptar"
+# aria-label variants are co-equal locale primaries — dismissing via accept
+# clears the banner without changing the session's logged-in state.
+COOKIE_BANNER_DISMISS = Selector(
+    "cookie_banner_dismiss",
+    [
+        "button[action-type='ACCEPT']",
+        "#onetrust-accept-btn-handler",
+        "button[aria-label='Accept cookies']",
+        "button[aria-label='Aceptar cookies']",
+    ],
+    primary_count=2,
+)
+# The "email required to connect" modal's dismiss control. When LinkedIn demands
+# an email to send an invitation, the modal is closed (the invitation is skipped
+# upstream); the EN/ES ``aria-label`` variants are co-equal locale primaries.
+EMAIL_REQUIRED_DISMISS = Selector(
+    "email_required_dismiss",
+    [
+        "button[aria-label='Dismiss']",
+        "button[aria-label='Descartar']",
+    ],
+    primary_count=2,
+)
+
 # --- Search readiness / result cards ---
 # Legacy UI exposes ``.search-results-container``; the SDUI rollout (2026) only
 # renders profile links inside <main>.

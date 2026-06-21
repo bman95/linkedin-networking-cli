@@ -585,6 +585,52 @@ class TestAutomationSettings:
         assert auto_settings[key] == default_value
 
 
+@pytest.mark.unit
+class TestNavigationSettings:
+    """Resilient-navigation tunables (issue #17)."""
+
+    _ENV_VARS = (
+        "NAV_GOTO_TIMEOUT_MS",
+        "NAV_MAX_RETRIES",
+        "NAV_RETRY_BACKOFF_BASE_S",
+        "NAV_HARD_TIMEOUT_MARGIN_S",
+        "NAV_INTERACTION_WATCHDOG_S",
+    )
+
+    def test_defaults(self, monkeypatch):
+        for var in self._ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        nav = AppSettings().get_navigation_settings()
+        assert nav["goto_timeout_ms"] == 30000
+        assert nav["max_retries"] == 2
+        assert nav["retry_backoff_base_s"] == 3
+        assert nav["hard_timeout_margin_s"] == 15
+        assert nav["interaction_watchdog_s"] == 240
+
+    def test_custom_values(self, monkeypatch):
+        monkeypatch.setenv("NAV_GOTO_TIMEOUT_MS", "45000")
+        monkeypatch.setenv("NAV_MAX_RETRIES", "4")
+        monkeypatch.setenv("NAV_RETRY_BACKOFF_BASE_S", "5")
+        monkeypatch.setenv("NAV_HARD_TIMEOUT_MARGIN_S", "20")
+        monkeypatch.setenv("NAV_INTERACTION_WATCHDOG_S", "120")
+        nav = AppSettings().get_navigation_settings()
+        assert nav["goto_timeout_ms"] == 45000
+        assert nav["max_retries"] == 4
+        assert nav["retry_backoff_base_s"] == 5
+        assert nav["hard_timeout_margin_s"] == 20
+        assert nav["interaction_watchdog_s"] == 120
+
+    def test_types_are_ints(self, app_settings):
+        nav = app_settings.get_navigation_settings()
+        for value in nav.values():
+            assert isinstance(value, int)
+
+    def test_zero_retries_allowed(self, monkeypatch):
+        """max_retries=0 means a single attempt with no retry (a valid config)."""
+        monkeypatch.setenv("NAV_MAX_RETRIES", "0")
+        assert AppSettings().get_navigation_settings()["max_retries"] == 0
+
+
 # ============================================================================
 # Path Tests
 # ============================================================================

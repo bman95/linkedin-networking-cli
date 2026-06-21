@@ -1,12 +1,20 @@
-"""Tests for the navigation landing guard (issue #16).
+"""Tests for the navigation landing guard (issue #16) and the resilience layer
+around it (issue #17).
 
 Cover the pure URL helpers (path/param diff, challenge detection), the
 ``navigate_guarded`` gate (clean landing, challenge/login bounce, param reset,
 ignored LinkedIn-added params, strict_path miss, overlay sweep + evidence
 capture), the DOM-backed login confirmation, and the empty-vs-not-rendered
 listing disambiguation (reload-once).
+
+The #17 layer adds: transient ``net::ERR_*`` goto retry with backoff and a
+bounded count, the renderer-crash watchdog (outer ``asyncio.wait_for`` so a
+wedged renderer can't deadlock the goto), crash-shaped error detection + one
+context-refresh recovery, the benign-interstitial surf (cookie banner / email
+modal only — never CAPTCHA), and the per-item ``run_bounded`` watchdog.
 """
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from playwright.async_api import Error as PWError
 from playwright.async_api import TimeoutError as PWTimeoutError
 
 from automation import navigation as nav
@@ -606,3 +615,321 @@ class TestVerifyListingRendered:
                 )
         fail_loud.assert_awaited_once()
         page.reload.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Issue #17 — resilience layer
+# ---------------------------------------------------------------------------
+
+
+def _quiet_page(url="https://www.linkedin.com/search/results/people/"):
+    """A guard-friendly page that also surfs cleanly (no interstitials present).
+
+    Extends ``_page`` so the benign-interstitial surf finds nothing: every
+    ``query_selector`` returns ``None`` and the overlay count is 0, so the
+    landing guard and surf are both no-ops and the test can focus on the
+    retry/crash behaviour.
+    """
+    page = _page(url)
+    page.query_selector = AsyncMock(return_value=None)
+    return page
+
+
+@pytest.mark.unit
+class TestIsCrashError:
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "Page crashed",
+            "Target page, context or browser has been closed",
+            "Navigation hung past 45s — renderer unresponsive",
+            "TARGET CLOSED",  # case-insensitive
+        ],
+    )
+    def test_crash_shaped_messages(self, msg):
+        assert nav._is_crash_error(Exception(msg)) is True
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            "net::ERR_NAME_NOT_RESOLVED",
+            "Timeout 30000ms exceeded",
+            "some unrelated failure",
+        ],
+    )
+    def test_non_crash_messages(self, msg):
+        assert nav._is_crash_error(Exception(msg)) is False
+
+
+@pytest.mark.unit
+class TestGotoRetry:
+    @pytest.mark.asyncio
+    async def test_transient_net_error_retried_then_succeeds(self):
+        """A net::ERR_* goto is retried (with backoff) and then lands cleanly."""
+        page = _quiet_page()
+        calls = {"n": 0}
+
+        async def _goto(target, *_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PWError("net::ERR_NAME_NOT_RESOLVED at " + target)
+            page.url = target
+
+        page.goto = AsyncMock(side_effect=_goto)
+
+        with patch("automation.navigation.asyncio.sleep", new=AsyncMock()) as slept:
+            await nav.navigate_guarded(
+                page,
+                "https://www.linkedin.com/search/results/people/",
+                strict_path="/search/results/people",
+                settle_timeout_ms=0,
+                max_retries=2,
+                retry_backoff_base_s=3,
+            )
+        assert calls["n"] == 2
+        # First retry backs off base*(0+1) = 3s.
+        slept.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
+    async def test_transient_net_error_gives_up_after_bounded_count(self):
+        """After max_retries+1 transient failures the error propagates."""
+        page = _quiet_page()
+        page.goto = AsyncMock(side_effect=PWError("net::ERR_CONNECTION_CLOSED"))
+
+        with patch("automation.navigation.asyncio.sleep", new=AsyncMock()) as slept:
+            with pytest.raises(PWError):
+                await nav.navigate_guarded(
+                    page,
+                    "https://www.linkedin.com/feed/",
+                    check_path=False,
+                    settle_timeout_ms=0,
+                    max_retries=2,
+                )
+        # 1 initial + 2 retries = 3 attempts; 2 backoff sleeps between them.
+        assert page.goto.await_count == 3
+        assert slept.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_transient_playwright_error_not_retried(self):
+        """A non-``net::ERR_*`` Playwright error is raised on the first attempt."""
+        page = _quiet_page()
+        # A clearly non-net error: no retry, no recovery.
+        page.goto = AsyncMock(side_effect=PWError("Unsupported scheme"))
+        with patch("automation.navigation.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(PWError):
+                await nav.navigate_guarded(
+                    page,
+                    "ftp://nope",
+                    check_path=False,
+                    settle_timeout_ms=0,
+                    max_retries=2,
+                )
+        page.goto.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_goto_hang_becomes_crash_shaped_error(self):
+        """The outer watchdog converts a deadlocked goto into a crash error.
+
+        A renderer crash detaches the CDP session goto's own timer is bound to,
+        so the driver timeout never fires. Modeled here as the outer
+        ``asyncio.wait_for`` raising ``asyncio.TimeoutError``; the helper must
+        re-raise it as a crash-shaped (``unresponsive``) ``PlaywrightError`` so
+        recovery — not transient-retry — engages.
+        """
+        page = _quiet_page()
+        # No recover callback: the crash-shaped error must propagate.
+        with patch(
+            "automation.navigation.asyncio.wait_for",
+            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+        ):
+            with pytest.raises(PWError) as excinfo:
+                await nav.navigate_guarded(
+                    page,
+                    "https://www.linkedin.com/feed/",
+                    check_path=False,
+                    settle_timeout_ms=0,
+                )
+        assert nav._is_crash_error(excinfo.value)
+        assert "unresponsive" in str(excinfo.value)
+
+
+@pytest.mark.unit
+class TestCrashRecovery:
+    @pytest.mark.asyncio
+    async def test_crash_triggers_recover_and_one_retry(self):
+        """A crash-shaped goto failure refreshes the context and retries once."""
+        crashed = _quiet_page("https://www.linkedin.com/feed/")
+        crashed.goto = AsyncMock(side_effect=PWError("Page crashed"))
+
+        fresh = _quiet_page("https://www.linkedin.com/in/jane/")
+
+        async def _fresh_goto(target, *_a, **_k):
+            fresh.url = target
+
+        fresh.goto = AsyncMock(side_effect=_fresh_goto)
+        recover = AsyncMock(return_value=fresh)
+
+        result = await nav.navigate_guarded(
+            crashed,
+            "https://www.linkedin.com/in/jane/",
+            check_path=False,
+            settle_timeout_ms=0,
+            recover=recover,
+        )
+        recover.assert_awaited_once()
+        # The retry ran on the FRESH page, and that page is returned for rebind.
+        fresh.goto.assert_awaited_once()
+        assert result is fresh
+
+    @pytest.mark.asyncio
+    async def test_second_crash_after_refresh_propagates(self):
+        """If the fresh page also crashes, the error propagates (no infinite loop)."""
+        crashed = _quiet_page("https://www.linkedin.com/feed/")
+        crashed.goto = AsyncMock(side_effect=PWError("Page crashed"))
+        still_dead = _quiet_page()
+        still_dead.goto = AsyncMock(side_effect=PWError("Target closed"))
+        recover = AsyncMock(return_value=still_dead)
+
+        with pytest.raises(PWError):
+            await nav.navigate_guarded(
+                crashed,
+                "https://www.linkedin.com/feed/",
+                check_path=False,
+                settle_timeout_ms=0,
+                recover=recover,
+            )
+        recover.assert_awaited_once()  # only ONE refresh attempt
+
+    @pytest.mark.asyncio
+    async def test_transient_error_does_not_trigger_recover(self):
+        """A plain net error is handled by retry, never by a context refresh."""
+        page = _quiet_page()
+        page.goto = AsyncMock(side_effect=PWError("net::ERR_NAME_NOT_RESOLVED"))
+        recover = AsyncMock()
+        with patch("automation.navigation.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(PWError):
+                await nav.navigate_guarded(
+                    page,
+                    "https://www.linkedin.com/feed/",
+                    check_path=False,
+                    settle_timeout_ms=0,
+                    max_retries=1,
+                    recover=recover,
+                )
+        recover.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestSurfBenignInterstitials:
+    @pytest.mark.asyncio
+    async def test_dismisses_cookie_banner(self):
+        page = _page()
+        cookie_anchor = sel.COOKIE_BANNER_DISMISS.anchor
+        btn = AsyncMock()
+
+        async def _qs(candidate):
+            return btn if candidate == cookie_anchor else None
+
+        page.query_selector = AsyncMock(side_effect=_qs)
+        dismissed = await nav.surf_benign_interstitials(page)
+        assert dismissed is True
+        btn.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dismisses_email_required_modal(self):
+        page = _page()
+        email_anchor = sel.EMAIL_REQUIRED_DISMISS.anchor
+        btn = AsyncMock()
+
+        async def _qs(candidate):
+            return btn if candidate == email_anchor else None
+
+        page.query_selector = AsyncMock(side_effect=_qs)
+        dismissed = await nav.surf_benign_interstitials(page)
+        assert dismissed is True
+        btn.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_surf_returns_false(self):
+        page = _page()
+        page.query_selector = AsyncMock(return_value=None)
+        assert await nav.surf_benign_interstitials(page) is False
+
+    @pytest.mark.asyncio
+    async def test_click_failure_is_non_fatal(self):
+        page = _page()
+        btn = AsyncMock()
+        btn.click = AsyncMock(side_effect=RuntimeError("detached"))
+        page.query_selector = AsyncMock(return_value=btn)
+        # Must not raise even though every dismiss click fails.
+        assert await nav.surf_benign_interstitials(page) is False
+
+    @pytest.mark.asyncio
+    async def test_surf_runs_during_navigate_guarded(self):
+        """navigate_guarded surfs after settle and before the landing guard."""
+        page = _quiet_page()
+        with patch(
+            "automation.navigation.surf_benign_interstitials", new=AsyncMock()
+        ) as surf:
+            await nav.navigate_guarded(
+                page,
+                "https://www.linkedin.com/search/results/people/",
+                strict_path="/search/results/people",
+                settle_timeout_ms=0,
+            )
+        surf.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_surf_can_be_disabled(self):
+        page = _quiet_page()
+        with patch(
+            "automation.navigation.surf_benign_interstitials", new=AsyncMock()
+        ) as surf:
+            await nav.navigate_guarded(
+                page,
+                "https://www.linkedin.com/search/results/people/",
+                strict_path="/search/results/people",
+                settle_timeout_ms=0,
+                surf=False,
+            )
+        surf.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestRunBounded:
+    @pytest.mark.asyncio
+    async def test_returns_result_within_budget(self):
+        async def _work():
+            return "done"
+
+        result = await nav.run_bounded(_work(), timeout_s=5)
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_timeout_refreshes_and_reraises(self):
+        async def _wedged():
+            await asyncio.sleep(10)
+
+        recover = AsyncMock()
+        with pytest.raises(asyncio.TimeoutError):
+            await nav.run_bounded(_wedged(), timeout_s=0.01, recover=recover)
+        recover.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_recover_still_reraises(self):
+        async def _wedged():
+            await asyncio.sleep(10)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await nav.run_bounded(_wedged(), timeout_s=0.01)
+
+    @pytest.mark.asyncio
+    async def test_recover_failure_does_not_mask_timeout(self):
+        async def _wedged():
+            await asyncio.sleep(10)
+
+        recover = AsyncMock(side_effect=RuntimeError("relaunch failed"))
+        # The TimeoutError (the real failure) must still surface, not the
+        # refresh's own error.
+        with pytest.raises(asyncio.TimeoutError):
+            await nav.run_bounded(_wedged(), timeout_s=0.01, recover=recover)
