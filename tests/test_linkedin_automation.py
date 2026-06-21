@@ -1671,16 +1671,30 @@ class TestNavigationGuardWiring:
         mock_linkedin_automation._find_connect_control = find
 
         calls = {"n": 0}
+        # The recovered page the watchdog rebinds to; the second iteration must
+        # run on THIS page, proving the skip leaves a live page behind.
+        fresh_page = mock_linkedin_automation.page
+        seen_pages = []
 
         async def _run_bounded(awaitable, **kwargs):
             calls["n"] += 1
             # Close the un-awaited coroutine so it doesn't leak a warning.
             awaitable.close()
+            seen_pages.append(mock_linkedin_automation.page)
             if calls["n"] == 1:
-                raise asyncio.TimeoutError()  # first profile wedges
+                # Mirror run_bounded's contract: refresh (rebinds self.page),
+                # then re-raise so the caller skips the item.
+                await kwargs["recover"]()
+                raise asyncio.TimeoutError()
             return mock_linkedin_automation.page
 
-        with patch(
+        async def _recover():
+            mock_linkedin_automation.page = fresh_page
+            return fresh_page
+
+        with patch.object(
+            mock_linkedin_automation, "_recover", new=_recover
+        ), patch(
             "automation.linkedin.navigate_guarded",
             new=AsyncMock(side_effect=lambda page, *a, **k: page),
         ), patch(
@@ -1699,6 +1713,9 @@ class TestNavigationGuardWiring:
         assert calls["n"] == 2
         assert result["failed"] >= 1
         assert any("Timed out" in m for m in messages)
+        # The second iteration ran on the recover-returned page (the watchdog's
+        # whole purpose: leave a live page for the rest of the worklist).
+        assert seen_pages[1] is fresh_page
 
     @pytest.mark.asyncio
     async def test_recover_refreshes_context_and_rebinds_page(
@@ -1722,6 +1739,76 @@ class TestNavigationGuardWiring:
         start.assert_awaited_once()
         assert returned is fresh_page
         assert mock_linkedin_automation.page is fresh_page
+
+    @pytest.mark.asyncio
+    async def test_refresh_context_survives_a_failing_close(
+        self, mock_linkedin_automation
+    ):
+        """A close that throws/hangs must not wedge the refresh meant to recover.
+
+        The bounded close drops the partial handles and start_browser relaunches
+        from a clean slate — the load-bearing 'the refresh can't itself wedge'
+        guarantee.
+        """
+        fresh_page = MagicMock()
+
+        async def _fake_start():
+            mock_linkedin_automation.page = fresh_page
+
+        with patch.object(
+            mock_linkedin_automation, "close_browser",
+            new=AsyncMock(side_effect=RuntimeError("context already crashed")),
+        ) as close, patch.object(
+            mock_linkedin_automation, "start_browser",
+            new=AsyncMock(side_effect=_fake_start),
+        ) as start:
+            returned = await mock_linkedin_automation._refresh_context()
+
+        close.assert_awaited_once()
+        start.assert_awaited_once()
+        # Partial handles were dropped before the relaunch.
+        assert returned is fresh_page
+        assert mock_linkedin_automation.page is fresh_page
+
+    @pytest.mark.asyncio
+    async def test_crash_shaped_failure_in_loop_refreshes_once(
+        self, mock_linkedin_automation
+    ):
+        """A crash that *raises* (not hangs) past the watchdog refreshes once.
+
+        run_bounded only catches a hang; a renderer that crashes by raising
+        surfaces in the generic except. Without a refresh self.page stays dead
+        and every later profile fails on it — so the handler must recover once.
+        """
+        from playwright.async_api import Error as PWError
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "CrashRaise"})
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+
+        async def _run_bounded(awaitable, **kwargs):
+            awaitable.close()
+            raise PWError("Page crashed")
+
+        with patch.object(
+            mock_linkedin_automation, "_refresh_context", new=AsyncMock()
+        ) as refresh, patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(1)
+            )
+
+        refresh.assert_awaited_once()
 
 
 # ============================================================================

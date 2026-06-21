@@ -752,6 +752,30 @@ class TestGotoRetry:
         assert nav._is_crash_error(excinfo.value)
         assert "unresponsive" in str(excinfo.value)
 
+    @pytest.mark.asyncio
+    async def test_driver_goto_timeout_propagates_plain_not_crash(self):
+        """A driver PlaywrightTimeoutError (slow page) is NOT crash-shaped.
+
+        It must propagate unchanged so the caller treats it as an ordinary
+        navigation timeout — never folded into the wedge path that would force a
+        full browser refresh on every slow load.
+        """
+        page = _quiet_page()
+        page.goto = AsyncMock(side_effect=PWTimeoutError("Timeout 30000ms exceeded"))
+        recover = AsyncMock()
+        with pytest.raises(PWTimeoutError) as excinfo:
+            await nav.navigate_guarded(
+                page,
+                "https://www.linkedin.com/feed/",
+                check_path=False,
+                settle_timeout_ms=0,
+                recover=recover,
+            )
+        # The error stays a plain timeout (not re-wrapped "unresponsive") and no
+        # context refresh is triggered.
+        assert not nav._is_crash_error(excinfo.value)
+        recover.assert_not_awaited()
+
 
 @pytest.mark.unit
 class TestCrashRecovery:
@@ -933,3 +957,24 @@ class TestRunBounded:
         # refresh's own error.
         with pytest.raises(asyncio.TimeoutError):
             await nav.run_bounded(_wedged(), timeout_s=0.01, recover=recover)
+
+    @pytest.mark.asyncio
+    async def test_slow_but_within_budget_warns(self, caplog):
+        """A unit that runs past half the budget (but finishes) is flagged slow.
+
+        Real clock with wide margins (sleep 60ms vs a 1s budget — half is 500ms):
+        the sleep comfortably exceeds half the budget yet stays far under it, so
+        the slow-warning branch fires without a tight real-clock race. Patching
+        ``time.monotonic`` is avoided here because ``asyncio.wait_for`` reads the
+        same stdlib clock and would consume the stub.
+        """
+        import logging
+
+        async def _slowish():
+            await asyncio.sleep(0.06)
+            return "ok"
+
+        with caplog.at_level(logging.WARNING, logger="automation.navigation"):
+            result = await nav.run_bounded(_slowish(), timeout_s=0.1, label="probe")
+        assert result == "ok"
+        assert any("Slow probe" in r.message for r in caplog.records)

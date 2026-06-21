@@ -410,7 +410,7 @@ async def _goto_with_retry(
 ) -> None:
     """``page.goto`` that retries transient net errors and can't hang forever.
 
-    Two distinct failure modes are handled here:
+    Three distinct failure modes, kept distinct on purpose:
 
     - **Transient network error** (``net::ERR_NAME_NOT_RESOLVED`` /
       ``ERR_CONNECTION_CLOSED`` …): a flaky resolver/connection on a cold start
@@ -420,9 +420,16 @@ async def _goto_with_retry(
     - **Wedged renderer**: a renderer that crashes *mid-navigation* detaches the
       CDP session ``page.goto``'s own timer is bound to, so the driver timeout
       never fires and the call deadlocks forever. The ``goto`` is wrapped in an
-      outer ``asyncio.wait_for`` (goto timeout + ``hard_timeout_margin_s``); on
-      fire it is re-raised as a crash-shaped ``PlaywrightError`` so the caller's
-      crash recovery — not the transient-retry path — engages.
+      outer ``asyncio.wait_for`` (goto timeout + ``hard_timeout_margin_s``);
+      *only* that outer fire is re-raised as a crash-shaped ``PlaywrightError``,
+      so the caller's heavyweight crash recovery (context refresh) engages for a
+      genuine wedge and nothing else.
+    - **Slow-but-alive page** (the driver's own ``PlaywrightTimeoutError`` from
+      ``goto``): the page is reachable, just slow — *not* a crash. It propagates
+      unchanged so the caller treats it as an ordinary navigation timeout rather
+      than tearing down and relaunching the whole browser. Folding it into the
+      crash path (as a naive single ``except`` would) would force a full Chrome
+      relaunch on every slow load, which is both wasteful and wrong.
     """
     hard = timeout / 1000 + hard_timeout_margin_s
     goto_kwargs = {"timeout": timeout}
@@ -433,15 +440,20 @@ async def _goto_with_retry(
         try:
             await asyncio.wait_for(page.goto(url, **goto_kwargs), timeout=hard)
             return
-        except (PlaywrightTimeoutError, asyncio.TimeoutError) as exc:
-            # The outer watchdog (or a driver timeout that still resolved as a
-            # Playwright timeout) fired: the renderer is wedged. Surface it as a
-            # crash so the caller refreshes the browser instead of retrying on a
-            # dead page.
+        except asyncio.TimeoutError as exc:
+            # ONLY the outer watchdog firing means the renderer is wedged: the
+            # driver timeout never resolved, so the goto deadlocked. Surface it
+            # as a crash so the caller refreshes the browser instead of retrying
+            # on a dead page. A driver-side PlaywrightTimeoutError (slow page) is
+            # deliberately NOT caught here — it falls through to propagate plain.
             raise PlaywrightError(
                 f"Navigation to {url!r} hung past {hard:.0f}s — "
                 "renderer unresponsive"
             ) from exc
+        except PlaywrightTimeoutError:
+            # The page is reachable but slow — a normal navigation timeout, not a
+            # crash. Propagate unchanged; do not trigger a context refresh.
+            raise
         except PlaywrightError as exc:
             if "net::ERR_" not in str(exc) or attempt == max_retries:
                 raise

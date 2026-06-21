@@ -50,6 +50,7 @@ from automation.navigation import (
     landed_on_challenge,
     landed_on_checkpoint,
     run_bounded,
+    _is_crash_error,
 )
 from automation import selectors as sel
 from utils.logging import get_logger
@@ -401,10 +402,23 @@ class LinkedInAutomation:
             logger.info("Created new page for browser context")
 
     async def close_browser(self):
-        """Close browser and cleanup"""
+        """Close browser and cleanup.
+
+        The ``storage_state`` snapshot is best-effort: on a *crashed/closed*
+        context (the exact situation ``_refresh_context`` calls this to recover
+        from) it throws, and an unguarded throw here would skip ``context.close``
+        / ``browser.close`` / ``playwright.stop`` and orphan the Playwright node
+        driver. Guarding it keeps the teardown total so a crash-recovery refresh
+        never leaks a driver subprocess.
+        """
         if self.context:
-            # Save session state
-            await self.context.storage_state(path=str(self.settings.session_path))
+            # Save session state (best-effort — a dead context can't snapshot).
+            try:
+                await self.context.storage_state(
+                    path=str(self.settings.session_path)
+                )
+            except Exception as exc:
+                logger.debug("Could not save storage_state on close: %s", exc)
             await self.context.close()
         if self.browser:
             await self.browser.close()
@@ -1059,7 +1073,12 @@ class LinkedInAutomation:
                 # Check if email is required to connect (dismiss and skip). The
                 # ``email`` field is the modal's fingerprint; the dismiss control
                 # comes from the selector registry (EMAIL_REQUIRED_DISMISS) so the
-                # ES/EN aria-label variants live in one maintained place.
+                # ES/EN aria-label variants live in one maintained place. This is
+                # the *in-flow* handler that runs right after the Connect click
+                # (when the modal actually appears and we must record the skip);
+                # surf_benign_interstitials' email-modal dismiss is a cross-
+                # navigation backstop for a stray leftover. They intentionally
+                # share the selector — don't dedupe one away.
                 email_label = await self.page.query_selector('label[for="email"]')
                 if email_label:
                     logger.info(
@@ -1285,6 +1304,26 @@ class LinkedInAutomation:
                 logger.error(f"Failed to process {profile.name}: {str(e)}")
                 failed_count += 1
                 consecutive_failures += 1
+
+                # A renderer that crashes by *raising* (rather than hanging)
+                # escapes the run_bounded watchdog and surfaces here. Without a
+                # refresh self.page stays dead and every later profile fails on
+                # it until the backoff. Detect the crash shape and refresh once
+                # so the rest of the worklist runs on a live page. Best-effort:
+                # a failed refresh must not mask the original failure handling.
+                if _is_crash_error(e):
+                    logger.warning(
+                        "Crash-shaped failure for %s — refreshing browser before "
+                        "continuing",
+                        profile.name,
+                    )
+                    try:
+                        await self._refresh_context()
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "Browser refresh after crash-shaped failure failed: %s",
+                            refresh_exc,
+                        )
 
                 # Exponential backoff after repeated failures: a burst of
                 # errors often means LinkedIn has started throttling or
