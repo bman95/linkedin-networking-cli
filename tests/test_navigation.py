@@ -906,6 +906,30 @@ class TestCrashRecovery:
         recover.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_recover_failure_preserves_original_crash(self):
+        """If recover() itself fails, the ORIGINAL crash error propagates.
+
+        A recover error chained over the crash would make the caller misclassify
+        a page crash as a browser-startup/teardown failure, so the original
+        renderer-crash is re-raised as the real cause.
+        """
+        crashed = _quiet_page("https://www.linkedin.com/feed/")
+        crashed.goto = AsyncMock(side_effect=PWError("Page crashed"))
+        recover = AsyncMock(side_effect=RuntimeError("relaunch failed"))
+
+        with pytest.raises(PWError) as excinfo:
+            await nav.navigate_guarded(
+                crashed,
+                "https://www.linkedin.com/feed/",
+                check_path=False,
+                settle_timeout_ms=0,
+                recover=recover,
+            )
+        recover.assert_awaited_once()
+        # The original crash, not the relaunch failure.
+        assert "crashed" in str(excinfo.value).lower()
+
+    @pytest.mark.asyncio
     async def test_transient_error_does_not_trigger_recover(self):
         """A plain net error is handled by retry, never by a context refresh."""
         page = _quiet_page()

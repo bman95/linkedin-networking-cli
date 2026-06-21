@@ -1746,29 +1746,33 @@ class TestNavigationGuardWiring:
     async def test_refresh_context_survives_a_failing_close(
         self, mock_linkedin_automation
     ):
-        """A close that throws/hangs must not wedge the refresh meant to recover.
+        """A close whose underlying steps throw must not wedge the refresh.
 
-        The bounded close drops the partial handles and start_browser relaunches
-        from a clean slate — the load-bearing 'the refresh can't itself wedge'
-        guarantee.
+        close_browser is per-step bounded and never raises, so _refresh_context
+        drops the partial handles and start_browser relaunches from a clean slate
+        even when the crashed context/browser closes throw — the load-bearing
+        'the refresh can't itself wedge' guarantee.
         """
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock(side_effect=RuntimeError("dead context"))
+        ctx.close = AsyncMock(side_effect=RuntimeError("close failed"))
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = AsyncMock()
+        mock_linkedin_automation.playwright = AsyncMock()
+
         fresh_page = MagicMock()
 
         async def _fake_start():
             mock_linkedin_automation.page = fresh_page
 
         with patch.object(
-            mock_linkedin_automation, "close_browser",
-            new=AsyncMock(side_effect=RuntimeError("context already crashed")),
-        ) as close, patch.object(
             mock_linkedin_automation, "start_browser",
             new=AsyncMock(side_effect=_fake_start),
         ) as start:
             returned = await mock_linkedin_automation._refresh_context()
 
-        close.assert_awaited_once()
         start.assert_awaited_once()
-        # Partial handles were dropped before the relaunch.
+        # Handles were dropped before the relaunch and the fresh page is returned.
         assert returned is fresh_page
         assert mock_linkedin_automation.page is fresh_page
 
@@ -1797,6 +1801,38 @@ class TestNavigationGuardWiring:
         # browser.close and (critically) playwright.stop still ran — the driver
         # subprocess is freed.
         browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_browser_bounds_a_hanging_step_and_still_stops(
+        self, mock_linkedin_automation
+    ):
+        """A HUNG context.close() is bounded so playwright.stop() still runs.
+
+        On a wedged renderer a close can hang (not just throw); the per-step
+        watchdog must cap it so the later steps — especially the stop() that
+        frees the driver — are not starved.
+        """
+        import asyncio
+
+        async def _hang():
+            await asyncio.sleep(60)
+
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock()
+        ctx.close = AsyncMock(side_effect=_hang)
+        browser = AsyncMock()
+        playwright = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = browser
+        mock_linkedin_automation.playwright = playwright
+
+        # Shrink the per-step budget so the test is fast.
+        with patch.object(
+            type(mock_linkedin_automation), "_CLOSE_STEP_TIMEOUT_S", 0.01
+        ):
+            await mock_linkedin_automation.close_browser()
+
         playwright.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
