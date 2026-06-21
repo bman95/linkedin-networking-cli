@@ -2341,6 +2341,22 @@ class TestSearchAndConnect:
         assert deferred == [p0.profile_url, p1.profile_url]
         assert result["sent"] == 2
 
+    @pytest.mark.asyncio
+    async def test_unexpected_card_pass_error_propagates(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """An unexpected card-pass error propagates so the CLI surfaces a failure,
+        rather than being swallowed into a partial 'success' result."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+        # Card extraction blows up unexpectedly (e.g. selector drift in the walk).
+        auto._extract_profile_cards = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await auto.search_and_connect(campaign, limit=10)
+
 
 @pytest.mark.unit
 class TestParseCardProfile:

@@ -1217,18 +1217,10 @@ class LinkedInAutomation:
                     "the account"
                 )
             raise
-        except Exception as e:
-            logger.error("Search-and-connect failed: %s", e)
-            if progress_callback:
-                progress_callback(f"Search-and-connect failed: {e}")
-            self.db_manager.update_campaign_stats(campaign.id)
-            return {
-                "sent": card_sent,
-                "failed": card_failed,
-                "existing": card_existing,
-                "total_processed": card_sent + card_failed + card_existing,
-                "scanned": len(profiles),
-            }
+        # No catch-all here: an unexpected error in the card pass or the
+        # profile-page pass must propagate to the CLI's failure handler. Swallowing
+        # it into a partial-counter return would let run_automation stamp a failed
+        # run as ``status="success"`` (e.g. "0 processed") instead of surfacing it.
 
     def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
         """Warn (advisory only) when a prior run sent within the configured
@@ -2227,36 +2219,41 @@ class LinkedInAutomation:
         instead of across the whole profile page. Because one card is exactly one
         person, there is no name to disambiguate against and no top-card vs.
         sticky-header y-preference to resolve — the first visible Connect/Pending
-        control in the card is THE control. The card is already rendered when we
-        enumerate it, so there is no polling loop either.
+        control in the card is THE control.
+
+        SDUI action buttons can hydrate a beat after the card shell renders, so —
+        like :meth:`_find_connect_control` — re-query and poll a few times before
+        giving up. Without it a slow render would classify a connectable card as
+        'none' and needlessly defer it to the profile-page path (the very extra
+        navigation the card flow exists to avoid).
 
         Returns ``(handle, kind)`` where kind is 'connect', 'pending' or 'none'.
-
-        NOT wired into any flow yet — this is foundation for issue #25 (connect
-        directly from a search-result card); PR 2 wires it into the card flow.
         """
-        controls = await card.query_selector_all(sel.CONNECT_CONTROL.css)
-
         async def match(keywords):
+            # Re-query each poll: the action controls may not be in the DOM yet on
+            # the first pass. A handle can also detach between enumeration and
+            # read; skip it, mirroring the profile-page sibling.
+            controls = await card.query_selector_all(sel.CONNECT_CONTROL.css)
             for ctrl in controls:
                 try:
                     if not await ctrl.is_visible():
                         continue
                     aria = self._normalize(await ctrl.get_attribute("aria-label"))
                 except Exception:
-                    # A handle can detach between enumeration and read; skip it,
-                    # mirroring the profile-page sibling _find_connect_control.
                     continue
                 if any(k in aria for k in keywords):
                     return ctrl
             return None
 
-        connect = await match(("conectar", "connect"))
-        if connect:
-            return connect, "connect"
-        pending = await match(("pendiente", "pending"))
-        if pending:
-            return pending, "pending"
+        for attempt in range(3):
+            connect = await match(("conectar", "connect"))
+            if connect:
+                return connect, "connect"
+            pending = await match(("pendiente", "pending"))
+            if pending:
+                return pending, "pending"
+            if attempt < 2:
+                await self.page.wait_for_timeout(500)
         return None, "none"
 
     async def _invitation_blocked_toast(self) -> bool:
