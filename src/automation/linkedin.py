@@ -468,12 +468,18 @@ class LinkedInAutomation:
                     "Stored session challenged on feed probe "
                     f"({current_url!r}); manual verification required"
                 )
-                await capture_error_context(
-                    self.page,
-                    "login_feed_probe_challenge",
-                    exc=challenge_exc,
-                    context={"landed_url": current_url},
-                )
+                try:
+                    challenge_exc.evidence = await capture_error_context(
+                        self.page,
+                        "login_feed_probe_challenge",
+                        exc=challenge_exc,
+                        context={"landed_url": current_url},
+                    )
+                except Exception as capture_exc:  # pragma: no cover - defensive
+                    logger.error(
+                        "Evidence capture failed for login_feed_probe_challenge: %s",
+                        capture_exc,
+                    )
                 raise challenge_exc
 
             # DOM-backed "already logged in?" check: not on a login wall AND the
@@ -758,11 +764,25 @@ class LinkedInAutomation:
                         timeout=10000,
                     )
                 except TimeoutError:
-                    raise SelectorNotFoundException(
+                    selector_exc = SelectorNotFoundException(
                         "Profile elements not found on search results page",
                         selector=sel.SEARCH_RESULT_CARDS.css,
                         timeout=10000
                     )
+                    try:
+                        selector_exc.evidence = await capture_error_context(
+                            self.page,
+                            "search_results_selector_missing",
+                            exc=selector_exc,
+                            context={"selector": sel.SEARCH_RESULT_CARDS.css},
+                        )
+                    except Exception as capture_exc:  # pragma: no cover - defensive
+                        logger.error(
+                            "Evidence capture failed for "
+                            "search_results_selector_missing: %s",
+                            capture_exc,
+                        )
+                    raise selector_exc
 
                 # Record the landed search page into the rolling ring buffer so
                 # a later failure can be traced back through how we got here.

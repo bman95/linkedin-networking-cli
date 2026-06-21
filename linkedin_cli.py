@@ -7,6 +7,7 @@ from InquirerPy.separator import Separator
 from rich.align import Align
 from rich.box import ROUNDED
 from rich.console import Console, Group
+from rich.markup import escape as _rich_escape
 from rich.panel import Panel
 from rich.text import Text
 from collections import namedtuple
@@ -15,6 +16,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 import asyncio
 import csv
+import os
 import sys
 
 # LinkedIn brand blue, used across the welcome banner
@@ -68,6 +70,15 @@ from database.operations import DatabaseManager
 from database.models import Campaign
 from config.settings import AppSettings
 from automation.linkedin import LinkedInAutomation
+from automation.diagnostics import _artifacts_dir
+from exceptions import (
+    LinkedInAutomationError,
+    CaptchaDetectedException,
+    RateLimitExceededException,
+    NotAuthenticatedException,
+    SelectorNotFoundException,
+    UnexpectedLandingException,
+)
 from automation.linkedin_mappings import (
     get_location_display_names,
     get_location_urn,
@@ -105,6 +116,100 @@ class LinkedInCLI:
         if isinstance(campaign, dict):
             return campaign.get(attr, default)
         return getattr(campaign, attr, default)
+
+    @staticmethod
+    def _format_evidence_reference(exc=None):
+        """Describe where the saved diagnostics evidence lives, for the user.
+
+        The lower automation layers capture an evidence bundle (screenshot +
+        DOM snapshot) before raising and attach it to the exception as
+        ``exc.evidence`` (the dict from ``capture_error_context``). When those
+        concrete artifact paths are available we point straight at them;
+        otherwise we fall back to the deterministic artifacts directory so the
+        message still tells the user where to look.
+        """
+        evidence = getattr(exc, "evidence", None) if exc is not None else None
+        if isinstance(evidence, dict):
+            paths = [p for p in (evidence.get("screenshot"), evidence.get("dom")) if p]
+            if paths:
+                if len(paths) == 1:
+                    return f"Evidence saved to {paths[0]}"
+                joined = "\n  - ".join(paths)
+                return f"Evidence saved to:\n  - {joined}"
+        # No concrete bundle on the exception: point at the artifacts directory.
+        try:
+            artifacts_dir = _artifacts_dir()
+        except Exception:
+            # Mirror _artifacts_dir's own resolution (env override first) so the
+            # double-fault fallback still honors LINKEDIN_CLI_ARTIFACTS_DIR.
+            override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
+            artifacts_dir = (
+                Path(override)
+                if override
+                else Path.home() / ".linkedin-networking-cli" / "artifacts"
+            )
+        return f"Evidence (screenshot/DOM) saved under {artifacts_dir}"
+
+    def _report_automation_failure(self, exc, action_label):
+        """Map an automation failure to a distinct, user-friendly stop message.
+
+        Catches the typed automation exceptions by type, each with its own
+        actionable message plus a pointer to the saved evidence, and falls back
+        to a generic message (still referencing evidence) for anything else.
+        Prints the message and returns; the caller then hard-stops the run with
+        no interactive waiting and no traceback shown to the user.
+        """
+        # Keep the full traceback in the file logs for postmortem, but off the
+        # user's console: the console handler is at WARNING, so logging this at
+        # INFO preserves it in linkedin_cli.log without dumping a traceback to
+        # the terminal (the user only sees the friendly message below).
+        logger.info(
+            "Automation stopped during %s: %s", action_label, exc, exc_info=True
+        )
+        evidence_ref = self._format_evidence_reference(exc)
+
+        if isinstance(exc, CaptchaDetectedException):
+            headline = (
+                "LinkedIn is showing a security checkpoint or CAPTCHA — stopped. "
+                "Complete the verification in a normal browser, then try again."
+            )
+        elif isinstance(exc, RateLimitExceededException):
+            headline = (
+                "LinkedIn rate limit reached — stopped. Wait before sending more "
+                "invitations (limits reset over the following hours/days)."
+            )
+        elif isinstance(exc, NotAuthenticatedException):
+            headline = (
+                "LinkedIn session is no longer authenticated — stopped. "
+                "Log in again to refresh the session, then retry."
+            )
+        elif isinstance(exc, UnexpectedLandingException):
+            headline = (
+                "Navigation landed on an unexpected page — stopped. LinkedIn may "
+                "have changed its layout or redirected the request."
+            )
+        elif isinstance(exc, SelectorNotFoundException):
+            headline = (
+                "A required page element was not found — stopped. LinkedIn's page "
+                "structure may have changed, or the page failed to load."
+            )
+        elif isinstance(exc, LinkedInAutomationError):
+            # Escape the exception text: selector/URL detail can contain
+            # square brackets (e.g. a CSS attribute selector ``a[href]``), which
+            # Rich would otherwise parse as markup tags and silently drop.
+            headline = (
+                f"Automation stopped during {action_label}: {_rich_escape(str(exc))}"
+            )
+        else:
+            headline = (
+                f"Unexpected error during {action_label} — stopped: "
+                f"{_rich_escape(str(exc))}"
+            )
+
+        # The fixed headlines above carry no dynamic content, but evidence_ref
+        # holds filesystem paths that may contain brackets, so escape it too.
+        self.console.print(f"[red]{headline}[/red]")
+        self.console.print(f"[yellow]{_rich_escape(evidence_ref)}[/yellow]")
 
     def _welcome_badge(self):
         """Rounded blue 'in' badge with the small 'LinkedIn' label beside it."""
@@ -898,22 +1003,27 @@ class LinkedInCLI:
                     return results
 
             try:
-                automation_result = asyncio.run(run_automation())
-            except RuntimeError as runtime_error:
-                if "asyncio.run()" in str(runtime_error):
+                try:
+                    automation_result = asyncio.run(run_automation())
+                except RuntimeError as runtime_error:
+                    # Only the "asyncio.run() cannot be called from a running
+                    # event loop" case is a benign re-run; any other RuntimeError
+                    # (and any typed automation failure raised inside the fresh
+                    # loop) falls through to the handlers below.
+                    if "asyncio.run()" not in str(runtime_error):
+                        raise
                     loop = asyncio.new_event_loop()
                     try:
                         asyncio.set_event_loop(loop)
                         automation_result = loop.run_until_complete(run_automation())
                     finally:
                         loop.close()
-                else:
-                    self.console.print(f"[red]Automation failed: {runtime_error}[/red]")
-                    inquirer.confirm(message="Press Enter to continue...").execute()
-                    return
             except Exception as automation_error:
-                self.console.print(f"[red]Automation failed: {automation_error}[/red]")
-                inquirer.confirm(message="Press Enter to continue...").execute()
+                # Hard-stop with evidence: distinct message per typed exception,
+                # generic fallback otherwise. No interactive wait, no traceback.
+                self._report_automation_failure(
+                    automation_error, "campaign execution"
+                )
                 return
 
             status = automation_result.get("status") if automation_result else None
@@ -1172,7 +1282,9 @@ class LinkedInCLI:
         try:
             return asyncio.run(run_lookup())
         except Exception as e:
-            self.console.print(f"[red]❌ Location search failed: {e}[/red]")
+            # Hard-stop with evidence: distinct message per typed exception.
+            # Returns [] so the caller renders "no results" without hanging.
+            self._report_automation_failure(e, "location search")
             return []
 
     def _search_location_online(self):
@@ -1337,7 +1449,10 @@ class LinkedInCLI:
                     self.console.print("[red]Connection checker failed. Please try again.[/red]")
 
             except Exception as e:
-                self.console.print(f"[red]Checker failed: {e}[/red]")
+                # Hard-stop with evidence: distinct message per typed exception,
+                # generic fallback otherwise. No interactive wait, no traceback.
+                self._report_automation_failure(e, "connection check")
+                return
 
         except Exception as e:
             self.console.print(f"[red]Error loading campaigns: {e}[/red]")
@@ -1501,7 +1616,10 @@ class LinkedInCLI:
                 self.console.print("[red]Profile extraction failed. Please try again.[/red]")
 
         except Exception as e:
-            self.console.print(f"[red]Extraction failed: {e}[/red]")
+            # Hard-stop with evidence: distinct message per typed exception,
+            # generic fallback otherwise. No interactive wait, no traceback.
+            self._report_automation_failure(e, "profile extraction")
+            return
 
         inquirer.confirm(message="Press Enter to continue...").execute()
 

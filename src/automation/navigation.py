@@ -321,7 +321,9 @@ async def _raise_challenge(page, requested_url, landed_url, kind, context):
     if context:
         bundle_context.update(context)
     try:
-        await capture_error_context(page, step, exc=exc, context=bundle_context)
+        exc.evidence = await capture_error_context(
+            page, step, exc=exc, context=bundle_context
+        )
     except Exception as capture_exc:  # pragma: no cover - defensive backstop
         logger.error("Evidence capture failed for %s: %s", step, capture_exc)
     raise exc
@@ -390,7 +392,7 @@ async def _raise_mismatch(page, exc, context):
     if context:
         bundle_context.update(context)
     try:
-        await capture_error_context(
+        exc.evidence = await capture_error_context(
             page, "navigation_wrong_landing", exc=exc, context=bundle_context
         )
     except Exception as capture_exc:  # pragma: no cover - defensive backstop

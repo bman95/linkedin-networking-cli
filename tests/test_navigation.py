@@ -277,15 +277,20 @@ class TestNavigateGuarded:
 
         page.goto = AsyncMock(side_effect=_bounce)
 
+        bundle = {"screenshot": "/tmp/art/error_login.png", "dom": "/tmp/art/error_login.html"}
         with patch(
-            "automation.navigation.capture_error_context", new=AsyncMock()
+            "automation.navigation.capture_error_context",
+            new=AsyncMock(return_value=bundle),
         ) as cap:
-            with pytest.raises(NotAuthenticatedException):
+            with pytest.raises(NotAuthenticatedException) as excinfo:
                 await nav.navigate_guarded(
                     page, "https://www.linkedin.com/feed", settle_timeout_ms=0
                 )
         cap.assert_awaited_once()
         assert cap.await_args.args[1] == "navigation_login_wall"
+        # The captured bundle is threaded onto the exception so the CLI can
+        # point the user at the saved evidence artifact paths.
+        assert excinfo.value.evidence == bundle
 
     @pytest.mark.asyncio
     async def test_checkpoint_bounce_raises_captcha_with_evidence(self):
