@@ -493,38 +493,21 @@ class LinkedInAutomation:
                     )
                 raise challenge_exc
 
-            # DOM-backed "already logged in?" check: not on a login wall AND the
-            # logged-in nav landmark renders. The URL alone is not enough — a soft
-            # block served from a non-login URL would pass a URL-only check but
-            # renders no nav landmark. A /checkpoint in progress is skipped here:
-            # the landmark cannot render on a verification page, so it is handed
-            # straight to _wait_for_login_redirect below.
+            # "Already logged in?" — URL-only. The feed probe stayed on a non-wall
+            # URL, and an unauthenticated session is always redirected away from
+            # /feed to a /login or /authwall (caught as ``wall`` above), so
+            # remaining on the feed URL is itself proof of an active session. We
+            # deliberately do NOT require a logged-in nav DOM landmark here:
+            # LinkedIn's SDUI rewrites those class/data-test hooks, and the brittle
+            # landmark check was misreading valid persistent sessions as logged out
+            # and re-driving them through /login. (A /checkpoint in progress is a
+            # "challenge" wall, so it does not reach here — it is handed to
+            # _wait_for_login_redirect below.)
             if wall is None:
-                # Give the logged-in landmark a generous budget: a valid but slow
-                # feed can take longer than a couple of seconds to paint the nav,
-                # and a too-tight wait would misread it as logged out and re-drive
-                # a healthy session through /login (which can corrupt it). On a
-                # timeout, fall back to a direct count before concluding "not
-                # logged in" — the landmark may have rendered just past the wait.
-                landmark_present = False
-                try:
-                    await self.page.wait_for_selector(
-                        sel.GLOBAL_NAV_ME.css, timeout=20_000
-                    )
-                    landmark_present = True
-                except TimeoutError:
-                    try:
-                        landmark_present = await sel.GLOBAL_NAV_ME.count(self.page) > 0
-                    except Exception as count_error:
-                        logger.debug(
-                            "Logged-in landmark fallback count failed: %s",
-                            count_error,
-                        )
-                if landmark_present:
-                    self.is_authenticated = True
-                    if progress_callback:
-                        progress_callback("Session already active on LinkedIn!")
-                    return True
+                self.is_authenticated = True
+                if progress_callback:
+                    progress_callback("Session already active on LinkedIn!")
+                return True
 
             # We were redirected to login (or the feed never confirmed a session),
             # proceed with authentication.
