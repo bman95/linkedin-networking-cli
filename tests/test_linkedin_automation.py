@@ -271,6 +271,44 @@ class TestLogin:
         )
 
     @pytest.mark.asyncio
+    async def test_manual_login_preserves_typed_challenge(
+        self, mock_linkedin_automation
+    ):
+        """Manual login surfaces a challenge as its typed self, not a timeout.
+
+        The DOM-backed confirmation can now raise CaptchaDetectedException; the
+        manual-login branch must let it propagate (not wrap it into a generic
+        "manual login timed out" LoginFailedException) so the caller stops.
+        """
+        from unittest.mock import PropertyMock
+        from exceptions import CaptchaDetectedException
+        from config.settings import AppSettings
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        # Feed probe lands on /login (a wall) -> proceed to authenticate.
+        mock_page.url = "https://www.linkedin.com/login"
+
+        with patch.object(
+            AppSettings, "linkedin_email", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            AppSettings, "linkedin_password", new_callable=PropertyMock, return_value=""
+        ), patch.object(
+            mock_linkedin_automation.settings,
+            "get_browser_settings",
+            return_value={"headless": False},
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(side_effect=CaptchaDetectedException("wall")),
+        ):
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.login()
+
+    @pytest.mark.asyncio
     async def test_slow_feed_landmark_wait_confirms_session(
         self, mock_linkedin_automation
     ):

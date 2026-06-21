@@ -145,14 +145,19 @@ def diff_redirect(requested_url: str, landed_url: str) -> Optional[Tuple[str, st
 async def _settle(page, settle_timeout_ms: int) -> None:
     """Let the page settle after a navigation. Best-effort, never raises.
 
-    Prefers ``wait_for_load_state('domcontentloaded')`` (cheap, deterministic)
-    and falls back to a fixed timeout — the same fixed wait the bare navigations
-    used before — so a mocked or slow page still gets a settle beat.
+    Prefers ``wait_for_load_state('domcontentloaded')`` (cheap, deterministic):
+    when it resolves, the page has settled and we return immediately — no fixed
+    sleep is added to the hot path (``navigate_guarded`` wraps every search and
+    profile navigation, so an unconditional sleep would tax every visit). The
+    fixed ``wait_for_timeout`` is a true *fallback*, used only when the
+    load-state wait could not confirm the settle (timeout, or a mocked page) so
+    a slow page still gets a settle beat.
     """
     try:
         await page.wait_for_load_state("domcontentloaded", timeout=settle_timeout_ms)
+        return
     except Exception as exc:
-        logger.debug("settle load-state wait skipped: %s", exc)
+        logger.debug("settle load-state wait did not confirm; using fallback: %s", exc)
     try:
         await page.wait_for_timeout(settle_timeout_ms)
     except Exception as exc:

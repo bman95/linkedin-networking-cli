@@ -475,6 +475,16 @@ class LinkedInAutomation:
 
                 try:
                     await self._wait_for_login_redirect(timeout_ms=600_000)
+                except (
+                    CaptchaDetectedException,
+                    NotAuthenticatedException,
+                    UnexpectedLandingException,
+                ):
+                    # A challenge/login wall (or a soft block with no nav
+                    # landmark) is NOT an ordinary timeout: let the typed signal
+                    # propagate so the caller can stop to protect the account
+                    # rather than reading it as "manual login timed out".
+                    raise
                 except Exception as wait_error:
                     logger.error(f"Manual login timed out: {wait_error}")
                     if progress_callback:

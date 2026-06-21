@@ -325,6 +325,37 @@ class TestNavigateGuarded:
 
 
 @pytest.mark.unit
+class TestSettle:
+    @pytest.mark.asyncio
+    async def test_load_state_resolves_skips_fixed_sleep(self):
+        # When wait_for_load_state confirms the settle, no fixed sleep is added
+        # (the hot path must not tax every guarded navigation with 2s).
+        page = _page()
+        page.wait_for_load_state = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        await nav._settle(page, 2000)
+        page.wait_for_load_state.assert_awaited_once()
+        page.wait_for_timeout.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fallback_sleep_when_load_state_times_out(self):
+        # When the load-state wait cannot confirm (timeout / mocked page), the
+        # fixed wait is used as a fallback so a slow page still settles.
+        page = _page()
+        page.wait_for_load_state = AsyncMock(side_effect=PWTimeoutError("slow"))
+        page.wait_for_timeout = AsyncMock()
+        await nav._settle(page, 2000)
+        page.wait_for_timeout.assert_awaited_once_with(2000)
+
+    @pytest.mark.asyncio
+    async def test_never_raises(self):
+        page = _page()
+        page.wait_for_load_state = AsyncMock(side_effect=RuntimeError("x"))
+        page.wait_for_timeout = AsyncMock(side_effect=RuntimeError("y"))
+        await nav._settle(page, 2000)  # must not raise
+
+
+@pytest.mark.unit
 class TestSweepUnexpectedOverlay:
     @pytest.mark.asyncio
     async def test_no_overlay_returns_false(self):
