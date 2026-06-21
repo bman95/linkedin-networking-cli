@@ -942,6 +942,8 @@ class LinkedInAutomation:
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
+        from .interactions import detect_captcha
+
         automation_settings = self.settings.get_automation_settings()
         daily_limit = automation_settings["daily_connection_limit"]
 
@@ -953,6 +955,10 @@ class LinkedInAutomation:
         scan_done = False  # stop walking result pages
         stop_all = False  # also skip the profile-page fallback pass
 
+        # Inter-session cooldown notice (advisory; mirrors the profile path so a
+        # pure card-connect run isn't silently exempt from the warning).
+        self._emit_cooldown_notice(automation_settings, progress_callback)
+
         # New run boundary: clear per-run diagnostics state (see search_profiles).
         reset_diagnostics_run()
 
@@ -961,6 +967,19 @@ class LinkedInAutomation:
                 progress_callback("Searching and connecting from result cards...")
 
             async for _page in self._walk_search_pages(campaign, progress_callback):
+                # Inline CAPTCHA can render on the results page without a URL
+                # bounce (the landing guard only catches URL-level challenges).
+                # Mirror the profile path's per-navigation detect_captcha: stop the
+                # whole run rather than keep reading/clicking cards through it.
+                if await detect_captcha(self.page):
+                    logger.warning("CAPTCHA detected on search results; stopping")
+                    if progress_callback:
+                        progress_callback(
+                            "⚠️ CAPTCHA detected — stopping automation to protect "
+                            "the account"
+                        )
+                    stop_all = True
+                    break
                 # Card handles are valid only until the walk paginates, so act on
                 # every card on this page before letting the loop advance.
                 for profile, card in await self._extract_profile_cards():
@@ -1179,6 +1198,39 @@ class LinkedInAutomation:
                 "scanned": len(seen_urls),
             }
 
+    def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
+        """Warn (advisory only) when a prior run sent within the configured
+        inter-session cooldown window.
+
+        Shared by :meth:`send_connection_requests` and :meth:`search_and_connect`
+        so the card-first path surfaces the same notice the profile path does
+        (issue #25). Advisory only: it never blocks — it warns the user that a
+        recent run may warrant waiting before continuing.
+        """
+        cooldown_seconds = automation_settings.get("connection_cooldown", 0)
+        if cooldown_seconds <= 0:
+            return
+        last_action_at = self.db_manager.get_last_connection_at()
+        if last_action_at is None:
+            return
+        if last_action_at.tzinfo is None:
+            last_action_at = last_action_at.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_action_at).total_seconds()
+        if elapsed < cooldown_seconds:
+            remaining = int(cooldown_seconds - elapsed)
+            logger.warning(
+                "Inter-session cooldown active: last request %ds ago, "
+                "cooldown is %ds (%ds remaining)",
+                int(elapsed),
+                cooldown_seconds,
+                remaining,
+            )
+            if progress_callback:
+                progress_callback(
+                    f"⚠️ Cooldown active — last connection {int(elapsed)}s ago; "
+                    f"wait {remaining}s before the next run"
+                )
+
     async def send_connection_requests(
         self,
         campaign: Campaign,
@@ -1206,27 +1258,7 @@ class LinkedInAutomation:
 
         # Optional inter-session cooldown: if a previous run sent a request
         # within the configured window, warn the user before continuing.
-        cooldown_seconds = automation_settings.get("connection_cooldown", 0)
-        if cooldown_seconds > 0:
-            last_action_at = self.db_manager.get_last_connection_at()
-            if last_action_at is not None:
-                if last_action_at.tzinfo is None:
-                    last_action_at = last_action_at.replace(tzinfo=timezone.utc)
-                elapsed = (datetime.now(timezone.utc) - last_action_at).total_seconds()
-                if elapsed < cooldown_seconds:
-                    remaining = int(cooldown_seconds - elapsed)
-                    logger.warning(
-                        "Inter-session cooldown active: last request %ds ago, "
-                        "cooldown is %ds (%ds remaining)",
-                        int(elapsed),
-                        cooldown_seconds,
-                        remaining,
-                    )
-                    if progress_callback:
-                        progress_callback(
-                            f"⚠️ Cooldown active — last connection {int(elapsed)}s ago; "
-                            f"wait {remaining}s before the next run"
-                        )
+        self._emit_cooldown_notice(automation_settings, progress_callback)
 
         # Stop immediately if the persisted daily cap was already reached on a
         # prior run today.

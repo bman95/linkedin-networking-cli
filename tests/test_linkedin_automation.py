@@ -2091,15 +2091,21 @@ class TestSearchAndConnect:
             profile_url=f"https://www.linkedin.com/in/person{i}/",
         )
 
-    def _wire(self, automation, cards):
+    def _wire(self, automation, cards, monkeypatch):
         """Drive the card scan from canned data (one results page).
 
         ``cards`` is a list of ``(profile, kind)`` where kind is
         'connect'/'pending'/'none'. Replaces the page-walk with a one-page async
         generator and wires _extract_profile_cards / _find_card_connect_control to
         return the canned profiles/controls. Each card carries the intended
-        ``(button, kind)`` on ``_wanted`` so the lookup is deterministic.
+        ``(button, kind)`` on ``_wanted`` so the lookup is deterministic. Patches
+        detect_captcha to False so the results-page CAPTCHA guard (which would
+        otherwise fire against the truthy mock page) stays clear.
         """
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha", AsyncMock(return_value=False)
+        )
+
         pairs = []
         for profile, kind in cards:
             card = AsyncMock(name=f"card:{profile.name}")
@@ -2130,7 +2136,7 @@ class TestSearchAndConnect:
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         auto = mock_linkedin_automation
         campaign = auto.db_manager.create_campaign({"name": "Cards"})
-        pairs = self._wire(auto, [(self._profile(0), "connect")])
+        pairs = self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
 
         attempt = AsyncMock(return_value=ConnectResult("sent", total_today=1))
         auto._attempt_connect = attempt
@@ -2155,7 +2161,7 @@ class TestSearchAndConnect:
         auto = mock_linkedin_automation
         campaign = auto.db_manager.create_campaign({"name": "Cards"})
         profile = self._profile(0)
-        self._wire(auto, [(profile, "none")])
+        self._wire(auto, [(profile, "none")], monkeypatch)
 
         auto._attempt_connect = AsyncMock()  # never invoked for a none card
         fallback = AsyncMock(
@@ -2182,7 +2188,7 @@ class TestSearchAndConnect:
         db = auto.db_manager
         campaign = db.create_campaign({"name": "Cards"})
         profile = self._profile(0)
-        self._wire(auto, [(profile, "pending")])
+        self._wire(auto, [(profile, "pending")], monkeypatch)
 
         auto._attempt_connect = AsyncMock()
         auto.send_connection_requests = AsyncMock()
@@ -2221,6 +2227,7 @@ class TestSearchAndConnect:
         self._wire(
             auto,
             [(self._profile(0), "none"), (self._profile(1), "connect")],
+            monkeypatch,
         )
 
         auto._attempt_connect = AsyncMock(
@@ -2252,7 +2259,7 @@ class TestSearchAndConnect:
         today = date.today().isoformat()
         for _ in range(2):  # prior run already used the day's quota
             db.increment_daily_connection_count(today)
-        self._wire(auto, [(self._profile(0), "connect")])
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
 
         auto._attempt_connect = AsyncMock()
         auto.send_connection_requests = AsyncMock()
@@ -2263,6 +2270,36 @@ class TestSearchAndConnect:
         auto._attempt_connect.assert_not_called()
         auto.send_connection_requests.assert_not_called()
         assert db.get_daily_connection_count(today) == 2
+
+    @pytest.mark.asyncio
+    async def test_inline_captcha_on_results_stops_run(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """An inline CAPTCHA on the results page stops before reading any card."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+        # Override the _wire default: LinkedIn renders a verification widget
+        # inline on /search/results/people (no URL bounce for the guard to catch).
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha",
+            AsyncMock(return_value=True),
+        )
+        auto._attempt_connect = AsyncMock()
+        auto.send_connection_requests = AsyncMock()
+
+        messages = []
+        result = await auto.search_and_connect(
+            campaign, limit=10, progress_callback=messages.append
+        )
+
+        # Stopped to protect the account: no cards read, no fallback pass.
+        assert result["sent"] == 0
+        auto._extract_profile_cards.assert_not_called()
+        auto._attempt_connect.assert_not_called()
+        auto.send_connection_requests.assert_not_called()
+        assert any("captcha" in m.lower() for m in messages)
 
 
 @pytest.mark.unit
