@@ -150,6 +150,7 @@ class TestReportAutomationFailure:
 
     def test_does_not_raise_on_capture_or_format_failure(self, monkeypatch):
         # Defensive: a throwing _artifacts_dir must not break the stop path.
+        monkeypatch.delenv("LINKEDIN_CLI_ARTIFACTS_DIR", raising=False)
         monkeypatch.setattr(
             linkedin_cli, "_artifacts_dir", lambda: (_ for _ in ()).throw(OSError())
         )
@@ -160,6 +161,54 @@ class TestReportAutomationFailure:
         assert "Unexpected error" in out
         # Falls back to the default home artifacts path string.
         assert ".linkedin-networking-cli" in out
+
+    def test_dir_fallback_honors_env_override_on_double_fault(self, monkeypatch):
+        # If _artifacts_dir itself throws but the env override is set, the
+        # message must still point at the configured dir, not the home default.
+        monkeypatch.setenv("LINKEDIN_CLI_ARTIFACTS_DIR", "/tmp/issue18-override")
+        monkeypatch.setattr(
+            linkedin_cli, "_artifacts_dir", lambda: (_ for _ in ()).throw(OSError())
+        )
+        cli = _cli_with_recording_console()
+        cli._report_automation_failure(RuntimeError("boom"), "campaign execution")
+        out = _rendered(cli)
+        assert "/tmp/issue18-override" in out
+
+    def test_no_traceback_dumped_to_user_stdout(self):
+        # Acceptance criterion: a stop must not dump a traceback to the user.
+        # The logging console handler writes to sys.stdout at WARNING+, so we
+        # capture real stdout and assert no traceback text appears there.
+        import contextlib
+
+        cli = _cli_with_recording_console()
+        captured = StringIO()
+        with contextlib.redirect_stdout(captured):
+            try:
+                raise CaptchaDetectedException("blocked at checkpoint")
+            except CaptchaDetectedException as e:
+                cli._report_automation_failure(e, "campaign execution")
+        assert "Traceback" not in captured.getvalue()
+        assert "CaptchaDetectedException" not in captured.getvalue()
+
+    def test_bracketed_detail_survives_rich_markup(self):
+        # Rich treats [..] as markup; dynamic exception text / evidence paths
+        # can contain brackets (CSS attribute selectors, encoded URLs, paths).
+        # They must not be silently dropped from the user-facing message.
+        cli = _cli_with_recording_console()
+        exc = LinkedInAutomationError("state with selector a[href] and [encoded]")
+        exc.evidence = {"screenshot": "/art/error_[odd]_x.png", "dom": None}
+        cli._report_automation_failure(exc, "campaign execution")
+        out = _rendered(cli)
+        assert "a[href]" in out
+        assert "[encoded]" in out
+        assert "[odd]" in out
+
+    def test_bracketed_detail_survives_in_generic_branch(self):
+        cli = _cli_with_recording_console()
+        cli._report_automation_failure(RuntimeError("boom [x] a[y]"), "campaign execution")
+        out = _rendered(cli)
+        assert "[x]" in out
+        assert "a[y]" in out
 
 
 # ---------------------------------------------------------------------------
@@ -259,3 +308,46 @@ class TestExecuteCampaignHardStop:
         assert "Unexpected error" in out
         assert "/tmp/issue18-loop" in out
         assert confirm_count == 1
+
+
+@pytest.mark.unit
+class TestLocationSearchHardStop:
+    """_run_location_search must report a typed message and return [] cleanly."""
+
+    def _drive(self, raised_exc):
+        cli = _cli_with_recording_console()
+        cli.db_manager = object()  # only truthiness matters here
+        cli.settings = _real_settings()
+
+        # The loop must add no interactive wait of its own.
+        confirm_calls = {"count": 0}
+
+        class _Prompt:
+            def execute(self):
+                confirm_calls["count"] += 1
+                return True
+
+        def fake_confirm(*a, **k):
+            return _Prompt()
+
+        def fake_run(coro):
+            coro.close()
+            raise raised_exc
+
+        with patch.object(linkedin_cli.inquirer, "confirm", side_effect=fake_confirm), \
+             patch.object(linkedin_cli.asyncio, "run", side_effect=fake_run):
+            result = cli._run_location_search("Madrid")
+
+        return cli, result, confirm_calls["count"]
+
+    def test_typed_message_and_empty_result_no_wait(self):
+        exc = CaptchaDetectedException("blocked")
+        exc.evidence = {"screenshot": "/art/loc.png", "dom": None}
+        cli, result, confirm_count = self._drive(exc)
+        out = _rendered(cli)
+        assert "security checkpoint" in out
+        assert "/art/loc.png" in out
+        # Contract preserved: failure yields [] (caller renders "no results").
+        assert result == []
+        # Hard-stop: no "Press Enter to continue" wait added by this loop.
+        assert confirm_count == 0

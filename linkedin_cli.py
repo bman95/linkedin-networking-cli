@@ -7,6 +7,7 @@ from InquirerPy.separator import Separator
 from rich.align import Align
 from rich.box import ROUNDED
 from rich.console import Console, Group
+from rich.markup import escape as _rich_escape
 from rich.panel import Panel
 from rich.text import Text
 from collections import namedtuple
@@ -15,6 +16,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 import asyncio
 import csv
+import os
 import sys
 
 # LinkedIn brand blue, used across the welcome banner
@@ -138,7 +140,14 @@ class LinkedInCLI:
         try:
             artifacts_dir = _artifacts_dir()
         except Exception:
-            artifacts_dir = Path.home() / ".linkedin-networking-cli" / "artifacts"
+            # Mirror _artifacts_dir's own resolution (env override first) so the
+            # double-fault fallback still honors LINKEDIN_CLI_ARTIFACTS_DIR.
+            override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
+            artifacts_dir = (
+                Path(override)
+                if override
+                else Path.home() / ".linkedin-networking-cli" / "artifacts"
+            )
         return f"Evidence (screenshot/DOM) saved under {artifacts_dir}"
 
     def _report_automation_failure(self, exc, action_label):
@@ -150,7 +159,11 @@ class LinkedInCLI:
         Prints the message and returns; the caller then hard-stops the run with
         no interactive waiting and no traceback shown to the user.
         """
-        logger.error(
+        # Keep the full traceback in the file logs for postmortem, but off the
+        # user's console: the console handler is at WARNING, so logging this at
+        # INFO preserves it in linkedin_cli.log without dumping a traceback to
+        # the terminal (the user only sees the friendly message below).
+        logger.info(
             "Automation stopped during %s: %s", action_label, exc, exc_info=True
         )
         evidence_ref = self._format_evidence_reference(exc)
@@ -181,14 +194,22 @@ class LinkedInCLI:
                 "structure may have changed, or the page failed to load."
             )
         elif isinstance(exc, LinkedInAutomationError):
-            headline = f"Automation stopped during {action_label}: {exc}"
+            # Escape the exception text: selector/URL detail can contain
+            # square brackets (e.g. a CSS attribute selector ``a[href]``), which
+            # Rich would otherwise parse as markup tags and silently drop.
+            headline = (
+                f"Automation stopped during {action_label}: {_rich_escape(str(exc))}"
+            )
         else:
             headline = (
-                f"Unexpected error during {action_label} — stopped: {exc}"
+                f"Unexpected error during {action_label} — stopped: "
+                f"{_rich_escape(str(exc))}"
             )
 
+        # The fixed headlines above carry no dynamic content, but evidence_ref
+        # holds filesystem paths that may contain brackets, so escape it too.
         self.console.print(f"[red]{headline}[/red]")
-        self.console.print(f"[yellow]{evidence_ref}[/yellow]")
+        self.console.print(f"[yellow]{_rich_escape(evidence_ref)}[/yellow]")
 
     def _welcome_badge(self):
         """Rounded blue 'in' badge with the small 'LinkedIn' label beside it."""
