@@ -4,9 +4,12 @@ Page interactions and connection management with human-like behavior.
 All functions operate on an async Playwright ``Page`` and must be awaited.
 """
 
+import asyncio
 import math
 import random
 import sys
+import time
+from collections import deque
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent.parent))
@@ -28,13 +31,28 @@ async def random_wait(
 
 
 async def scroll_down(page) -> None:
-    """Smooth scrolling down to the end of the page with natural behavior."""
+    """Smooth scrolling down to the end of the page with natural behavior.
+
+    Terminates via two guards:
+
+    - ``MAX_STALLED_STEPS`` (primary): stop once the real scroll position stops
+      advancing — i.e. the bottom of a finite page is reached and the browser
+      clamps ``scrollY``. This is what ends the scroll on normal pages, however
+      tall, so finite result lists are fully scrolled before harvesting.
+    - ``MAX_STEPS`` (safety backstop): a generous hard cap on iterations for
+      LinkedIn's infinite/lazy-loading lists, where ``scrollHeight`` keeps
+      growing as you approach the bottom so ``scrollY`` never stalls and the
+      stall guard never fires. The cap is set high enough (≈25k+ px of scroll)
+      that it does not cut off any realistic finite page short of its bottom.
+    """
     MEAN_STEP = 120
     STEP_JITTER = 40
     MIN_PAUSE = 200
     MAX_PAUSE = 900
     LONG_PAUSE_CHANCE = 0.10
     LONG_PAUSE_MS = (1_500, 3_000)
+    MAX_STEPS = 200
+    MAX_STALLED_STEPS = 3
 
     logger.info("Scrolling down")
 
@@ -42,9 +60,13 @@ async def scroll_down(page) -> None:
     viewport = await page.evaluate("window.innerHeight")
     total = await page.evaluate("document.body.scrollHeight")
 
-    while current + viewport < total:
+    stalled = 0
+    for _ in range(MAX_STEPS):
+        if current + viewport >= total:
+            break
+
         # Calculate easing progress
-        progress = current / total
+        progress = current / total if total else 0
         easing = 0.5 * (1 - math.cos(math.pi * progress))
         base = MEAN_STEP * (1.5 - easing)
 
@@ -54,7 +76,6 @@ async def scroll_down(page) -> None:
 
         # Scroll with mouse wheel
         await page.mouse.wheel(0, delta + random.randint(-10, 10))
-        current += delta
 
         # Random pause between scrolls
         pause = random.randint(MIN_PAUSE, MAX_PAUSE)
@@ -63,10 +84,169 @@ async def scroll_down(page) -> None:
 
         await page.wait_for_timeout(pause)
 
-        # Update values
+        # Update values from the page (not the intended delta): the browser
+        # clamps scrollY at the bottom, which is how we detect a stall.
+        previous = current
         viewport = await page.evaluate("window.innerHeight")
         total = await page.evaluate("document.body.scrollHeight")
         current = await page.evaluate("window.scrollY")
+
+        # If the real position didn't advance, the page won't scroll further
+        # (or is clamped); bail after a few stalled iterations.
+        if current <= previous:
+            stalled += 1
+            if stalled >= MAX_STALLED_STEPS:
+                break
+        else:
+            stalled = 0
+
+
+async def human_type(
+    box, text: str, *, delay_min: int = 50, delay_max: int = 150
+) -> None:
+    """Type ``text`` into ``box`` character-by-character like a human.
+
+    Focuses the field with a short pause first, then types each key with a
+    randomized per-key delay (in ms). ``box`` is a Playwright Locator;
+    ``press_sequentially`` drives one keystroke at a time, unlike ``fill``
+    which sets the value instantly and reads as scripted.
+
+    The field is cleared first so any pre-existing value (browser autofill, a
+    remembered credential in the persistent profile, or a prior failed
+    attempt) is overwritten rather than appended to — matching ``fill``'s
+    overwrite semantics that this replaces.
+    """
+    await box.click()
+    await box.clear()
+    # Brief focus pause before the first keystroke.
+    await asyncio.sleep(random.uniform(0.15, 0.4))
+    for char in text:
+        await box.press_sequentially(
+            char, delay=random.randint(delay_min, delay_max)
+        )
+
+
+async def _human_mouse_move(page, x: float, y: float) -> None:
+    """Move the cursor toward (x, y) in a few jittered steps.
+
+    A hand-rolled, slightly noisy path: ``random(5, 10)`` segments toward the
+    target with ±5px jitter per step and a 0.01–0.03s pause between moves, so
+    the trajectory doesn't teleport straight to the element the way a bare
+    ``element.click()`` does.
+    """
+    steps = random.randint(5, 10)
+    for i in range(1, steps + 1):
+        progress = i / steps
+        jitter_x = random.uniform(-5, 5) if i < steps else 0
+        jitter_y = random.uniform(-5, 5) if i < steps else 0
+        await page.mouse.move(x * progress + jitter_x, y * progress + jitter_y)
+        await asyncio.sleep(random.uniform(0.01, 0.03))
+
+
+async def move_to_element(page, element) -> None:
+    """Move the mouse toward ``element``'s center along a human path.
+
+    Best-effort: if the bounding box can't be read or the mouse move fails
+    (e.g. a mocked page), this is a no-op so the caller's click still proceeds.
+    """
+    try:
+        box = await element.bounding_box()
+        if box:
+            target_x = box["x"] + box["width"] / 2
+            target_y = box["y"] + box["height"] / 2
+            await _human_mouse_move(page, target_x, target_y)
+    except Exception as move_error:
+        logger.debug("Human mouse move skipped: %s", move_error)
+
+
+async def move_to_and_click(page, element, *, click_timeout: int = 5_000) -> None:
+    """Move the mouse to ``element`` along a human path, then click it.
+
+    A JS click is the last resort when a real click is intercepted, matching
+    the existing connect-path behavior.
+    """
+    await move_to_element(page, element)
+    try:
+        await element.click(timeout=click_timeout)
+    except Exception as click_error:
+        logger.info("Normal click intercepted (%s); using JS click", click_error)
+        await element.evaluate("el => el.click()")
+
+
+# Probabilistic reading/dwell distribution: most pauses are a normal scan, with
+# occasional quick glances and slower careful reads. Each profile's (low, high)
+# are fractions of the configured (min_s, max_s) window — 0.0 == min_s,
+# 1.0 == max_s — so the three profiles together span the whole window.
+_DWELL_PROFILES = (
+    (0.25, (0.0, 0.35)),   # quick scan
+    (0.55, (0.30, 0.70)),  # normal read
+    (0.20, (0.65, 1.0)),   # careful read
+)
+
+
+async def dwell(page, *, min_s: float = 1.0, max_s: float = 4.0) -> None:
+    """Pause between major actions as if reading the page.
+
+    Picks a dwell profile (quick-scan / normal / careful) by weight, then a
+    duration inside the configured ``(min_s, max_s)`` window scaled by that
+    profile, simulating variable human attention.
+    """
+    roll = random.random()
+    cumulative = 0.0
+    low_frac, high_frac = _DWELL_PROFILES[1][1]
+    for weight, (lo, hi) in _DWELL_PROFILES:
+        cumulative += weight
+        if roll <= cumulative:
+            low_frac, high_frac = lo, hi
+            break
+
+    span = max_s - min_s
+    seconds = min_s + span * random.uniform(low_frac, high_frac)
+    seconds = max(min_s, min(seconds, max_s))
+    logger.debug("Dwelling %.2fs between actions", seconds)
+    await page.wait_for_timeout(int(seconds * 1_000))
+
+
+class RateLimiter:
+    """Sliding 60s-window cap on actions to avoid bursty, bot-like traffic.
+
+    ``acquire`` records each action's timestamp and, once the rolling
+    60-second window holds ``max_per_minute`` actions, sleeps until the oldest
+    action ages out before allowing the next one through (like the reference
+    project's ``antidetect.rate_limit``).
+    """
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(self, max_per_minute: int = 20):
+        self.max_per_minute = max_per_minute
+        self._timestamps: deque[float] = deque()
+
+    async def acquire(self) -> None:
+        if self.max_per_minute <= 0:
+            return
+
+        now = time.monotonic()
+        self._prune(now)
+
+        if len(self._timestamps) >= self.max_per_minute:
+            wait_for = self.WINDOW_SECONDS - (now - self._timestamps[0])
+            if wait_for > 0:
+                logger.info(
+                    "Rate limit reached (%d/min); waiting %.1fs",
+                    self.max_per_minute,
+                    wait_for,
+                )
+                await asyncio.sleep(wait_for)
+                now = time.monotonic()
+                self._prune(now)
+
+        self._timestamps.append(time.monotonic())
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.WINDOW_SECONDS
+        while self._timestamps and self._timestamps[0] <= cutoff:
+            self._timestamps.popleft()
 
 
 async def _is_true_limit(modal) -> bool:

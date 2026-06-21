@@ -27,7 +27,16 @@ from database.models import Campaign, Contact
 from database.operations import DatabaseManager
 from config.settings import AppSettings
 from automation.linkedin_mappings import format_ids_for_url
-from automation.interactions import random_wait, _is_true_limit
+from automation.interactions import (
+    random_wait,
+    _is_true_limit,
+    human_type,
+    move_to_element,
+    move_to_and_click,
+    scroll_down,
+    dwell,
+    RateLimiter,
+)
 from automation.diagnostics import (
     capture_anomaly_context,
     snapshot_page,
@@ -110,6 +119,29 @@ class LinkedInAutomation:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.is_authenticated = False
+        # Sliding-window per-minute action cap, built lazily from settings so
+        # an env override applied after construction still takes effect.
+        self._rate_limiter: Optional[RateLimiter] = None
+
+    def _get_rate_limiter(self) -> RateLimiter:
+        """Return the action rate limiter, building it from settings once."""
+        if self._rate_limiter is None:
+            cap = self.settings.get_automation_settings()["max_actions_per_minute"]
+            self._rate_limiter = RateLimiter(max_per_minute=cap)
+        return self._rate_limiter
+
+    async def _throttle_action(self) -> None:
+        """Enforce the sliding-window per-minute action cap before an action."""
+        await self._get_rate_limiter().acquire()
+
+    async def _dwell(self) -> None:
+        """Probabilistic reading/dwell pause between major actions."""
+        auto = self.settings.get_automation_settings()
+        await dwell(
+            self.page,
+            min_s=auto["action_delay_min"],
+            max_s=auto["action_delay_max"],
+        )
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -349,11 +381,29 @@ class LinkedInAutomation:
                 if progress_callback:
                     progress_callback("Entering credentials...")
 
-                await self.page.fill(sel.LOGIN_USERNAME.css, email)
-                await self.page.fill(sel.LOGIN_PASSWORD.css, password)
+                # Type credentials character-by-character (with a short focus
+                # pause and randomized per-key delay) instead of an instant
+                # fill, which reads as scripted. Field targets come from the
+                # central selector registry so they survive SDUI churn.
+                auto = self.settings.get_automation_settings()
+                typing_min = auto["typing_delay_min"]
+                typing_max = auto["typing_delay_max"]
+                await human_type(
+                    self.page.locator(sel.LOGIN_USERNAME.css),
+                    email,
+                    delay_min=typing_min,
+                    delay_max=typing_max,
+                )
+                await human_type(
+                    self.page.locator(sel.LOGIN_PASSWORD.css),
+                    password,
+                    delay_min=typing_min,
+                    delay_max=typing_max,
+                )
 
-                # Submit login
-                await self.page.click(sel.LOGIN_SUBMIT.css)
+                # Submit login with a natural mouse move to the button first.
+                submit_button = self.page.locator(sel.LOGIN_SUBMIT.css).first
+                await move_to_and_click(self.page, submit_button)
 
                 # Wait a moment for the page to respond
                 await self.page.wait_for_timeout(2000)
@@ -499,6 +549,10 @@ class LinkedInAutomation:
 
                 profiles_before_page = len(profiles)
 
+                # Scroll the results like a human before harvesting them, so the
+                # page isn't read instantly the way a scraper would.
+                await scroll_down(self.page)
+
                 # Legacy UI: structured result elements with a stable attribute
                 # (the result-cards selector's stable anchor).
                 profile_elements = await self.page.query_selector_all(
@@ -542,7 +596,9 @@ class LinkedInAutomation:
                 next_button = await sel.PAGINATION_NEXT.locate(self.page)
                 if next_button and not await next_button.is_disabled():
                     await next_button.scroll_into_view_if_needed()
-                    await next_button.click()
+                    # Natural mouse move to the pagination control before clicking.
+                    await self._throttle_action()
+                    await move_to_and_click(self.page, next_button, click_timeout=10_000)
                     await self.page.wait_for_timeout(3000)  # Wait for page load
                 else:
                     break
@@ -670,7 +726,8 @@ class LinkedInAutomation:
                     existing_count += 1
                     continue
 
-                # Navigate to profile
+                # Navigate to profile (throttled by the per-minute action cap).
+                await self._throttle_action()
                 await self.page.goto(profile.profile_url, timeout=30000)
                 await self.page.wait_for_timeout(2000)
 
@@ -683,6 +740,12 @@ class LinkedInAutomation:
                             "⚠️ CAPTCHA detected — stopping automation to protect the account"
                         )
                     break
+
+                # Read the profile like a human (scroll + dwell) before acting.
+                # _find_connect_control scrolls back to the top afterward to
+                # bring the top-card action into view.
+                await scroll_down(self.page)
+                await self._dwell()
 
                 # Find the Connect / Pending control for THIS profile.
                 connect_button, control_kind = await self._find_connect_control(profile)
@@ -742,15 +805,12 @@ class LinkedInAutomation:
                 slot_reserved = True
 
                 # Click Connect. The top-card control is already in view at
-                # scroll-top, so a real Playwright click reaches it and the
-                # SDUI opens the invitation modal (a JS click is a last resort
-                # for the rare case the control is still occluded).
+                # scroll-top, so a natural mouse move reaches it and the SDUI
+                # opens the invitation modal (a JS click is a last resort for
+                # the rare case the control is still occluded).
                 logger.info("Clicking 'Connect' button")
-                try:
-                    await connect_button.click(timeout=5000)
-                except Exception as click_error:
-                    logger.info(f"Normal click intercepted ({click_error}); using JS click")
-                    await connect_button.evaluate("el => el.click()")
+                await self._throttle_action()
+                await move_to_and_click(self.page, connect_button)
                 await random_wait(self.page, min_ms=2500, max_ms=4000)
 
                 # Check if email is required to connect (dismiss and skip)
@@ -867,6 +927,12 @@ class LinkedInAutomation:
                 send_target = send_no_note if await send_no_note.count() else send_exact
 
                 logger.info("Clicking 'Send without a note' button")
+                # Natural mouse move to the send button before clicking. The
+                # click keeps its own failure handling (records the contact and
+                # skips), so don't route it through move_to_and_click's JS
+                # fallback — only humanize the approach.
+                await self._throttle_action()
+                await move_to_element(self.page, send_target)
                 try:
                     await send_target.click(timeout=5000)
                 except Exception as send_error:

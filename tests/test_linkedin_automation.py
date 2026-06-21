@@ -195,7 +195,7 @@ class TestLogin:
 
     @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
-        """Test login with username and password after redirect to /login."""
+        """Login types credentials character-by-character (no instant fill)."""
         automation = LinkedInAutomation(db_manager, app_settings)
         automation.page = mock_page
         automation.context = AsyncMock()
@@ -206,11 +206,37 @@ class TestLogin:
         mock_page.query_selector = AsyncMock(return_value=None)
         mock_page.content = AsyncMock(return_value="")
 
+        # Hand back a distinct locator per selector so we can assert on each.
+        locators = {}
+
+        def _locator(selector):
+            loc = AsyncMock()
+            loc.click = AsyncMock()
+            loc.clear = AsyncMock()
+            loc.press_sequentially = AsyncMock()
+            loc.bounding_box = AsyncMock(return_value=None)
+            loc.first = loc
+            locators[selector] = loc
+            return loc
+
+        mock_page.locator = MagicMock(side_effect=_locator)
+
         result = await automation.login()
 
-        assert mock_page.fill.call_count >= 2  # Email and password fields
-        assert mock_page.click.called  # Submit button
         assert result is True
+        # Humanized typing: no instant fill, and each credential is typed key
+        # by key (one press_sequentially() call per character).
+        assert mock_page.fill.call_count == 0
+        email = app_settings.linkedin_email
+        password = app_settings.linkedin_password
+        assert locators["input#username"].press_sequentially.call_count == len(email)
+        assert locators["input#password"].press_sequentially.call_count == len(password)
+        # Each field is cleared first so autofill/remembered values don't get
+        # appended to (overwrite semantics, matching the old fill).
+        assert locators["input#username"].clear.called
+        assert locators["input#password"].clear.called
+        # Submit button is clicked after a natural mouse move.
+        assert locators["button[type=submit]"].click.called
 
 
 # ============================================================================
@@ -870,6 +896,8 @@ class TestPersistedDailyCap:
         button = AsyncMock()
         button.click = AsyncMock()
         button.evaluate = AsyncMock()
+        # bounding_box None -> the human mouse move is a clean no-op.
+        button.bounding_box = AsyncMock(return_value=None)
 
         automation._find_connect_control = AsyncMock(return_value=(button, "connect"))
         automation._invitation_blocked_toast = AsyncMock(return_value=False)
@@ -884,6 +912,7 @@ class TestPersistedDailyCap:
         loc = AsyncMock()
         loc.count = AsyncMock(return_value=1)
         loc.click = AsyncMock()
+        loc.bounding_box = AsyncMock(return_value=None)
         first = MagicMock()
         first.first = loc
         automation.page.locator = MagicMock(return_value=first)

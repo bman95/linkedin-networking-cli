@@ -206,10 +206,32 @@ class AppSettings:
             "connection_delay_max": int(os.getenv("CONNECTION_DELAY_MAX", "5")),
             "daily_connection_limit": int(os.getenv("DAILY_CONNECTION_LIMIT", "20")),
             "connection_cooldown": int(os.getenv("CONNECTION_COOLDOWN", "0")),
-            "search_limit": int(os.getenv("SEARCH_LIMIT", "100"))
+            "search_limit": int(os.getenv("SEARCH_LIMIT", "100")),
+            # Humanization tunables (issue #15). Typing is per-keystroke in ms;
+            # action dwell is between major actions in seconds; the per-minute
+            # cap throttles a sliding 60s window of actions.
+            "typing_delay_min": int(os.getenv("TYPING_DELAY_MIN", "50")),
+            "typing_delay_max": int(os.getenv("TYPING_DELAY_MAX", "150")),
+            "action_delay_min": int(os.getenv("ACTION_DELAY_MIN", "1")),
+            "action_delay_max": int(os.getenv("ACTION_DELAY_MAX", "4")),
+            "max_actions_per_minute": int(os.getenv("MAX_ACTIONS_PER_MINUTE", "20")),
         }
 
-        logger.debug(f"Automation settings: delay={settings['connection_delay_min']}-{settings['connection_delay_max']}s, daily_limit={settings['daily_connection_limit']}, cooldown={settings['connection_cooldown']}s, search_limit={settings['search_limit']}")
+        logger.debug(
+            "Automation settings: delay=%s-%ss, daily_limit=%s, cooldown=%ss, "
+            "search_limit=%s, typing_delay=%s-%sms, action_delay=%s-%ss, "
+            "max_actions_per_minute=%s",
+            settings["connection_delay_min"],
+            settings["connection_delay_max"],
+            settings["daily_connection_limit"],
+            settings["connection_cooldown"],
+            settings["search_limit"],
+            settings["typing_delay_min"],
+            settings["typing_delay_max"],
+            settings["action_delay_min"],
+            settings["action_delay_max"],
+            settings["max_actions_per_minute"],
+        )
         return settings
 
     def validate_credentials(self) -> bool:
