@@ -39,6 +39,7 @@ from automation.interactions import (
 )
 from automation.diagnostics import (
     capture_anomaly_context,
+    capture_error_context,
     snapshot_page,
     reset_diagnostics_run,
 )
@@ -352,30 +353,56 @@ class LinkedInAutomation:
                 progress_callback("Checking LinkedIn session...")
 
             # Check if already logged in by attempting to access feed.
-            # A bounce to /login here is the *expected* "need to authenticate"
-            # path, so this probe uses a bare goto (not navigate_guarded, which
-            # would raise on the login bounce).
+            # A bounce to a /login wall here is the *expected* "need to
+            # authenticate" path, so this probe uses a bare goto (not
+            # navigate_guarded, which would raise on the login bounce).
             await self.page.goto(f"{self.BASE_URL}/feed", timeout=30_000, wait_until="domcontentloaded")
             # Give a moment for redirect to happen if not logged in
             await self.page.wait_for_timeout(2000)
 
             current_url = self.page.url
 
-            # DOM-backed "already logged in?" check: not on a login/challenge
-            # wall AND the logged-in nav landmark is present. The URL alone is
-            # not enough — a soft block served from a non-login URL would pass a
-            # URL-only check but renders no nav landmark.
             from automation.navigation import landed_on_challenge
 
-            if landed_on_challenge(current_url) is None:
-                me_landmark = await sel.GLOBAL_NAV_ME.count(self.page)
-                if me_landmark > 0:
+            wall = landed_on_challenge(current_url)
+            if wall == "challenge":
+                # The stored session was already challenged (/checkpoint, /authwall):
+                # surface it as a typed exception with evidence rather than quietly
+                # routing to /login, so the caller stops instead of pushing through.
+                challenge_exc = CaptchaDetectedException(
+                    "Stored session challenged on feed probe "
+                    f"({current_url!r}); manual verification required"
+                )
+                await capture_error_context(
+                    self.page,
+                    "login_feed_probe_challenge",
+                    exc=challenge_exc,
+                    context={"landed_url": current_url},
+                )
+                raise challenge_exc
+
+            # DOM-backed "already logged in?" check: not on a login wall AND the
+            # logged-in nav landmark renders. The URL alone is not enough — a soft
+            # block served from a non-login URL would pass a URL-only check but
+            # renders no nav landmark. Wait briefly for the landmark (instead of
+            # an instantaneous count) so a slow-but-valid feed isn't misread as
+            # logged out and needlessly re-driven to /login.
+            if wall is None:
+                try:
+                    await self.page.wait_for_selector(
+                        sel.GLOBAL_NAV_ME.css, timeout=5_000
+                    )
+                    landmark_present = True
+                except TimeoutError:
+                    landmark_present = False
+                if landmark_present:
                     self.is_authenticated = True
                     if progress_callback:
                         progress_callback("Session already active on LinkedIn!")
                     return True
 
-            # We were redirected to login, proceed with authentication
+            # We were redirected to login (or the feed never confirmed a session),
+            # proceed with authentication.
             if progress_callback:
                 progress_callback("Not logged in, proceeding with login...")
 
@@ -469,6 +496,11 @@ class LinkedInAutomation:
 
         except LoginFailedException:
             raise  # Re-raise login failed exceptions
+        except (CaptchaDetectedException, NotAuthenticatedException):
+            # Surface a challenge/auth wall as its typed self (not a generic
+            # LoginFailedException) so callers can stop to protect the account
+            # rather than retrying credentials into a challenge.
+            raise
         except Exception as e:
             logger.error(f"Login failed: {str(e)}")
             if progress_callback:
@@ -526,17 +558,25 @@ class LinkedInAutomation:
                 context={"campaign": campaign.name},
             )
             # Disambiguate "empty" from "not rendered yet": race the readiness
-            # selector and, if the listing does not render, reload ONCE before
-            # trusting "no results" (re-checking for a challenge that replaced
-            # the listing). Only a still-missing listing after the reload fails
-            # loud through the registry (evidence bundle + raise). A genuine
-            # empty/no-results page returns False without a spurious failure.
-            await verify_listing_rendered(
+            # selector against the explicit no-results marker and, if neither
+            # renders, reload ONCE before trusting "no results" (re-checking for
+            # a challenge that replaced the listing). Only a still-missing listing
+            # after the reload fails loud through the registry (evidence bundle +
+            # raise). A genuine empty/no-results page returns False — return an
+            # empty list cleanly rather than entering the harvest loop (which
+            # would time out on the result-cards wait and misreport a failure).
+            rendered = await verify_listing_rendered(
                 self.page,
                 sel.SEARCH_RESULTS_READY,
+                empty_selector=sel.SEARCH_NO_RESULTS.css,
                 ready_timeout_ms=15000,
                 context={"campaign": campaign.name},
             )
+            if not rendered:
+                logger.info("Search returned no results for campaign %r", campaign.name)
+                if progress_callback:
+                    progress_callback("Search complete! Found 0 profiles (no results)")
+                return profiles
 
             page_count = 0
             max_pages = 10  # Limit to prevent infinite loops

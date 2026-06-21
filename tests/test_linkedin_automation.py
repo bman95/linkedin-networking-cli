@@ -211,6 +211,7 @@ class TestLogin:
         block as a live session.
         """
         from unittest.mock import PropertyMock
+        from playwright.async_api import TimeoutError as PWTimeoutError
         from exceptions import LoginFailedException
         from config.settings import AppSettings
 
@@ -218,11 +219,11 @@ class TestLogin:
         mock_linkedin_automation.is_authenticated = False
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
-        # Non-login URL, but the logged-in landmark is absent (count 0).
+        # Non-login URL, but the logged-in landmark never renders: the probe's
+        # bounded wait_for_selector for GLOBAL_NAV_ME times out, so the early
+        # "already authenticated" return is correctly skipped.
         mock_page.url = "https://www.linkedin.com/feed/"
-        absent = MagicMock()
-        absent.count = AsyncMock(return_value=0)
-        mock_page.locator = MagicMock(return_value=absent)
+        mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("no landmark"))
         # No stored credentials + headless => the manual-login branch fails loud,
         # proving the URL-only "already logged in" shortcut did NOT fire. No
         # CAPTCHA on the login page so the flow reaches the headless guard.
@@ -241,6 +242,59 @@ class TestLogin:
                 await mock_linkedin_automation.login()
 
         assert mock_linkedin_automation.is_authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_feed_probe_challenge_raises_captcha(self, mock_linkedin_automation):
+        """A stored session already challenged on the feed probe is surfaced.
+
+        If the /feed probe lands on /checkpoint or /authwall, the login flow must
+        raise CaptchaDetectedException (with evidence) instead of quietly routing
+        to /login and pushing through the challenge.
+        """
+        from exceptions import CaptchaDetectedException
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with patch(
+            "automation.linkedin.capture_error_context", new=AsyncMock()
+        ) as cap:
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.login()
+        cap.assert_awaited()
+        assert cap.await_args.args[1] == "login_feed_probe_challenge"
+        # Never routed to the login page after a challenge.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_feed_landmark_wait_confirms_session(
+        self, mock_linkedin_automation
+    ):
+        """A slow-but-valid feed is recognized via the bounded landmark wait.
+
+        The probe waits for GLOBAL_NAV_ME (not an instantaneous count), so a
+        landmark that renders a beat late still confirms the session instead of
+        misclassifying it as logged out.
+        """
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/feed/"
+        # The landmark resolves (no timeout) -> authenticated.
+        mock_page.wait_for_selector = AsyncMock()
+
+        result = await mock_linkedin_automation.login()
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        mock_page.wait_for_selector.assert_awaited()
+        # The wait targets the logged-in nav landmark.
+        assert sel.GLOBAL_NAV_ME.css in str(
+            mock_page.wait_for_selector.await_args.args[0]
+        )
 
     @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
@@ -1191,6 +1245,30 @@ class TestNavigationGuardWiring:
         # Wired with the readiness selector and the campaign context.
         assert verify.await_args.args[1] is sel.SEARCH_RESULTS_READY
         assert verify.await_args.kwargs["context"]["campaign"] == "Listing"
+
+    @pytest.mark.asyncio
+    async def test_search_empty_results_returns_clean_empty_list(
+        self, mock_linkedin_automation
+    ):
+        """A genuine no-results page returns [] cleanly (not a harvest-loop failure)."""
+        campaign = Campaign(name="Empty")
+        # verify_listing_rendered reports a rendered-but-empty page (False).
+        with patch(
+            "automation.linkedin.verify_listing_rendered",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "automation.linkedin.snapshot_page", new=AsyncMock()
+        ) as snapshot:
+            messages = []
+            result = await mock_linkedin_automation.search_profiles(
+                campaign, limit=10, progress_callback=messages.append
+            )
+
+        assert result == []
+        # Short-circuited before the harvest loop: no page snapshot, no
+        # result-cards wait that would otherwise time out and raise.
+        snapshot.assert_not_awaited()
+        assert any("no results" in m.lower() for m in messages)
 
     @pytest.mark.asyncio
     async def test_search_guard_challenge_reraises(self, mock_linkedin_automation):

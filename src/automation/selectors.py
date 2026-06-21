@@ -266,6 +266,22 @@ SEARCH_RESULT_CARDS = Selector(
     "search_result_cards",
     ["[data-chameleon-result-urn]", "main a[href*='/in/']"],
 )
+# Explicit "no results" empty state. Raced against the readiness selector so a
+# genuinely empty search (filters that match nobody) is distinguished from a
+# listing that simply has not rendered yet — the empty marker present means the
+# page DID render, it just has zero results. The ``search-no-results`` data-test
+# is the stable anchor; the ES/EN copy variants are the SDUI fallback. The ES/EN
+# texts are co-equal primaries (a locale difference, not drift), hence
+# ``primary_count=2`` over the two text candidates after the anchor.
+SEARCH_NO_RESULTS = Selector(
+    "search_no_results",
+    [
+        "[data-test-search-no-results]",
+        "main:has-text('No se han encontrado resultados')",
+        "main:has-text('No results found')",
+    ],
+    primary_count=3,
+)
 
 # --- Pagination ---
 # The EN/ES aria-labels are co-equal primaries (same stable role attribute, just

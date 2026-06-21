@@ -254,6 +254,20 @@ class TestRegistryShape:
             "[data-chameleon-result-urn]"
         )
 
+    def test_search_no_results_anchor_and_locale_variants(self):
+        # data-test anchor first; ES/EN copy variants are co-equal primaries
+        # (a locale difference, not drift) so an empty page in either language
+        # is recognized without a spurious drift warning.
+        assert selectors.SEARCH_NO_RESULTS.anchor == "[data-test-search-no-results]"
+        assert any(
+            "No results found" in c for c in selectors.SEARCH_NO_RESULTS.candidates
+        )
+        assert any(
+            "No se han encontrado resultados" in c
+            for c in selectors.SEARCH_NO_RESULTS.candidates
+        )
+        assert selectors.SEARCH_NO_RESULTS.primary_count == 3
+
     def test_pagination_has_en_es_and_text_fallback(self):
         cands = selectors.PAGINATION_NEXT.candidates
         assert "button[aria-label='Next']" in cands
