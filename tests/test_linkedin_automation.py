@@ -2263,3 +2263,118 @@ class TestSearchAndConnect:
         auto._attempt_connect.assert_not_called()
         auto.send_connection_requests.assert_not_called()
         assert db.get_daily_connection_count(today) == 2
+
+
+@pytest.mark.unit
+class TestParseCardProfile:
+    """_parse_card_profile turns a card's href + visible text into a profile."""
+
+    def test_parses_name_dropping_degree_marker_and_actions(self):
+        profile = LinkedInAutomation._parse_card_profile(
+            "https://www.linkedin.com/in/jane/",
+            "Jane Roe • 2º\nSenior Engineer\nMadrid, Spain\nConectar",
+        )
+        assert profile is not None
+        assert profile.name == "Jane Roe"
+        # The "Conectar" action label is dropped, so headline/location land right.
+        assert profile.headline == "Senior Engineer"
+        assert profile.location == "Madrid, Spain"
+        assert profile.profile_url == "https://www.linkedin.com/in/jane/"
+
+    def test_action_words_filtered_case_insensitively(self):
+        profile = LinkedInAutomation._parse_card_profile(
+            "https://www.linkedin.com/in/x/",
+            "John Doe\nConnect\nMessage\nCEO at Foo",
+        )
+        # Both EN action words are dropped; the first real line becomes headline.
+        assert profile.headline == "CEO at Foo"
+
+    def test_empty_text_returns_none(self):
+        assert LinkedInAutomation._parse_card_profile("https://x/in/y/", "") is None
+        assert LinkedInAutomation._parse_card_profile("https://x/in/y/", None) is None
+
+    def test_blank_name_returns_none(self):
+        # First line is only the degree marker → no usable name.
+        assert (
+            LinkedInAutomation._parse_card_profile("https://x/in/y/", "• 2º\nfoo")
+            is None
+        )
+
+
+@pytest.mark.unit
+class TestExtractProfileCards:
+    """_extract_profile_cards keeps a card handle per profile and normalizes URLs."""
+
+    @staticmethod
+    def _card(href, text="Jane Roe • 2º\nEngineer", *, has_link=True, raises=False):
+        card = AsyncMock(name=f"card:{href}")
+        if raises:
+            card.query_selector = AsyncMock(side_effect=RuntimeError("detached"))
+        elif has_link:
+            link = AsyncMock()
+            link.get_attribute = AsyncMock(return_value=href)
+            card.query_selector = AsyncMock(return_value=link)
+        else:
+            card.query_selector = AsyncMock(return_value=None)
+        card.inner_text = AsyncMock(return_value=text)
+        return card
+
+    @pytest.mark.asyncio
+    async def test_relative_href_normalized_to_absolute(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        card = self._card("/in/jane/")
+        auto._enumerate_card_handles = AsyncMock(return_value=[card])
+
+        pairs = await auto._extract_profile_cards()
+
+        assert len(pairs) == 1
+        profile, handle = pairs[0]
+        # Relative href is resolved against BASE_URL so the fallback goto and the
+        # contact-book dedup match the other harvest paths.
+        assert profile.profile_url == "https://www.linkedin.com/in/jane/"
+        assert handle is card
+
+    @pytest.mark.asyncio
+    async def test_absolute_href_query_stripped_and_passed_through(
+        self, mock_linkedin_automation
+    ):
+        auto = mock_linkedin_automation
+        card = self._card("https://www.linkedin.com/in/bob/?miniProfileUrn=x")
+        auto._enumerate_card_handles = AsyncMock(return_value=[card])
+
+        pairs = await auto._extract_profile_cards()
+
+        assert pairs[0][0].profile_url == "https://www.linkedin.com/in/bob/"
+
+    @pytest.mark.asyncio
+    async def test_card_without_in_link_is_skipped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/x/", has_link=False)]
+        )
+
+        assert await auto._extract_profile_cards() == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_href_deduped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/jane/"), self._card("/in/jane/")]
+        )
+
+        pairs = await auto._extract_profile_cards()
+        assert len(pairs) == 1
+
+    @pytest.mark.asyncio
+    async def test_detached_handle_is_skipped(self, mock_linkedin_automation):
+        auto = mock_linkedin_automation
+        good = self._card("/in/jane/")
+        auto._enumerate_card_handles = AsyncMock(
+            return_value=[self._card("/in/x/", raises=True), good]
+        )
+
+        pairs = await auto._extract_profile_cards()
+        # The detached card is skipped; the live one still harvests.
+        assert [p.profile_url for p, _ in pairs] == [
+            "https://www.linkedin.com/in/jane/"
+        ]

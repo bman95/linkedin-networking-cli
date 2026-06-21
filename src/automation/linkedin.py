@@ -709,9 +709,10 @@ class LinkedInAutomation:
             # The navigate→verify→paginate scaffolding lives in the shared page
             # walk; here we just harvest each ready page's profiles. Breaking once
             # we have enough closes the walk at its ``yield`` before it advances
-            # pagination (no extra page loaded), matching the old
-            # ``while len(profiles) < limit`` bound. A no-results page yields
-            # nothing, so ``walked_any`` stays False and we report "no results".
+            # pagination, so the next page is never loaded once we are satisfied
+            # (the old inline loop clicked Next first, loading one extra page at
+            # the boundary). A no-results page yields nothing, so ``walked_any``
+            # stays False and we report "no results".
             walked_any = False
             async for page_count in self._walk_search_pages(campaign, progress_callback):
                 walked_any = True
@@ -807,7 +808,9 @@ class LinkedInAutomation:
         read the page however it needs. Between yields it advances pagination; the
         consumer ``break``ing closes this generator at the ``yield`` (before the
         pagination click), so no extra page is loaded once the consumer is
-        satisfied — matching the old inline ``while len(profiles) < limit`` bound.
+        satisfied. (The old inline ``while len(profiles) < limit`` loop clicked
+        Next before its top-of-loop re-check stopped it, loading one extra page at
+        the limit boundary; closing at the yield avoids that.)
 
         A genuine empty/no-results page yields nothing (clean stop). A
         challenge/wrong-landing bounce from the guard, and a missing result-cards
@@ -2017,7 +2020,14 @@ class LinkedInAutomation:
                 link = await card.query_selector("a[href*='/in/']")
                 if link is None:
                     continue
+                # get_attribute returns the raw (usually relative) href; every
+                # other harvest path stores an absolute URL (the SDUI JS path
+                # reads the resolved .href property, _extract_profile_info
+                # prepends BASE_URL). Normalize here too so the fallback goto and
+                # the contact-book dedup compare like for like.
                 href = (await link.get_attribute("href") or "").split("?")[0]
+                if href and not href.startswith("http"):
+                    href = self.BASE_URL + href
                 if not href or href in seen:
                     continue
                 text = await card.inner_text()
