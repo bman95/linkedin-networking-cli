@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, MagicMock, patch
 from datetime import datetime, timezone, date
 
 from automation.linkedin import LinkedInAutomation, LinkedInProfile
+from automation import selectors as sel
 from database.models import Campaign
 
 
@@ -1171,6 +1172,40 @@ class TestNavigationGuardWiring:
         assert "/search/results/people" in call.args[1]
         assert call.kwargs["strict_path"] == "/search/results/people"
         assert call.kwargs["context"]["campaign"] == "Wiring"
+
+    @pytest.mark.asyncio
+    async def test_search_disambiguates_via_verify_listing_rendered(
+        self, mock_linkedin_automation
+    ):
+        """The search readiness wait goes through verify_listing_rendered."""
+        campaign = Campaign(name="Listing")
+        with patch(
+            "automation.linkedin.verify_listing_rendered", new=AsyncMock(return_value=True)
+        ) as verify, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+        verify.assert_awaited()
+        # Wired with the readiness selector and the campaign context.
+        assert verify.await_args.args[1] is sel.SEARCH_RESULTS_READY
+        assert verify.await_args.kwargs["context"]["campaign"] == "Listing"
+
+    @pytest.mark.asyncio
+    async def test_search_guard_challenge_reraises(self, mock_linkedin_automation):
+        """A challenge raised during the search nav is NOT swallowed as 'no results'."""
+        from exceptions import CaptchaDetectedException
+
+        campaign = Campaign(name="Wall")
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=CaptchaDetectedException("search wall")),
+        ):
+            # Must propagate (a walled session read as [] would let the caller
+            # drive the connection run straight through the wall).
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
     @pytest.mark.asyncio
     async def test_search_scroll_runs_after_guard(self, mock_linkedin_automation):

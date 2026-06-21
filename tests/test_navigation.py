@@ -128,6 +128,22 @@ class TestLandedOnChallenge:
         # string (a redirect target) is not a wall.
         assert nav.landed_on_challenge("https://x/feed?redirect=/login") is None
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.linkedin.com/company/loginworks",  # contains "login"
+            "https://www.linkedin.com/in/authwall-fan",     # contains "authwall"
+            "https://www.linkedin.com/company/uasolutions",  # contains "uas"
+        ],
+    )
+    def test_segment_boundary_avoids_substring_false_positive(self, url):
+        # Markers match whole path SEGMENTS, so a legitimate path that merely
+        # contains the marker text is not misread as a wall.
+        assert nav.landed_on_challenge(url) is None
+
+    def test_uas_login_segment_matches(self):
+        assert nav.landed_on_challenge("https://www.linkedin.com/uas/login") == "login"
+
 
 @pytest.mark.unit
 class TestDiffRedirect:
@@ -359,6 +375,49 @@ class TestConfirmLoggedInDom:
         with patch("automation.navigation.capture_error_context", new=AsyncMock()):
             with pytest.raises(NotAuthenticatedException):
                 await nav.confirm_logged_in_dom(page, timeout=10)
+
+    @pytest.mark.asyncio
+    async def test_landmark_wait_shares_deadline_with_url_wait(self):
+        # The two waits share ONE budget: if the URL wait consumed most of the
+        # timeout, the landmark wait gets only the remainder (floored at 1000ms),
+        # so a stuck login cannot hang for 2x the budget.
+        page = _page("https://www.linkedin.com/feed/")
+        page.wait_for_url = AsyncMock()
+
+        # Simulate 8s already elapsed against a 10s budget by advancing the
+        # monotonic clock between the deadline capture and the landmark wait.
+        clock = iter([100.0, 108.0])  # deadline base, then "now" for remaining
+
+        def _mono():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 108.0
+
+        with patch("automation.navigation.time.monotonic", side_effect=_mono):
+            await nav.confirm_logged_in_dom(page, timeout=10_000)
+
+        # 10s budget - 8s elapsed = 2s remaining for the landmark wait.
+        assert page.wait_for_selector.await_args.kwargs["timeout"] == 2_000
+
+    @pytest.mark.asyncio
+    async def test_landmark_wait_floored_when_budget_nearly_gone(self):
+        # When the URL wait ate essentially the whole budget, the landmark wait
+        # is floored to 1000ms (a real, if small, chance to render) rather than 0.
+        page = _page("https://www.linkedin.com/feed/")
+        page.wait_for_url = AsyncMock()
+        clock = iter([100.0, 109.9])  # 9.9s elapsed of a 10s budget
+
+        def _mono():
+            try:
+                return next(clock)
+            except StopIteration:
+                return 109.9
+
+        with patch("automation.navigation.time.monotonic", side_effect=_mono):
+            await nav.confirm_logged_in_dom(page, timeout=10_000)
+
+        assert page.wait_for_selector.await_args.kwargs["timeout"] == 1_000
 
     @pytest.mark.asyncio
     async def test_challenge_replaced_page_after_url_settled(self):

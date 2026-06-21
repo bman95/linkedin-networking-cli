@@ -40,6 +40,7 @@ All functions are async and operate on an async Playwright ``Page``.
 """
 
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -59,16 +60,23 @@ from exceptions import (
 
 logger = get_logger(__name__)
 
-# Path substrings that mark a challenge or login wall. Matched against the
-# landed *path* (not the full URL) so a profile that merely *links* to
-# ``/login`` in its body cannot trip the check. URL-over-DOM by design: the
-# challenge DOM churns far faster than any selector list, so the stable signal
-# is "the browser is sitting on a challenge/login path".
+# Path *segments* that mark a challenge or login wall. Matched against the
+# landed path's segments (not the full URL, and not a bare substring) so a
+# profile that merely *links* to ``/login`` and a legitimate path that merely
+# *contains* the text (e.g. ``/company/loginworks``) cannot trip the check.
+# URL-over-DOM by design: the challenge DOM churns far faster than any selector
+# list, so the stable signal is "the browser is sitting on a challenge/login
+# path".
 #
-# ``/login`` and ``/uas/`` are login walls -> NotAuthenticatedException.
-# ``/checkpoint/`` and ``/authwall`` are interstitial challenges -> CAPTCHA.
-_LOGIN_PATH_MARKERS = ("/login", "/uas/")
-_CHALLENGE_PATH_MARKERS = ("/checkpoint/", "/authwall")
+# ``login`` and ``uas`` are login walls -> NotAuthenticatedException.
+# ``checkpoint`` and ``authwall`` are interstitial challenges -> CAPTCHA.
+_LOGIN_PATH_SEGMENTS = ("login", "uas")
+_CHALLENGE_PATH_SEGMENTS = ("checkpoint", "authwall")
+
+
+def _path_segments(path: str) -> set:
+    """Return the set of non-empty path segments (already lower-cased)."""
+    return {seg for seg in path.split("/") if seg}
 
 
 def _split(url: str) -> Tuple[str, Dict[str, str]]:
@@ -95,9 +103,10 @@ def landed_on_challenge(landed_url: str) -> Optional[str]:
     URL-over-DOM: a positive result is trusted regardless of what the DOM shows.
     """
     path, _ = _split(landed_url)
-    if any(marker in path for marker in _CHALLENGE_PATH_MARKERS):
+    segments = _path_segments(path)
+    if segments & set(_CHALLENGE_PATH_SEGMENTS):
         return "challenge"
-    if any(marker in path for marker in _LOGIN_PATH_MARKERS):
+    if segments & set(_LOGIN_PATH_SEGMENTS):
         return "login"
     return None
 
@@ -368,6 +377,11 @@ async def confirm_logged_in_dom(
     def _left_login(url) -> bool:
         return landed_on_challenge(str(url)) is None
 
+    # One shared deadline across both waits: the URL wait and the landmark wait
+    # together may not exceed ``timeout``, so a stuck login cannot silently hang
+    # for 2x the budget (the manual-login path passes a 10-minute timeout).
+    deadline = time.monotonic() + timeout / 1000.0
+
     try:
         await page.wait_for_url(_left_login, timeout=timeout)
     except PlaywrightTimeoutError:
@@ -381,9 +395,12 @@ async def confirm_logged_in_dom(
         await _raise_challenge(page, "login-confirmation", landed_url, kind, context)
 
     # URL left the login flow — now require the DOM landmark so a soft block on
-    # a non-login URL cannot pass as authenticated.
+    # a non-login URL cannot pass as authenticated. The landmark wait gets only
+    # the time remaining in the shared budget (floored so a near-elapsed budget
+    # still gives the landmark a real, if small, chance to render).
+    remaining_ms = max(int((deadline - time.monotonic()) * 1000), 1_000)
     try:
-        await page.wait_for_selector(sel.GLOBAL_NAV_ME.css, timeout=timeout)
+        await page.wait_for_selector(sel.GLOBAL_NAV_ME.css, timeout=remaining_ms)
     except PlaywrightTimeoutError as exc:
         try:
             landed_url = str(page.url)
@@ -472,7 +489,9 @@ async def verify_listing_rendered(
         landed_url = ""
     kind = landed_on_challenge(landed_url)
     if kind:
-        await _raise_challenge(page, landed_url, landed_url, kind, context)
+        await _raise_challenge(
+            page, "listing-verification", landed_url, kind, context
+        )
 
     # Reload once before trusting "no results" — the listing may simply not have
     # rendered on the first paint.
@@ -493,7 +512,9 @@ async def verify_listing_rendered(
         landed_url = ""
     kind = landed_on_challenge(landed_url)
     if kind:
-        await _raise_challenge(page, landed_url, landed_url, kind, context)
+        await _raise_challenge(
+            page, "listing-verification", landed_url, kind, context
+        )
 
     outcome = await _attempt()
     if outcome == "ready":

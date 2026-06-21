@@ -627,6 +627,20 @@ class LinkedInAutomation:
 
             return profiles
 
+        except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
+            # The navigation guard bounced the search to a challenge/login wall
+            # (evidence already captured). This must NOT be swallowed into an
+            # empty result list: a walled session read as "no profiles" would
+            # both misreport to the user and let the caller drive
+            # send_connection_requests straight through the wall. Re-raise so the
+            # run stops loudly, mirroring the per-profile guard's break.
+            logger.warning("Search hit a challenge/login wall; aborting: %s", challenge)
+            if progress_callback:
+                progress_callback(
+                    "⚠️ Challenge/login wall detected during search — stopping "
+                    "to protect the account"
+                )
+            raise
         except Exception as e:
             logger.error(f"Search failed: {str(e)}")
             if progress_callback:
