@@ -242,6 +242,24 @@ class TestRegistryShape:
         ]
         assert selectors.BLOCKING_OVERLAY.primary_count == 2
 
+    def test_cookie_banner_dismiss_present(self):
+        # Benign dismissible interstitial (issue #17): the accept control leads,
+        # OneTrust + EN/ES aria-label variants follow as co-equal primaries.
+        assert selectors.COOKIE_BANNER_DISMISS.anchor == "button[action-type='ACCEPT']"
+        assert "#onetrust-accept-btn-handler" in (
+            selectors.COOKIE_BANNER_DISMISS.candidates
+        )
+        assert selectors.COOKIE_BANNER_DISMISS.primary_count == 2
+
+    def test_email_required_dismiss_present(self):
+        # Benign dismissible interstitial (issue #17): the EN/ES aria-label
+        # dismiss-button variants are co-equal locale primaries.
+        assert selectors.EMAIL_REQUIRED_DISMISS.candidates == [
+            "button[aria-label='Dismiss']",
+            "button[aria-label='Descartar']",
+        ]
+        assert selectors.EMAIL_REQUIRED_DISMISS.primary_count == 2
+
     def test_search_readiness_keeps_legacy_and_sdui_variants(self):
         assert selectors.SEARCH_RESULTS_READY.candidates == [
             ".search-results-container",

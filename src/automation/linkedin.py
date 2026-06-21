@@ -49,6 +49,8 @@ from automation.navigation import (
     verify_listing_rendered,
     landed_on_challenge,
     landed_on_checkpoint,
+    run_bounded,
+    _is_crash_error,
 )
 from automation import selectors as sel
 from utils.logging import get_logger
@@ -151,6 +153,64 @@ class LinkedInAutomation:
             min_s=auto["action_delay_min"],
             max_s=auto["action_delay_max"],
         )
+
+    async def _refresh_context(self) -> Page:
+        """Close and reopen the browser context, keeping the persistent profile.
+
+        Recovery primitive for the resilient-navigation layer (issue #17): when
+        a renderer crashes or a per-item watchdog fires, the wedged context is
+        torn down and a fresh one launched so one crash does not cascade across
+        the rest of the worklist. Login state survives because the persistent
+        Chrome profile on disk (and the ``session.json`` ``close_browser``
+        writes for the transient path) carries the cookies — ``start_browser``
+        re-reads them, so the refreshed context resumes the same session.
+
+        The teardown is bounded *per step* inside ``close_browser`` itself (each
+        close gets its own ``asyncio.wait_for``), so on a frozen,
+        memory-thrashing renderer a hung step cannot wedge the very refresh meant
+        to recover from it — and, crucially, cannot starve the later steps
+        (``playwright.stop()`` frees the driver subprocess and must always run).
+        ``close_browser`` swallows its own errors, so this never needs to guard
+        the whole call with a watchdog that would cancel it mid-teardown.
+
+        Returns the fresh ``Page``.
+        """
+        logger.warning("Refreshing browser context to recover from a wedged renderer")
+        await self.close_browser()
+        # Drop any partial handles so start_browser launches from scratch rather
+        # than reusing a half-dead context.
+        self.context = None
+        self.browser = None
+        self.page = None
+        self.playwright = None
+
+        await self.start_browser()
+        return self.page
+
+    async def _recover(self) -> Page:
+        """The ``recover`` callback handed to the navigation helpers.
+
+        Thin wrapper around :meth:`_refresh_context` so the navigation layer
+        stays page-agnostic (it receives a zero-arg async callable returning the
+        fresh page) without importing the automation engine.
+        """
+        return await self._refresh_context()
+
+    def _nav_kwargs(self) -> Dict[str, Any]:
+        """Resilient-navigation kwargs shared by every ``navigate_guarded`` call.
+
+        Bundles the env-tuned retry/watchdog tunables plus the crash-recovery
+        callback so each call site stays a single readable statement and the two
+        navigations cannot drift apart in how they retry/recover.
+        """
+        nav = self.settings.get_navigation_settings()
+        return {
+            "timeout": nav["goto_timeout_ms"],
+            "max_retries": nav["max_retries"],
+            "retry_backoff_base_s": nav["retry_backoff_base_s"],
+            "hard_timeout_margin_s": nav["hard_timeout_margin_s"],
+            "recover": self._recover,
+        }
 
     async def __aenter__(self):
         """Async context manager entry"""
@@ -337,16 +397,46 @@ class LinkedInAutomation:
             self.page = await self.context.new_page()
             logger.info("Created new page for browser context")
 
+    # Per-step teardown budget (seconds). ``close_browser`` is called during
+    # crash recovery against a *wedged* renderer, where an individual close can
+    # HANG (not just throw). Each step is bounded on its own so a hung step
+    # cannot starve the *later* steps — in particular ``playwright.stop()``,
+    # which frees the driver subprocess — and leak a process per crash.
+    _CLOSE_STEP_TIMEOUT_S = 10
+
+    async def _close_step(self, awaitable, what: str):
+        """Run one teardown step, bounded and best-effort (never raises).
+
+        A throw OR a hang on one step must not skip the remaining steps, so each
+        is wrapped in its own ``asyncio.wait_for`` and its errors are swallowed.
+        """
+        try:
+            await asyncio.wait_for(awaitable, timeout=self._CLOSE_STEP_TIMEOUT_S)
+        except Exception as exc:
+            logger.debug("Teardown step %s did not complete cleanly: %s", what, exc)
+
     async def close_browser(self):
-        """Close browser and cleanup"""
+        """Close browser and cleanup.
+
+        Every step is independently bounded and best-effort. ``_refresh_context``
+        calls this specifically against *crashed/half-closed* objects, where the
+        snapshot, ``context.close``, ``browser.close`` or ``playwright.stop`` can
+        each throw *or hang*. Either failure on one step must not skip the later
+        steps and orphan the still-running Chrome/Playwright node driver, so a
+        repeated crash-recovery refresh would leak a process per crash. Bounding
+        each step keeps the teardown total — every handle gets a bounded close
+        attempt, and ``stop`` (which frees the driver subprocess) always runs.
+        """
         if self.context:
-            # Save session state
-            await self.context.storage_state(path=str(self.settings.session_path))
-            await self.context.close()
+            await self._close_step(
+                self.context.storage_state(path=str(self.settings.session_path)),
+                "storage_state",
+            )
+            await self._close_step(self.context.close(), "context.close")
         if self.browser:
-            await self.browser.close()
+            await self._close_step(self.browser.close(), "browser.close")
         if self.playwright:
-            await self.playwright.stop()
+            await self._close_step(self.playwright.stop(), "playwright.stop")
 
     async def login(self, progress_callback: Optional[Callable] = None) -> bool:
         """Login to LinkedIn with enhanced session detection"""
@@ -613,17 +703,21 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback("Starting profile search...")
 
-            # Guarded navigation: goto -> settle -> landing guard. A bounce to a
+            # Guarded navigation: resilient goto (transient-error retry +
+            # renderer-crash watchdog + one crash-recovery refresh) -> settle ->
+            # surf benign interstitials -> landing guard. A bounce to a
             # challenge/login wall or a wrong path raises a typed exception with
             # an evidence bundle; ``strict_path`` asserts we are still on the
             # people-search results path even when LinkedIn rewrites the rest of
-            # the URL. The humanized scroll below still runs after this returns.
-            await navigate_guarded(
+            # the URL. navigate_guarded returns the page it finished on (a fresh
+            # one if a crash was recovered), so rebind self.page. The humanized
+            # scroll below still runs after this returns.
+            self.page = await navigate_guarded(
                 self.page,
                 search_url,
                 strict_path="/search/results/people",
-                timeout=30000,
                 context={"campaign": campaign.name},
+                **self._nav_kwargs(),
             )
             # Disambiguate "empty" from "not rendered yet": race the readiness
             # selector against the explicit no-results marker and, if neither
@@ -873,42 +967,64 @@ class LinkedInAutomation:
                     existing_count += 1
                     continue
 
-                # Navigate to profile (throttled by the per-minute action cap).
-                # Guarded: goto -> settle -> landing guard. A bounce to a
-                # challenge/login wall raises a typed exception (caught below);
-                # path-diff is OFF because LinkedIn canonicalizes vanity profile
-                # URLs (a normal redirect, not a wrong landing). The challenge
-                # detection and overlay sweep still run.
+                # Navigate to the profile and read it — all under ONE per-item
+                # interaction watchdog (run_bounded). The whole read sequence
+                # (guarded navigation, the DOM-level CAPTCHA check, the humanized
+                # scroll/dwell, and the connect-control lookup) consists of
+                # untimeouted page calls — a crashed renderer defeats even
+                # locator.count(), so any of them can hang forever. Bounding the
+                # whole unit means a wedge at any point caps the item, refreshes
+                # the browser, and re-raises TimeoutError so this profile is
+                # skipped (caught below) without wedging the rest of the worklist.
+                #
+                # navigate_guarded itself is guarded + resilient (transient-error
+                # retry + renderer-crash watchdog + one crash-recovery refresh,
+                # then goto -> settle -> surf -> landing guard). check_path is OFF
+                # because LinkedIn canonicalizes vanity profile URLs (a normal
+                # redirect). A challenge/login bounce raises a typed exception
+                # (caught below). On a recovered crash navigate_guarded returns a
+                # fresh page, and the connect-control lookup uses self.page, so
+                # the helper rebinds self.page before reading it.
+                async def _navigate_and_read():
+                    self.page = await navigate_guarded(
+                        self.page,
+                        profile.profile_url,
+                        check_path=False,
+                        context={"profile_url": profile.profile_url},
+                        **self._nav_kwargs(),
+                    )
+                    # DOM-level captcha check (an in-page widget on a non-wall
+                    # URL); the URL-level bounce is already caught by the guard.
+                    captcha = await detect_captcha(self.page)
+                    if captcha:
+                        return True, None, None
+                    # Read the profile like a human (scroll + dwell) before
+                    # acting (#15 humanization preserved). _find_connect_control
+                    # scrolls back to the top to bring the top-card action in view.
+                    await scroll_down(self.page)
+                    await self._dwell()
+                    button, kind = await self._find_connect_control(profile)
+                    return False, button, kind
+
                 await self._throttle_action()
-                await navigate_guarded(
-                    self.page,
-                    profile.profile_url,
-                    check_path=False,
-                    timeout=30000,
-                    context={"profile_url": profile.profile_url},
+                captcha_detected, connect_button, control_kind = await run_bounded(
+                    _navigate_and_read(),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"profile:{profile.name}",
                 )
 
                 # Stop early if LinkedIn challenges us — pushing through a
-                # CAPTCHA is the fastest way to get an account restricted. The
-                # guard already catches a URL-level challenge bounce; this is the
-                # DOM-level captcha check (an in-page widget on a non-wall URL).
-                if await detect_captcha(self.page):
+                # CAPTCHA is the fastest way to get an account restricted.
+                if captcha_detected:
                     logger.warning("CAPTCHA detected during connection run; stopping")
                     if progress_callback:
                         progress_callback(
                             "⚠️ CAPTCHA detected — stopping automation to protect the account"
                         )
                     break
-
-                # Read the profile like a human (scroll + dwell) before acting,
-                # right after the guarded navigation verified the landing (#15
-                # humanization preserved). _find_connect_control scrolls back to
-                # the top afterward to bring the top-card action into view.
-                await scroll_down(self.page)
-                await self._dwell()
-
-                # Find the Connect / Pending control for THIS profile.
-                connect_button, control_kind = await self._find_connect_control(profile)
 
                 if control_kind == "pending":
                     logger.info(f"Pending invitation already exists for {profile.name}")
@@ -964,29 +1080,88 @@ class LinkedInAutomation:
                     break
                 slot_reserved = True
 
-                # Click Connect. The top-card control is already in view at
-                # scroll-top, so a natural mouse move reaches it and the SDUI
-                # opens the invitation modal (a JS click is a last resort for
-                # the rare case the control is still occluded).
-                logger.info("Clicking 'Connect' button")
-                await self._throttle_action()
-                await move_to_and_click(self.page, connect_button)
-                await random_wait(self.page, min_ms=2500, max_ms=4000)
+                # Click Connect and wait for the invitation modal — under the
+                # SAME per-item watchdog as the read unit. ``move_to_and_click``,
+                # ``query_selector`` and the modal-polling ``locator.count()``
+                # loop are all untimeouted page operations a wedged renderer can
+                # hang forever (a crashed renderer defeats even ``count()``); the
+                # ``click`` has its own 5s timeout but the surrounding reads do
+                # not. Bounding the click+poll here means a wedge after the page
+                # loaded (e.g. right after clicking Connect, or while waiting for
+                # the modal) caps the item, refreshes, and the outer
+                # ``except asyncio.TimeoutError`` skips this profile and releases
+                # its reserved slot — instead of wedging the rest of the run.
+                async def _click_connect_and_await_modal():
+                    # The top-card control is already in view at scroll-top, so a
+                    # natural mouse move reaches it and the SDUI opens the
+                    # invitation modal (a JS click is a last resort for the rare
+                    # case the control is still occluded).
+                    logger.info("Clicking 'Connect' button")
+                    await self._throttle_action()
+                    await move_to_and_click(self.page, connect_button)
+                    await random_wait(self.page, min_ms=2500, max_ms=4000)
 
-                # Check if email is required to connect (dismiss and skip)
-                email_label = await self.page.query_selector('label[for="email"]')
+                    email_present = (
+                        await self.page.query_selector('label[for="email"]')
+                        is not None
+                    )
+                    if email_present:
+                        return "email_required", False, False
+
+                    note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
+                    send_no_note_loc = self.page.locator(
+                        sel.INVITE_SEND_NO_NOTE.css
+                    ).first
+                    send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
+                    blocked_inner = False
+                    modal_ready_inner = False
+                    for _ in range(8):
+                        # LinkedIn blocks re-inviting for 3 weeks after a
+                        # withdrawal; clicking Connect then shows an error toast
+                        # and no modal.
+                        if await self._invitation_blocked_toast():
+                            blocked_inner = True
+                            break
+                        if (
+                            await note_loc.count()
+                            or await send_no_note_loc.count()
+                            or await send_exact_loc.count()
+                        ):
+                            modal_ready_inner = True
+                            break
+                        await self.page.wait_for_timeout(1000)
+                    return "modal_check", blocked_inner, modal_ready_inner
+
+                modal_outcome, blocked, modal_ready = await run_bounded(
+                    _click_connect_and_await_modal(),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"invite:{profile.name}",
+                )
+
+                # Check if email is required to connect (dismiss and skip). The
+                # ``email`` field is the modal's fingerprint; the dismiss control
+                # comes from the selector registry (EMAIL_REQUIRED_DISMISS) so the
+                # ES/EN aria-label variants live in one maintained place. This is
+                # the *in-flow* handler that runs right after the Connect click
+                # (when the modal actually appears and we must record the skip);
+                # surf_benign_interstitials' email-modal dismiss is a cross-
+                # navigation backstop for a stray leftover. They intentionally
+                # share the selector — don't dedupe one away.
+                email_label = (
+                    await self.page.query_selector('label[for="email"]')
+                    if modal_outcome == "email_required"
+                    else None
+                )
                 if email_label:
                     logger.info(
                         f"Email request modal detected for {profile.name}. Dismissing..."
                     )
-                    for dismiss_sel in (
-                        'button[aria-label="Descartar"]',
-                        'button[aria-label="Dismiss"]',
-                    ):
-                        dismiss_btn = await self.page.query_selector(dismiss_sel)
-                        if dismiss_btn:
-                            await dismiss_btn.click()
-                            break
+                    dismiss_btn = await sel.EMAIL_REQUIRED_DISMISS.locate(self.page)
+                    if dismiss_btn:
+                        await dismiss_btn.click()
 
                     contact_data = {
                         "campaign_id": campaign.id,
@@ -1005,33 +1180,11 @@ class LinkedInAutomation:
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
 
-                # The invitation modal renders a moment after the click and is
-                # not a standard <dialog>, so locate its buttons by text and
-                # poll until they appear. ":text-is" matches the exact label so
-                # "Enviar" never collides with "Enviar sin nota" / "Enviar mensaje".
-                note_loc = self.page.locator(sel.INVITE_ADD_NOTE.css).first
-                send_no_note_loc = self.page.locator(
-                    sel.INVITE_SEND_NO_NOTE.css
-                ).first
-                send_exact_loc = self.page.locator(sel.INVITE_SEND.css).first
-
-                blocked = False
-                modal_ready = False
-                for _ in range(8):
-                    # LinkedIn blocks re-inviting for 3 weeks after a withdrawal;
-                    # clicking Connect then shows an error toast and no modal.
-                    if await self._invitation_blocked_toast():
-                        blocked = True
-                        break
-                    if (
-                        await note_loc.count()
-                        or await send_no_note_loc.count()
-                        or await send_exact_loc.count()
-                    ):
-                        modal_ready = True
-                        break
-                    await self.page.wait_for_timeout(1000)
-
+                # ``blocked`` / ``modal_ready`` were computed inside the bounded
+                # click+poll unit above. The invitation modal is not a standard
+                # <dialog>, so its buttons were located by text and polled until
+                # they appeared (":text-is" matches the exact label so "Enviar"
+                # never collides with "Enviar sin nota" / "Enviar mensaje").
                 if blocked:
                     logger.info(
                         f"Invitation to {profile.name} blocked (recently withdrawn / cooldown)"
@@ -1082,6 +1235,15 @@ class LinkedInAutomation:
                         "LinkedIn Premium; sending without a note"
                     )
 
+                # NOTE: The send/finalize tail below (locate the send control,
+                # humanized move+click, weekly-limit check) is intentionally left
+                # UNBOUNDED — it is not wrapped in run_bounded like the read and
+                # click+modal units above. Bounding it under the per-item watchdog
+                # mis-accounts the irreversible send (a watchdog timeout after the
+                # click has already fired would skip the profile as "not sent"
+                # while LinkedIn actually delivered the invitation). Designing a
+                # resilient wrapper that is safe around the irreversible send is
+                # tracked separately in issue #31.
                 send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
                 send_exact = self.page.locator(sel.INVITE_SEND.css).first
                 send_target = send_no_note if await send_no_note.count() else send_exact
@@ -1184,10 +1346,46 @@ class LinkedInAutomation:
                         "to protect the account"
                     )
                 break
+            except asyncio.TimeoutError:
+                # The interaction watchdog fired: a wedged renderer exceeded the
+                # per-item budget. run_bounded already refreshed the browser
+                # (self.page rebound via the recover callback), so skip just this
+                # profile and keep processing the rest of the worklist.
+                logger.warning(
+                    "Per-profile interaction watchdog fired for %s; "
+                    "skipping after browser refresh",
+                    profile.name,
+                )
+                failed_count += 1
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Timed out on {profile.name} — refreshed browser and skipped"
+                    )
+                continue
             except Exception as e:
                 logger.error(f"Failed to process {profile.name}: {str(e)}")
                 failed_count += 1
                 consecutive_failures += 1
+
+                # A renderer that crashes by *raising* (rather than hanging)
+                # escapes the run_bounded watchdog and surfaces here. Without a
+                # refresh self.page stays dead and every later profile fails on
+                # it until the backoff. Detect the crash shape and refresh once
+                # so the rest of the worklist runs on a live page. Best-effort:
+                # a failed refresh must not mask the original failure handling.
+                if _is_crash_error(e):
+                    logger.warning(
+                        "Crash-shaped failure for %s — refreshing browser before "
+                        "continuing",
+                        profile.name,
+                    )
+                    try:
+                        await self._refresh_context()
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "Browser refresh after crash-shaped failure failed: %s",
+                            refresh_exc,
+                        )
 
                 # Exponential backoff after repeated failures: a burst of
                 # errors often means LinkedIn has started throttling or
@@ -1207,7 +1405,12 @@ class LinkedInAutomation:
                             f"⚠️ {consecutive_failures} consecutive failures — "
                             f"backing off {wait_seconds}s"
                         )
-                    await self.page.wait_for_timeout(wait_seconds * 1000)
+                    # A wall-clock pause, not a page operation — use asyncio so
+                    # it never depends on a live page. A crash-shaped failure
+                    # above may have left self.page None (a failed refresh), and
+                    # the old page-based sleep would then throw AttributeError
+                    # out of this handler and abort the whole run.
+                    await asyncio.sleep(wait_seconds)
                 continue
             finally:
                 # Give back a reserved slot that wasn't consumed by a confirmed

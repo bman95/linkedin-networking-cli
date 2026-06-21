@@ -1515,9 +1515,16 @@ class TestNavigationGuardWiring:
         """#15's humanized scroll_down survives and runs after the guard."""
         campaign = Campaign(name="Order")
         order = []
+
+        def _guard(page, *a, **k):
+            order.append("guard")
+            # navigate_guarded returns the page it finished on; search_profiles
+            # rebinds self.page to it, so the mock must hand the page back.
+            return page
+
         with patch(
             "automation.linkedin.navigate_guarded",
-            new=AsyncMock(side_effect=lambda *a, **k: order.append("guard")),
+            new=AsyncMock(side_effect=_guard),
         ), patch(
             "automation.linkedin.scroll_down",
             new=AsyncMock(side_effect=lambda *a, **k: order.append("scroll")),
@@ -1596,6 +1603,412 @@ class TestNavigationGuardWiring:
             await mock_linkedin_automation._wait_for_login_redirect(timeout_ms=1234)
         confirm.assert_awaited_once()
         assert confirm.await_args.kwargs["timeout"] == 1234
+
+    @pytest.mark.asyncio
+    async def test_search_nav_passes_recover_and_tunables(
+        self, mock_linkedin_automation
+    ):
+        """The search nav carries the crash-recovery callback + tuned timeout."""
+        campaign = Campaign(name="Recover")
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ) as guarded, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
+            await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+        kwargs = guarded.await_args.kwargs
+        assert kwargs["recover"] == mock_linkedin_automation._recover
+        assert kwargs["timeout"] == 30000  # NAV_GOTO_TIMEOUT_MS default
+        assert kwargs["max_retries"] == 2
+
+    @pytest.mark.asyncio
+    async def test_profile_nav_runs_under_run_bounded_with_recover(
+        self, mock_linkedin_automation
+    ):
+        """The per-profile nav is bounded by run_bounded and carries recover."""
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Bounded"})
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+
+        async def _passthrough(awaitable, **kwargs):
+            # Mirror run_bounded's contract: await the unit, return its result.
+            return await awaitable
+
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)
+        ) as bounded, patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(1)
+            )
+
+        bounded.assert_awaited()
+        kwargs = bounded.await_args.kwargs
+        assert kwargs["recover"] == mock_linkedin_automation._recover
+        assert kwargs["timeout_s"] == 240  # NAV_INTERACTION_WATCHDOG_S default
+
+    @pytest.mark.asyncio
+    async def test_profile_watchdog_timeout_skips_item_not_whole_run(
+        self, mock_linkedin_automation
+    ):
+        """A per-item watchdog timeout skips that profile and keeps going."""
+        import asyncio
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Skip"})
+        find = AsyncMock(return_value=(None, "none"))
+        mock_linkedin_automation._find_connect_control = find
+
+        calls = {"n": 0}
+        # A DISTINCT sentinel page (not the one already on self.page) so the
+        # final assertion truly proves the recover rebind happened, rather than
+        # passing trivially because both sides reference the same starting page.
+        fresh_page = MagicMock(name="recovered_page")
+        assert fresh_page is not mock_linkedin_automation.page
+        seen_pages = []
+
+        async def _run_bounded(awaitable, **kwargs):
+            calls["n"] += 1
+            # Close the un-awaited coroutine so it doesn't leak a warning.
+            awaitable.close()
+            seen_pages.append(mock_linkedin_automation.page)
+            if calls["n"] == 1:
+                # Mirror run_bounded's contract: refresh (rebinds self.page),
+                # then re-raise so the caller skips the item.
+                await kwargs["recover"]()
+                raise asyncio.TimeoutError()
+            return mock_linkedin_automation.page
+
+        async def _recover():
+            mock_linkedin_automation.page = fresh_page
+            return fresh_page
+
+        with patch.object(
+            mock_linkedin_automation, "_recover", new=_recover
+        ), patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            messages = []
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(2), progress_callback=messages.append
+            )
+
+        # Both profiles were attempted (the run did NOT break on the timeout).
+        assert calls["n"] == 2
+        assert result["failed"] >= 1
+        assert any("Timed out" in m for m in messages)
+        # The second iteration ran on the recover-returned page (the watchdog's
+        # whole purpose: leave a live page for the rest of the worklist).
+        assert seen_pages[1] is fresh_page
+
+    @pytest.mark.asyncio
+    async def test_recover_refreshes_context_and_rebinds_page(
+        self, mock_linkedin_automation
+    ):
+        """_recover refreshes the context (close + reopen) and returns the page."""
+        fresh_page = MagicMock()
+
+        async def _fake_start():
+            mock_linkedin_automation.page = fresh_page
+
+        with patch.object(
+            mock_linkedin_automation, "close_browser", new=AsyncMock()
+        ) as close, patch.object(
+            mock_linkedin_automation, "start_browser",
+            new=AsyncMock(side_effect=_fake_start),
+        ) as start:
+            returned = await mock_linkedin_automation._recover()
+
+        close.assert_awaited_once()
+        start.assert_awaited_once()
+        assert returned is fresh_page
+        assert mock_linkedin_automation.page is fresh_page
+
+    @pytest.mark.asyncio
+    async def test_refresh_context_survives_a_failing_close(
+        self, mock_linkedin_automation
+    ):
+        """A close whose underlying steps throw must not wedge the refresh.
+
+        close_browser is per-step bounded and never raises, so _refresh_context
+        drops the partial handles and start_browser relaunches from a clean slate
+        even when the crashed context/browser closes throw — the load-bearing
+        'the refresh can't itself wedge' guarantee.
+        """
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock(side_effect=RuntimeError("dead context"))
+        ctx.close = AsyncMock(side_effect=RuntimeError("close failed"))
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = AsyncMock()
+        mock_linkedin_automation.playwright = AsyncMock()
+
+        fresh_page = MagicMock()
+
+        async def _fake_start():
+            mock_linkedin_automation.page = fresh_page
+
+        with patch.object(
+            mock_linkedin_automation, "start_browser",
+            new=AsyncMock(side_effect=_fake_start),
+        ) as start:
+            returned = await mock_linkedin_automation._refresh_context()
+
+        start.assert_awaited_once()
+        # Handles were dropped before the relaunch and the fresh page is returned.
+        assert returned is fresh_page
+        assert mock_linkedin_automation.page is fresh_page
+
+    @pytest.mark.asyncio
+    async def test_close_browser_stops_playwright_even_if_context_close_raises(
+        self, mock_linkedin_automation
+    ):
+        """A throwing context.close() must not skip browser.close()/playwright.stop().
+
+        On a crash-recovery refresh close_browser runs against half-closed
+        objects; an unguarded throw on any step would leak the still-running
+        Chrome/Playwright driver. Every step must get its own attempt.
+        """
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock(side_effect=RuntimeError("dead context"))
+        ctx.close = AsyncMock(side_effect=RuntimeError("close failed"))
+        browser = AsyncMock()
+        playwright = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = browser
+        mock_linkedin_automation.playwright = playwright
+
+        # Must not raise despite storage_state AND context.close throwing.
+        await mock_linkedin_automation.close_browser()
+
+        # browser.close and (critically) playwright.stop still ran — the driver
+        # subprocess is freed.
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_browser_bounds_a_hanging_step_and_still_stops(
+        self, mock_linkedin_automation
+    ):
+        """A HUNG context.close() is bounded so playwright.stop() still runs.
+
+        On a wedged renderer a close can hang (not just throw); the per-step
+        watchdog must cap it so the later steps — especially the stop() that
+        frees the driver — are not starved.
+        """
+        import asyncio
+
+        async def _hang():
+            await asyncio.sleep(60)
+
+        ctx = AsyncMock()
+        ctx.storage_state = AsyncMock()
+        ctx.close = AsyncMock(side_effect=_hang)
+        browser = AsyncMock()
+        playwright = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.browser = browser
+        mock_linkedin_automation.playwright = playwright
+
+        # Shrink the per-step budget so the test is fast.
+        with patch.object(
+            type(mock_linkedin_automation), "_CLOSE_STEP_TIMEOUT_S", 0.01
+        ):
+            await mock_linkedin_automation.close_browser()
+
+        playwright.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_invite_flow_runs_under_run_bounded(self, mock_linkedin_automation):
+        """The connect-click + modal-poll page work is bounded by run_bounded too.
+
+        The read unit and the invite unit are BOTH wrapped, so a wedge after the
+        page loaded (clicking Connect / waiting for the modal) is bounded, not
+        just the navigation/read.
+        """
+        from automation.linkedin import LinkedInProfile
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "InviteBounded"})
+        # A real Connect control so the flow reaches the invite unit.
+        connect_btn = AsyncMock()
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(connect_btn, "connect")
+        )
+
+        labels_seen = []
+
+        async def _passthrough(awaitable, **kwargs):
+            labels_seen.append(kwargs.get("label", ""))
+            return await awaitable
+
+        with patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)
+        ) as bounded, patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_and_click", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.random_wait", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation, "_invitation_blocked_toast",
+            new=AsyncMock(return_value=False),
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                [LinkedInProfile(name="P", profile_url="https://x/in/p/")],
+            )
+
+        # run_bounded was used for BOTH the profile read and the invite flow.
+        assert any(lbl.startswith("profile:") for lbl in labels_seen)
+        assert any(lbl.startswith("invite:") for lbl in labels_seen)
+        bounded.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dom_captcha_in_read_unit_stops_run(self, mock_linkedin_automation):
+        """A DOM-level CAPTCHA detected inside the bounded read unit stops the run.
+
+        The captcha check now lives inside the run_bounded read unit and returns
+        a flag; the loop must still break (protect the account) on it, before
+        ever looking up the connect control.
+        """
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Captcha"})
+        find = AsyncMock(return_value=(None, "none"))
+        mock_linkedin_automation._find_connect_control = find
+
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=True)
+        ):
+            messages = []
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=messages.append
+            )
+
+        # Broke on the first profile's captcha; never reached the connect lookup.
+        find.assert_not_awaited()
+        assert result["sent"] == 0
+        assert any("CAPTCHA detected" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_crash_shaped_failure_in_loop_refreshes_once(
+        self, mock_linkedin_automation
+    ):
+        """A crash that *raises* (not hangs) past the watchdog refreshes once.
+
+        run_bounded only catches a hang; a renderer that crashes by raising
+        surfaces in the generic except. Without a refresh self.page stays dead
+        and every later profile fails on it — so the handler must recover once.
+        """
+        from playwright.async_api import Error as PWError
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "CrashRaise"})
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+
+        async def _run_bounded(awaitable, **kwargs):
+            awaitable.close()
+            raise PWError("Page crashed")
+
+        with patch.object(
+            mock_linkedin_automation, "_refresh_context", new=AsyncMock()
+        ) as refresh, patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(1)
+            )
+
+        refresh.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_crash_with_failing_refresh_does_not_abort_run(
+        self, mock_linkedin_automation
+    ):
+        """A failed crash-refresh + backoff must not abort the whole run.
+
+        Regression guard: _refresh_context nulls self.page before relaunching,
+        so a *failing* refresh leaves self.page = None. The post-failure backoff
+        sleep must therefore not be a page operation (else AttributeError on None
+        escapes the handler and kills the run). Drive 4 crash-shaped failures so
+        the >=3 backoff branch runs, with a refresh that always fails.
+        """
+        from playwright.async_api import Error as PWError
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "CrashNoAbort"})
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(None, "none")
+        )
+
+        async def _run_bounded(awaitable, **kwargs):
+            awaitable.close()
+            raise PWError("Page crashed")
+
+        async def _failing_refresh():
+            # Mirror _refresh_context's contract: it nulls self.page, then the
+            # relaunch fails — leaving self.page None.
+            mock_linkedin_automation.page = None
+            raise RuntimeError("relaunch failed")
+
+        with patch.object(
+            mock_linkedin_automation, "_refresh_context",
+            new=AsyncMock(side_effect=_failing_refresh),
+        ), patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch(
+            "automation.linkedin.asyncio.sleep", new=AsyncMock()
+        ):
+            # Must complete (not raise AttributeError out of the loop).
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(4)
+            )
+
+        # All four were attempted and counted as failures; the run survived.
+        assert result["failed"] == 4
 
 
 # ============================================================================

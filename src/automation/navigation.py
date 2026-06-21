@@ -23,7 +23,29 @@ On a fatal mismatch it captures a diagnostics evidence bundle and raises a typed
 exception (``CaptchaDetectedException`` / ``NotAuthenticatedException`` for a
 challenge/login bounce, ``UnexpectedLandingException`` otherwise).
 
-Two companions live here too:
+Around that gate sits a **resilience layer** (issue #17) that surfs the problems
+it can safely surf and never wedges on a crashed renderer:
+
+- **goto retry**: ``page.goto`` is retried on transient ``net::ERR_*`` failures
+  with a small backoff and a bounded retry count, so a flaky resolver/connection
+  on a cold start does not fail a whole run.
+- **renderer-crash watchdog**: the ``goto`` is wrapped in an *outer*
+  ``asyncio.wait_for``. A renderer that crashes mid-navigation detaches the CDP
+  session ``goto``'s own timer is bound to, so the call would deadlock forever;
+  the watchdog converts that into a crash-shaped error.
+- **crash detect + recover**: a ``"crashed"`` / ``"target closed"`` /
+  ``"unresponsive"`` error triggers the caller's ``recover`` callback (close +
+  reopen the context, *keeping the persistent profile/cookies*) and one retry,
+  so a single crash does not cascade across the worklist.
+- **surf benign interstitials**: cookie banners and the email-required modal are
+  auto-dismissed (via the selector registry). CAPTCHAs and security checkpoints
+  are **not** surfed — those hard-stop via the landing guard above.
+- **bounded per-item interaction**: ``run_bounded`` wraps each per-profile /
+  per-card unit of work in an ``asyncio.wait_for`` so a crashed renderer (which
+  defeats even ``locator.count()``'s missing timeout) cannot hang the run; on
+  fire the browser is refreshed and the item skipped.
+
+Three companions live here too:
 
 - ``confirm_logged_in_dom`` — DOM-backed login confirmation (a logged-in nav
   landmark *in addition to* the URL), so a soft block on a non-login URL is not
@@ -32,21 +54,25 @@ Two companions live here too:
   pages: race a ready-selector against an empty-selector and, on render timeout,
   reload once before trusting "no results" (re-checking for a challenge that
   replaced the listing).
+- ``run_bounded`` — the per-item interaction watchdog described above.
 
-Modeled on the LinkedIn Worker project's ``_guard_landing`` / ``_diff_redirect``
+Modeled on the LinkedIn Worker project's ``goto_with_retry`` / ``run_bounded`` /
+``_handle_possible_crash`` and ``_guard_landing`` / ``_diff_redirect``
 (``agent/src/workflows/base.py``) and ``detection.py``.
 
 All functions are async and operate on an async Playwright ``Page``.
 """
 
+import asyncio
 import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Optional, Tuple
 
 sys.path.append(str(Path(__file__).parent.parent))
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from automation import selectors as sel
@@ -81,6 +107,49 @@ _CHALLENGE_PATH_SEGMENTS = ("checkpoint", "authwall")
 # as ignoring the params LinkedIn *adds*): only the params that actually steer
 # the result set (keywords, geoUrn, industry, network, start, page) are checked.
 _NON_SEMANTIC_REQUEST_PARAMS = frozenset({"origin", "sid", "trk", "trackingid"})
+
+# --- Resilience-layer defaults (issue #17) ------------------------------------
+# Defaults mirror ``AppSettings.get_navigation_settings``; the callers in
+# ``linkedin.py`` pass the env-tuned values, and these keep the helpers usable
+# (and testable) standalone with the same numbers.
+#
+# ``_DEFAULT_GOTO_TIMEOUT_MS`` — per-``page.goto`` navigation timeout.
+# ``_DEFAULT_MAX_RETRIES``     — extra ``goto`` attempts on a transient net error.
+# ``_DEFAULT_BACKOFF_BASE_S``  — base seconds for the inter-retry backoff.
+# ``_DEFAULT_HARD_MARGIN_S``   — slack on top of the goto timeout for the outer
+#                                ``asyncio`` crash watchdog.
+# ``_DEFAULT_INTERACTION_WATCHDOG_S`` — hard cap for one ``run_bounded`` unit.
+_DEFAULT_GOTO_TIMEOUT_MS = 30_000
+_DEFAULT_MAX_RETRIES = 2
+_DEFAULT_BACKOFF_BASE_S = 3
+_DEFAULT_HARD_MARGIN_S = 15
+_DEFAULT_INTERACTION_WATCHDOG_S = 240
+
+# A "recover" callback closes + reopens the browser context (keeping the
+# persistent profile/cookies) and returns the fresh ``Page``. It is supplied by
+# the automation engine; the navigation helpers stay page-agnostic by taking it
+# as a parameter rather than reaching into ``LinkedInAutomation``.
+RecoverCallback = Callable[[], Awaitable["object"]]
+
+
+def _is_crash_error(exc: BaseException) -> bool:
+    """True when ``exc`` looks like a renderer/browser crash or a wedged renderer.
+
+    A crashed renderer surfaces as ``"Page crashed"`` from Playwright, a context
+    that died takes the page with it (``"Target page, context or browser has
+    been closed"`` / ``"target closed"`` across Playwright versions), and a
+    navigation that hung against a wedged renderer is re-raised by
+    ``_goto_with_retry`` as ``"... renderer unresponsive"``. These are the cases
+    a context refresh can recover; a plain ``net::ERR_*`` (handled by the retry
+    loop) or a typed landing exception is *not* a crash.
+    """
+    msg = str(exc).lower()
+    return (
+        "crashed" in msg
+        or "target closed" in msg
+        or "has been closed" in msg
+        or "unresponsive" in msg
+    )
 
 
 def _path_segments(path: str) -> set:
@@ -329,22 +398,179 @@ async def _raise_mismatch(page, exc, context):
     raise exc
 
 
+async def _goto_with_retry(
+    page,
+    url: str,
+    *,
+    timeout: int,
+    wait_until: Optional[str],
+    max_retries: int,
+    retry_backoff_base_s: int,
+    hard_timeout_margin_s: int,
+) -> None:
+    """``page.goto`` that retries transient net errors and can't hang forever.
+
+    Three distinct failure modes, kept distinct on purpose:
+
+    - **Transient network error** (``net::ERR_NAME_NOT_RESOLVED`` /
+      ``ERR_CONNECTION_CLOSED`` …): a flaky resolver/connection on a cold start
+      loses the first ``goto`` while a manual reload succeeds. Retried up to
+      ``max_retries`` times with a ``base * (attempt + 1)`` second backoff. Any
+      other Playwright error (or the last attempt) propagates unchanged.
+    - **Wedged renderer**: a renderer that crashes *mid-navigation* detaches the
+      CDP session ``page.goto``'s own timer is bound to, so the driver timeout
+      never fires and the call deadlocks forever. The ``goto`` is wrapped in an
+      outer ``asyncio.wait_for`` (goto timeout + ``hard_timeout_margin_s``);
+      *only* that outer fire is re-raised as a crash-shaped ``PlaywrightError``,
+      so the caller's heavyweight crash recovery (context refresh) engages for a
+      genuine wedge and nothing else.
+    - **Slow-but-alive page** (the driver's own ``PlaywrightTimeoutError`` from
+      ``goto``): the page is reachable, just slow — *not* a crash. It propagates
+      unchanged so the caller treats it as an ordinary navigation timeout rather
+      than tearing down and relaunching the whole browser. Folding it into the
+      crash path (as a naive single ``except`` would) would force a full Chrome
+      relaunch on every slow load, which is both wasteful and wrong.
+    """
+    hard = timeout / 1000 + hard_timeout_margin_s
+    goto_kwargs = {"timeout": timeout}
+    if wait_until is not None:
+        goto_kwargs["wait_until"] = wait_until
+
+    # Clamp to >= 0: a misconfigured negative retry count must still perform the
+    # navigation once. Without this, range(max_retries + 1) would be range(0) for
+    # max_retries == -1 and skip page.goto() entirely (returning as if navigated).
+    max_retries = max(max_retries, 0)
+
+    for attempt in range(max_retries + 1):
+        try:
+            await asyncio.wait_for(page.goto(url, **goto_kwargs), timeout=hard)
+            return
+        except asyncio.TimeoutError as exc:
+            # ONLY the outer watchdog firing means the renderer is wedged: the
+            # driver timeout never resolved, so the goto deadlocked. Surface it
+            # as a crash so the caller refreshes the browser instead of retrying
+            # on a dead page. A driver-side PlaywrightTimeoutError (slow page) is
+            # deliberately NOT caught here — it falls through to propagate plain.
+            raise PlaywrightError(
+                f"Navigation to {url!r} hung past {hard:.0f}s — "
+                "renderer unresponsive"
+            ) from exc
+        except PlaywrightTimeoutError:
+            # The page is reachable but slow — a normal navigation timeout, not a
+            # crash. Propagate unchanged; do not trigger a context refresh.
+            raise
+        except PlaywrightError as exc:
+            if "net::ERR_" not in str(exc) or attempt == max_retries:
+                raise
+            delay = retry_backoff_base_s * (attempt + 1)
+            logger.warning(
+                "Transient navigation error (%s) — retry %d/%d in %ds",
+                str(exc).splitlines()[0],
+                attempt + 1,
+                max_retries,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+
+# Fingerprint that *gates* surfing the generic Dismiss/Descartar button: a bare
+# "Dismiss" matches many LinkedIn dialogs, so the email-required dismiss is only
+# surfed when the email field that uniquely identifies that modal is present.
+# Without this gate, surf would click away an unrelated dialog before the
+# overlay sweep (``sweep_unexpected_overlay``) could capture it as an anomaly.
+_EMAIL_MODAL_FINGERPRINT = "label[for='email']"
+
+
+async def _interstitial_present(page, fingerprint: Optional[str]) -> bool:
+    """Whether a gating fingerprint is on the page (non-raising). None => always."""
+    if fingerprint is None:
+        return True
+    try:
+        return await page.locator(fingerprint).count() > 0
+    except Exception as exc:
+        logger.debug("Interstitial fingerprint probe %r failed: %s", fingerprint, exc)
+        return False
+
+
+async def surf_benign_interstitials(page, *, context: Optional[dict] = None) -> bool:
+    """Auto-dismiss the *safe-to-surf* interstitials (cookie banner, email modal).
+
+    Surfing means clicking away only the overlays that are benign decoys — a
+    cookie-consent banner and the "email required to connect" modal. They merely
+    eat the next click; dismissing them changes nothing about the session. A
+    CAPTCHA or a security checkpoint is **never** surfed here: those are handled
+    by the landing guard, which hard-stops the run with a typed exception. This
+    is therefore deliberately a *closed allow-list*, not a generic "close any
+    modal" sweep.
+
+    Each entry may carry a *fingerprint* that must be present before its dismiss
+    button is clicked. The email-required modal's dismiss button is a bare
+    ``Dismiss``/``Descartar`` that matches many unrelated dialogs, so it is gated
+    on the ``label[for='email']`` field that uniquely identifies that modal —
+    otherwise surf could click away (and hide) an unexpected overlay before the
+    landing guard's overlay sweep records it. The cookie banner's accept control
+    is specific enough to need no gate.
+
+    Best-effort and non-fatal: a click failure is logged and skipped so surfing
+    can never derail the navigation it is meant to smooth. Returns True if any
+    interstitial was dismissed.
+
+    Args:
+        page: An async Playwright ``Page``.
+        context: Optional dict (unused today; accepted for call-site symmetry
+            with the other guard helpers).
+
+    Returns:
+        True when at least one benign interstitial was dismissed, else False.
+    """
+    dismissed = False
+    # (dismiss-control selector, gating fingerprint or None for "always safe").
+    surfable = (
+        (sel.COOKIE_BANNER_DISMISS, None),
+        (sel.EMAIL_REQUIRED_DISMISS, _EMAIL_MODAL_FINGERPRINT),
+    )
+    for selector, fingerprint in surfable:
+        if not await _interstitial_present(page, fingerprint):
+            continue
+        try:
+            handle = await selector.locate(page)
+        except Exception as exc:
+            logger.debug("Interstitial probe %r failed: %s", selector.name, exc)
+            continue
+        if handle is None:
+            continue
+        try:
+            await handle.click()
+            dismissed = True
+            logger.info("Surfed benign interstitial: %s", selector.name)
+        except Exception as exc:
+            logger.debug("Interstitial dismiss %r failed: %s", selector.name, exc)
+    return dismissed
+
+
 async def navigate_guarded(
     page,
     url: str,
     *,
     strict_path: Optional[str] = None,
     check_path: bool = True,
-    timeout: int = 30_000,
+    timeout: int = _DEFAULT_GOTO_TIMEOUT_MS,
     settle_timeout_ms: int = 2_000,
     wait_until: Optional[str] = None,
     context: Optional[dict] = None,
-) -> None:
-    """Navigate to ``url`` and verify the browser actually landed there.
+    recover: Optional[RecoverCallback] = None,
+    max_retries: int = _DEFAULT_MAX_RETRIES,
+    retry_backoff_base_s: int = _DEFAULT_BACKOFF_BASE_S,
+    hard_timeout_margin_s: int = _DEFAULT_HARD_MARGIN_S,
+    surf: bool = True,
+):
+    """Navigate to ``url`` resiliently and verify the browser landed there.
 
-    Replaces a bare ``page.goto`` + fixed ``wait_for_timeout`` with: goto →
-    settle → landing guard. On a wrong landing it captures a diagnostics
-    evidence bundle and raises a typed exception.
+    Replaces a bare ``page.goto`` + fixed ``wait_for_timeout`` with: resilient
+    goto (transient-error retry + renderer-crash watchdog + one crash-recovery
+    retry) → settle → surf benign interstitials → landing guard. On a wrong
+    landing it captures a diagnostics evidence bundle and raises a typed
+    exception.
 
     Args:
         page: An async Playwright ``Page``.
@@ -365,20 +591,120 @@ async def navigate_guarded(
             (e.g. ``"domcontentloaded"``); passed through when set.
         context: Optional dict merged into any evidence bundle this raises
             (e.g. ``{"campaign": name}`` / ``{"profile_url": url}``).
+        recover: Optional async callback that refreshes the browser context
+            (close + reopen, *keeping the persistent profile/cookies*) and
+            returns the fresh ``Page``. When supplied, a renderer-crash-shaped
+            failure during the goto triggers exactly one recover + retry so a
+            single crash does not cascade across the worklist. When ``None`` (or
+            recovery itself fails) the crash error propagates.
+        max_retries: Extra ``goto`` attempts on a transient ``net::ERR_*`` error.
+        retry_backoff_base_s: Base seconds for the inter-retry backoff.
+        hard_timeout_margin_s: Slack (s) added to the goto timeout for the outer
+            renderer-crash watchdog.
+        surf: When True (default), auto-dismiss benign interstitials (cookie
+            banner, email-required modal) after the settle and before the guard.
+
+    Returns:
+        The ``Page`` the navigation completed on — the same ``page`` normally,
+        or the fresh page from ``recover`` when a crash was recovered. Callers
+        holding a page reference must rebind it to the return value.
 
     Raises:
         CaptchaDetectedException: landed on a ``/checkpoint/`` / ``/authwall``.
         NotAuthenticatedException: landed on a ``/login`` / ``/uas/`` wall.
         UnexpectedLandingException: path changed or a requested param was reset.
     """
-    goto_kwargs = {"timeout": timeout}
-    if wait_until is not None:
-        goto_kwargs["wait_until"] = wait_until
-    await page.goto(url, **goto_kwargs)
-    await _settle(page, settle_timeout_ms)
-    await _guard_landing(
-        page, url, strict_path=strict_path, check_path=check_path, context=context
+    retry_kwargs = dict(
+        timeout=timeout,
+        wait_until=wait_until,
+        max_retries=max_retries,
+        retry_backoff_base_s=retry_backoff_base_s,
+        hard_timeout_margin_s=hard_timeout_margin_s,
     )
+
+    # Outer watchdog for the post-goto steps. The goto has its own inner
+    # asyncio.wait_for; settle/surf/guard each issue *untimeouted* page reads
+    # (surf's locator.count()/query_selector, the guard's URL/overlay reads) that
+    # a wedged renderer can hang forever. Bounding them here means a crash that
+    # *hangs* (not just one that raises) during the post-goto phase is converted
+    # to a crash-shaped error and recovered, instead of deadlocking a caller
+    # (e.g. search_profiles) that is not itself wrapped in run_bounded.
+    post_goto_hard_s = settle_timeout_ms / 1000 + hard_timeout_margin_s
+
+    async def _navigate_once(target_page):
+        """goto -> settle -> surf -> guard on ``target_page``.
+
+        The *whole* sequence is one recoverable unit: a renderer can crash not
+        only mid-``goto`` but also during the settle/surf/guard that immediately
+        follow (those touch the page too). Keeping them inside the recovery
+        boundary means such a crash refreshes + retries rather than surfacing as
+        an ordinary exception the caller misreads (e.g. ``search_profiles``
+        returning an empty result set). The landing guard's *typed* exceptions
+        (challenge/login/wrong-landing) are not crash-shaped, so ``_is_crash_error``
+        lets them propagate unchanged — recovery never swallows a real wall.
+        """
+        await _goto_with_retry(target_page, url, **retry_kwargs)
+
+        async def _post_goto():
+            await _settle(target_page, settle_timeout_ms)
+            if surf:
+                await surf_benign_interstitials(target_page, context=context)
+            await _guard_landing(
+                target_page,
+                url,
+                strict_path=strict_path,
+                check_path=check_path,
+                context=context,
+            )
+
+        try:
+            await asyncio.wait_for(_post_goto(), timeout=post_goto_hard_s)
+        except asyncio.TimeoutError as exc:
+            # A wedged renderer hung the post-goto reads. Surface it crash-shaped
+            # so the outer recovery refreshes the context and retries.
+            raise PlaywrightError(
+                f"Post-navigation page work for {url!r} hung past "
+                f"{post_goto_hard_s:.0f}s — renderer unresponsive"
+            ) from exc
+
+    try:
+        await _navigate_once(page)
+    except Exception as exc:
+        # Only a crash-shaped failure with a recovery callback is recoverable;
+        # transient net-error retries are already exhausted inside
+        # _goto_with_retry, and a non-crash error (a typed landing exception, or
+        # any failure when no callback was supplied) propagates so the caller's
+        # typed handling still runs.
+        if recover is None or not _is_crash_error(exc):
+            raise
+        logger.warning(
+            "Renderer crash during navigation to %r (%s) — refreshing context "
+            "and retrying once",
+            url,
+            exc,
+        )
+        try:
+            fresh = await recover()
+        except Exception as recover_exc:
+            # The refresh itself could not relaunch. Preserve the ORIGINAL crash
+            # as the cause (it is the real reason the navigation failed); a
+            # recover error chained over it would make the caller misclassify a
+            # page crash as a browser-startup/teardown failure.
+            logger.error(
+                "Context refresh after crash failed (%s); re-raising original "
+                "crash for %r",
+                recover_exc,
+                url,
+            )
+            raise exc
+        if fresh is not None:
+            page = fresh
+        # One full retry on the fresh page. A second crash propagates: a context
+        # that crashes again right after a refresh is not something one more
+        # refresh will fix, and the caller treats it as a hard nav failure.
+        await _navigate_once(page)
+
+    return page
 
 
 async def confirm_logged_in_dom(
@@ -564,3 +890,67 @@ async def verify_listing_rendered(
         page, context=context, timeout=ready_timeout_ms
     )
     return False  # pragma: no cover - fail_loud never returns
+
+
+async def run_bounded(
+    awaitable: Awaitable,
+    *,
+    timeout_s: float = _DEFAULT_INTERACTION_WATCHDOG_S,
+    recover: Optional[RecoverCallback] = None,
+    label: str = "unit",
+):
+    """Run one unit of page interaction under a hard watchdog. Returns its result.
+
+    A crashed renderer defeats Playwright's per-operation timeouts — even
+    ``locator.count()`` deadlocks, because it carries no timeout — so any
+    unbounded sequence of page calls for one item (a profile visit, a result
+    card) can wedge the run indefinitely. Wrap that whole unit in a single
+    coroutine and pass it here: on timeout the wedged browser is refreshed (via
+    ``recover``, keeping the persistent profile) and ``asyncio.TimeoutError`` is
+    re-raised so the caller can skip *this* item and keep the rest of the
+    worklist alive.
+
+    A unit that ran long but did not time out is surfaced with a WARNING (a
+    genuinely slow page and early memory pressure look alike, so the duration is
+    made visible) — but is not interfered with.
+
+    Args:
+        awaitable: A single coroutine doing all of one item's page interaction.
+        timeout_s: Hard cap (seconds) for the unit.
+        recover: Optional async callback that refreshes the browser context
+            (returning the fresh page) when the unit times out. The refresh
+            result is *not* returned here — the caller skips the timed-out item
+            and rebinds its page on the next navigation's ``recover`` — so a
+            wedged unit cannot also poison the next one.
+        label: Short name used in the watchdog log lines.
+
+    Returns:
+        The awaited result of ``awaitable`` on success.
+
+    Raises:
+        asyncio.TimeoutError: the unit exceeded ``timeout_s`` (after refresh).
+    """
+    start = time.monotonic()
+    try:
+        result = await asyncio.wait_for(awaitable, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s wedged the renderer (>%.0fs) — refreshing browser",
+            label,
+            timeout_s,
+        )
+        if recover is not None:
+            try:
+                await recover()
+            except Exception as exc:
+                logger.error("Browser refresh after wedge failed: %s", exc)
+        raise
+    elapsed = time.monotonic() - start
+    if elapsed > timeout_s / 2:
+        logger.warning(
+            "Slow %s took %.0fs (budget %.0fs) — watch for memory pressure",
+            label,
+            elapsed,
+            timeout_s,
+        )
+    return result

@@ -234,6 +234,48 @@ class AppSettings:
         )
         return settings
 
+    def get_navigation_settings(self) -> Dict[str, Any]:
+        """Get resilient-navigation tunables (issue #17).
+
+        These bound the retry/watchdog layer around the guarded navigation:
+
+        - ``goto_timeout_ms`` — the per-``page.goto`` navigation timeout.
+        - ``max_retries`` — extra ``goto`` attempts on a *transient* network
+          error (``net::ERR_*``); the total attempt count is this + 1.
+        - ``retry_backoff_base_s`` — base seconds for the inter-retry backoff
+          (attempt *n* waits ``base * (n + 1)`` seconds).
+        - ``hard_timeout_margin_s`` — slack added on top of the goto timeout for
+          the *outer* ``asyncio`` watchdog. A renderer that crashes
+          mid-navigation detaches the CDP session ``page.goto``'s own timer is
+          bound to, so the call would deadlock forever; the watchdog converts
+          that into a crash-shaped error the caller can recover from.
+        - ``interaction_watchdog_s`` — hard cap on one per-item (per-profile /
+          per-card) unit of page interaction. A crashed renderer defeats even
+          ``locator.count()`` (it carries no timeout), so each item runs under
+          this watchdog and a wedged unit is refreshed and skipped.
+        """
+        settings = {
+            "goto_timeout_ms": int(os.getenv("NAV_GOTO_TIMEOUT_MS", "30000")),
+            "max_retries": int(os.getenv("NAV_MAX_RETRIES", "2")),
+            "retry_backoff_base_s": int(os.getenv("NAV_RETRY_BACKOFF_BASE_S", "3")),
+            "hard_timeout_margin_s": int(os.getenv("NAV_HARD_TIMEOUT_MARGIN_S", "15")),
+            "interaction_watchdog_s": int(
+                os.getenv("NAV_INTERACTION_WATCHDOG_S", "240")
+            ),
+        }
+
+        logger.debug(
+            "Navigation settings: goto_timeout=%sms, max_retries=%s, "
+            "retry_backoff_base=%ss, hard_timeout_margin=%ss, "
+            "interaction_watchdog=%ss",
+            settings["goto_timeout_ms"],
+            settings["max_retries"],
+            settings["retry_backoff_base_s"],
+            settings["hard_timeout_margin_s"],
+            settings["interaction_watchdog_s"],
+        )
+        return settings
+
     def validate_credentials(self) -> bool:
         """Check if LinkedIn credentials are available"""
         is_valid = bool(self.linkedin_email and self.linkedin_password)
