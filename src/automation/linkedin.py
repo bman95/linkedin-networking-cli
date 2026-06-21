@@ -133,6 +133,13 @@ class LinkedInAutomation:
     BASE_URL = "https://www.linkedin.com"
     SEARCH_URL = f"{BASE_URL}/search/results/people/"
 
+    # Action labels (EN + ES) dropped from a result card's visible text lines so
+    # the headline/location land on the right lines when parsing a card.
+    _CARD_ACTION_WORDS = frozenset({
+        "conectar", "connect", "seguir", "follow",
+        "mensaje", "message", "pendiente", "pending",
+    })
+
     def __init__(self, db_manager: DatabaseManager, settings: AppSettings):
         self.db_manager = db_manager
         self.settings = settings
@@ -696,97 +703,19 @@ class LinkedInAutomation:
         reset_diagnostics_run()
 
         try:
-            # Build search URL
-            search_params = self._build_search_params(campaign)
-            search_url = f"{self.SEARCH_URL}?{search_params}"
-
             if progress_callback:
                 progress_callback("Starting profile search...")
 
-            # Guarded navigation: resilient goto (transient-error retry +
-            # renderer-crash watchdog + one crash-recovery refresh) -> settle ->
-            # surf benign interstitials -> landing guard. A bounce to a
-            # challenge/login wall or a wrong path raises a typed exception with
-            # an evidence bundle; ``strict_path`` asserts we are still on the
-            # people-search results path even when LinkedIn rewrites the rest of
-            # the URL. navigate_guarded returns the page it finished on (a fresh
-            # one if a crash was recovered), so rebind self.page. The humanized
-            # scroll below still runs after this returns.
-            self.page = await navigate_guarded(
-                self.page,
-                search_url,
-                strict_path="/search/results/people",
-                context={"campaign": campaign.name},
-                **self._nav_kwargs(),
-            )
-            # Disambiguate "empty" from "not rendered yet": race the readiness
-            # selector against the explicit no-results marker and, if neither
-            # renders, reload ONCE before trusting "no results" (re-checking for
-            # a challenge that replaced the listing). Only a still-missing listing
-            # after the reload fails loud through the registry (evidence bundle +
-            # raise). A genuine empty/no-results page returns False — return an
-            # empty list cleanly rather than entering the harvest loop (which
-            # would time out on the result-cards wait and misreport a failure).
-            rendered = await verify_listing_rendered(
-                self.page,
-                sel.SEARCH_RESULTS_READY,
-                empty_selector=sel.SEARCH_NO_RESULTS.css,
-                ready_timeout_ms=15000,
-                context={"campaign": campaign.name},
-            )
-            if not rendered:
-                logger.info("Search returned no results for campaign %r", campaign.name)
-                if progress_callback:
-                    progress_callback("Search complete! Found 0 profiles (no results)")
-                return profiles
-
-            page_count = 0
-            max_pages = 10  # Limit to prevent infinite loops
-
-            while len(profiles) < limit and page_count < max_pages:
-                page_count += 1
-
-                if progress_callback:
-                    progress_callback(
-                        f"Scanning page {page_count}... Found {len(profiles)} profiles"
-                    )
-
-                # Wait for profiles to load (legacy attribute or SDUI links)
-                try:
-                    await self.page.wait_for_selector(
-                        sel.SEARCH_RESULT_CARDS.css,
-                        timeout=10000,
-                    )
-                except TimeoutError:
-                    selector_exc = SelectorNotFoundException(
-                        "Profile elements not found on search results page",
-                        selector=sel.SEARCH_RESULT_CARDS.css,
-                        timeout=10000
-                    )
-                    try:
-                        selector_exc.evidence = await capture_error_context(
-                            self.page,
-                            "search_results_selector_missing",
-                            exc=selector_exc,
-                            context={"selector": sel.SEARCH_RESULT_CARDS.css},
-                        )
-                    except Exception as capture_exc:  # pragma: no cover - defensive
-                        logger.error(
-                            "Evidence capture failed for "
-                            "search_results_selector_missing: %s",
-                            capture_exc,
-                        )
-                    raise selector_exc
-
-                # Record the landed search page into the rolling ring buffer so
-                # a later failure can be traced back through how we got here.
-                await snapshot_page(self.page, page_count - 1)
-
+            # The navigate→verify→paginate scaffolding lives in the shared page
+            # walk; here we just harvest each ready page's profiles. Breaking once
+            # we have enough closes the walk at its ``yield`` before it advances
+            # pagination (no extra page loaded), matching the old
+            # ``while len(profiles) < limit`` bound. A no-results page yields
+            # nothing, so ``walked_any`` stays False and we report "no results".
+            walked_any = False
+            async for page_count in self._walk_search_pages(campaign, progress_callback):
+                walked_any = True
                 profiles_before_page = len(profiles)
-
-                # Scroll the results like a human before harvesting them, so the
-                # page isn't read instantly the way a scraper would.
-                await scroll_down(self.page)
 
                 # Legacy UI: structured result elements with a stable attribute
                 # (the result-cards selector's stable anchor).
@@ -824,22 +753,16 @@ class LinkedInAutomation:
                         context={"campaign": campaign.name, "page": page_count},
                     )
 
-                # Check for next page. Absence is the normal end-of-results
-                # signal, so this is a non-required locate (no fail-loud); the
-                # registry handles the EN/ES aria-label → SDUI text fallback
-                # ordering and warns if it drifts off the primary.
-                next_button = await sel.PAGINATION_NEXT.locate(self.page)
-                if next_button and not await next_button.is_disabled():
-                    await next_button.scroll_into_view_if_needed()
-                    # Natural mouse move to the pagination control before clicking.
-                    await self._throttle_action()
-                    await move_to_and_click(self.page, next_button, click_timeout=10_000)
-                    await self.page.wait_for_timeout(3000)  # Wait for page load
-                else:
+                if len(profiles) >= limit:
                     break
 
             if progress_callback:
-                progress_callback(f"Search complete! Found {len(profiles)} profiles")
+                if not walked_any:
+                    progress_callback("Search complete! Found 0 profiles (no results)")
+                else:
+                    progress_callback(
+                        f"Search complete! Found {len(profiles)} profiles"
+                    )
 
             return profiles
 
@@ -868,6 +791,390 @@ class LinkedInAutomation:
             if progress_callback:
                 progress_callback(f"Search failed: {str(e)}")
             return profiles
+
+    async def _walk_search_pages(
+        self,
+        campaign: Campaign,
+        progress_callback: Optional[Callable] = None,
+    ):
+        """Drive the people-search results page-walk, yielding once per ready page.
+
+        Owns the navigate→verify→paginate scaffolding shared by the two harvest
+        flows: :meth:`search_profiles` (text-only extraction) and
+        :meth:`search_and_connect` (card-handle connect). Per ready results page
+        it waits for the result cards, records a ring-buffer snapshot, scrolls
+        like a human, then ``yield``s the 1-based page number so the consumer can
+        read the page however it needs. Between yields it advances pagination; the
+        consumer ``break``ing closes this generator at the ``yield`` (before the
+        pagination click), so no extra page is loaded once the consumer is
+        satisfied — matching the old inline ``while len(profiles) < limit`` bound.
+
+        A genuine empty/no-results page yields nothing (clean stop). A
+        challenge/wrong-landing bounce from the guard, and a missing result-cards
+        selector, propagate to the consumer with their evidence bundle.
+        """
+        search_params = self._build_search_params(campaign)
+        search_url = f"{self.SEARCH_URL}?{search_params}"
+
+        # Guarded navigation: resilient goto (transient-error retry +
+        # renderer-crash watchdog + one crash-recovery refresh) -> settle ->
+        # surf benign interstitials -> landing guard. A bounce to a
+        # challenge/login wall or a wrong path raises a typed exception with an
+        # evidence bundle; ``strict_path`` asserts we are still on the
+        # people-search results path even when LinkedIn rewrites the rest of the
+        # URL. navigate_guarded returns the page it finished on (a fresh one if a
+        # crash was recovered), so rebind self.page.
+        self.page = await navigate_guarded(
+            self.page,
+            search_url,
+            strict_path="/search/results/people",
+            context={"campaign": campaign.name},
+            **self._nav_kwargs(),
+        )
+        # Disambiguate "empty" from "not rendered yet": race the readiness
+        # selector against the explicit no-results marker and, if neither
+        # renders, reload ONCE before trusting "no results" (re-checking for a
+        # challenge that replaced the listing). Only a still-missing listing
+        # after the reload fails loud through the registry (evidence bundle +
+        # raise). A genuine empty/no-results page returns False — yield nothing so
+        # the consumer stops cleanly rather than waiting on the result-cards
+        # selector that will never appear.
+        rendered = await verify_listing_rendered(
+            self.page,
+            sel.SEARCH_RESULTS_READY,
+            empty_selector=sel.SEARCH_NO_RESULTS.css,
+            ready_timeout_ms=15000,
+            context={"campaign": campaign.name},
+        )
+        if not rendered:
+            logger.info("Search returned no results for campaign %r", campaign.name)
+            return
+
+        page_count = 0
+        max_pages = 10  # Limit to prevent infinite loops
+
+        while page_count < max_pages:
+            page_count += 1
+
+            if progress_callback:
+                progress_callback(f"Scanning page {page_count}...")
+
+            # Wait for profiles to load (legacy attribute or SDUI links)
+            try:
+                await self.page.wait_for_selector(
+                    sel.SEARCH_RESULT_CARDS.css,
+                    timeout=10000,
+                )
+            except TimeoutError:
+                selector_exc = SelectorNotFoundException(
+                    "Profile elements not found on search results page",
+                    selector=sel.SEARCH_RESULT_CARDS.css,
+                    timeout=10000
+                )
+                try:
+                    selector_exc.evidence = await capture_error_context(
+                        self.page,
+                        "search_results_selector_missing",
+                        exc=selector_exc,
+                        context={"selector": sel.SEARCH_RESULT_CARDS.css},
+                    )
+                except Exception as capture_exc:  # pragma: no cover - defensive
+                    logger.error(
+                        "Evidence capture failed for "
+                        "search_results_selector_missing: %s",
+                        capture_exc,
+                    )
+                raise selector_exc
+
+            # Record the landed search page into the rolling ring buffer so a
+            # later failure can be traced back through how we got here.
+            await snapshot_page(self.page, page_count - 1)
+
+            # Scroll the results like a human before harvesting them, so the page
+            # isn't read instantly the way a scraper would.
+            await scroll_down(self.page)
+
+            yield page_count
+
+            # Check for next page. Absence is the normal end-of-results signal, so
+            # this is a non-required locate (no fail-loud); the registry handles
+            # the EN/ES aria-label → SDUI text fallback ordering and warns if it
+            # drifts off the primary.
+            next_button = await sel.PAGINATION_NEXT.locate(self.page)
+            if next_button and not await next_button.is_disabled():
+                await next_button.scroll_into_view_if_needed()
+                # Natural mouse move to the pagination control before clicking.
+                await self._throttle_action()
+                await move_to_and_click(self.page, next_button, click_timeout=10_000)
+                await self.page.wait_for_timeout(3000)  # Wait for page load
+            else:
+                break
+
+    async def search_and_connect(
+        self,
+        campaign: Campaign,
+        limit: int = 100,
+        progress_callback: Optional[Callable] = None,
+    ) -> Dict[str, int]:
+        """Search and connect from the result cards, falling back to profiles.
+
+        The card-first path for issue #25: walk the people-search results and, for
+        each card that exposes a Connect control, send the invitation straight from
+        the results page via :meth:`_attempt_connect` — no per-profile navigation
+        (lower bot-detection signal, one fewer page load). Cards already showing
+        Pending are recorded and skipped; cards with no actionable Connect control
+        are deferred to the profile-page path.
+
+        Staleness drives the two-pass shape: a profile ``goto`` would navigate off
+        the results page and detach every remaining card handle, so the fallback
+        can't run inline. Instead this drains each page's cards (Connect clicks
+        open an overlay modal and never navigate), collects the no-control
+        profiles, and runs the existing :meth:`send_connection_requests` on them as
+        a second pass. The persisted daily cap is shared across both passes, so a
+        day-full or weekly-limit stop ends the whole run.
+
+        Returns the same aggregate shape as :meth:`send_connection_requests`, plus
+        ``scanned`` (unique profiles seen across the result pages).
+        """
+        if not self.is_authenticated:
+            raise NotAuthenticatedException("Not authenticated. Please login first.")
+
+        automation_settings = self.settings.get_automation_settings()
+        daily_limit = automation_settings["daily_connection_limit"]
+
+        sent_count = 0
+        failed_count = 0
+        existing_count = 0
+        seen_urls: set = set()
+        fallback_profiles: List[LinkedInProfile] = []
+        scan_done = False  # stop walking result pages
+        stop_all = False  # also skip the profile-page fallback pass
+
+        # New run boundary: clear per-run diagnostics state (see search_profiles).
+        reset_diagnostics_run()
+
+        try:
+            if progress_callback:
+                progress_callback("Searching and connecting from result cards...")
+
+            async for _page in self._walk_search_pages(campaign, progress_callback):
+                # Card handles are valid only until the walk paginates, so act on
+                # every card on this page before letting the loop advance.
+                for profile, card in await self._extract_profile_cards():
+                    if len(seen_urls) >= limit:
+                        scan_done = True
+                        break
+                    if profile.profile_url in seen_urls:
+                        continue
+                    seen_urls.add(profile.profile_url)
+
+                    # Recompute the local-day key each card so a run crossing
+                    # midnight starts a fresh bucket. Cheap early stop only — the
+                    # real enforcement is the atomic reserve in _attempt_connect.
+                    today = date.today().isoformat()
+                    if self.db_manager.get_daily_connection_count(today) >= daily_limit:
+                        if progress_callback:
+                            progress_callback(
+                                f"Daily connection limit reached "
+                                f"({daily_limit}/{daily_limit} used today)"
+                            )
+                        scan_done = stop_all = True
+                        break
+
+                    # Skip profiles already in the contact book (any prior run).
+                    with self.db_manager.get_session() as session:
+                        from sqlmodel import select
+
+                        existing_contact = session.exec(
+                            select(Contact).where(
+                                Contact.profile_url == profile.profile_url
+                            )
+                        ).first()
+                    if existing_contact:
+                        existing_count += 1
+                        continue
+
+                    try:
+                        connect_button, control_kind = (
+                            await self._find_card_connect_control(card)
+                        )
+                    except Exception as e:
+                        # A detached/wedged card read shouldn't kill the run; defer
+                        # this one to the resilient profile-page path.
+                        logger.warning(
+                            "Card connect-control read failed for %s; deferring to "
+                            "profile path: %s", profile.name, e,
+                        )
+                        fallback_profiles.append(profile)
+                        continue
+
+                    if control_kind == "pending":
+                        logger.info(
+                            "Pending invitation already exists for %s (from card)",
+                            profile.name,
+                        )
+                        self.db_manager.create_contact({
+                            "campaign_id": campaign.id,
+                            "name": profile.name,
+                            "profile_url": profile.profile_url,
+                            "headline": profile.headline,
+                            "location": profile.location,
+                            "company": profile.company,
+                            "status": "pending",
+                            "notes": "Already sent (found Pending button on card)",
+                        })
+                        existing_count += 1
+                        if progress_callback:
+                            progress_callback(f"⚠️ Already pending for {profile.name}")
+                        continue
+
+                    if control_kind != "connect" or not connect_button:
+                        # No actionable Connect control on the card — defer to the
+                        # profile-page path, which can read controls (and the name
+                        # disambiguation) the card view doesn't expose.
+                        fallback_profiles.append(profile)
+                        continue
+
+                    if progress_callback:
+                        progress_callback(f"Connecting with {profile.name} (from card)")
+
+                    # Reserve-before-send → click+modal → send → record. Reused
+                    # verbatim from the profile path: it owns the daily-slot
+                    # lifecycle and bounds its own click+modal unit, so a watchdog
+                    # timeout / crash propagates out here exactly as in
+                    # send_connection_requests' loop.
+                    try:
+                        result = await self._attempt_connect(
+                            campaign, profile, connect_button, progress_callback
+                        )
+                    except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
+                        logger.warning(
+                            "Challenge/login wall during card connect for %s; "
+                            "stopping: %s", profile.name, challenge,
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                "⚠️ Challenge/login wall detected — stopping "
+                                "automation to protect the account"
+                            )
+                        scan_done = stop_all = True
+                        break
+                    except asyncio.TimeoutError:
+                        # The bounded click wedged; run_bounded already refreshed
+                        # the browser, so the remaining card handles on this page
+                        # are stale. End the card scan; the profile-page fallback
+                        # still runs on the no-control profiles gathered so far.
+                        logger.warning(
+                            "Card-connect watchdog fired for %s; ending card scan "
+                            "after browser refresh", profile.name,
+                        )
+                        failed_count += 1
+                        scan_done = True
+                        break
+                    except Exception as e:
+                        logger.error("Card connect failed for %s: %s", profile.name, e)
+                        failed_count += 1
+                        if _is_crash_error(e):
+                            try:
+                                await self._refresh_context()
+                            except Exception as refresh_exc:
+                                logger.error(
+                                    "Browser refresh after crash-shaped card-connect "
+                                    "failure failed: %s", refresh_exc,
+                                )
+                        # Page state is uncertain after a crash/refresh; end the
+                        # card scan and let the fallback pass take over.
+                        scan_done = True
+                        break
+
+                    if result.outcome in ("day_full", "limit_reached"):
+                        scan_done = stop_all = True
+                        break
+                    if result.outcome == "sent":
+                        sent_count += 1
+                        # Random delay between connections (mirrors the profile path).
+                        delay = random.randint(
+                            automation_settings["connection_delay_min"],
+                            automation_settings["connection_delay_max"],
+                        )
+                        await self.page.wait_for_timeout(delay * 1000)
+                        if (
+                            result.total_today is not None
+                            and result.total_today >= daily_limit
+                        ):
+                            if progress_callback:
+                                progress_callback(
+                                    f"Daily connection limit reached "
+                                    f"({result.total_today}/{daily_limit} used today)"
+                                )
+                            scan_done = stop_all = True
+                            break
+                        continue
+                    # Soft failure (email_required / blocked / modal_not_found /
+                    # send_failed): _attempt_connect already recorded the contact
+                    # and released the reserved slot. Don't add to the fallback —
+                    # the profile path would only re-hit the same wall.
+                    failed_count += 1
+
+                if scan_done:
+                    break
+
+            # Profile-page fallback for cards with no actionable Connect control.
+            # send_connection_requests owns its own cap preamble, cooldown notice,
+            # per-item watchdogs and backoff; the persisted cap is shared, so the
+            # two passes can't jointly exceed the daily limit.
+            if not stop_all and fallback_profiles:
+                if progress_callback:
+                    progress_callback(
+                        f"Visiting {len(fallback_profiles)} profile(s) with no card "
+                        "Connect button..."
+                    )
+                fb = await self.send_connection_requests(
+                    campaign, fallback_profiles, progress_callback
+                )
+                sent_count += fb["sent"]
+                failed_count += fb["failed"]
+                existing_count += fb["existing"]
+
+            self.db_manager.update_campaign_stats(campaign.id)
+            return {
+                "sent": sent_count,
+                "failed": failed_count,
+                "existing": existing_count,
+                "total_processed": sent_count + failed_count + existing_count,
+                "scanned": len(seen_urls),
+            }
+
+        except (
+            CaptchaDetectedException,
+            NotAuthenticatedException,
+            UnexpectedLandingException,
+        ) as challenge:
+            # The page-walk guard bounced search to a challenge/login wall or the
+            # wrong path (evidence already captured). Re-raise so the run stops
+            # loudly, mirroring search_profiles.
+            logger.warning(
+                "Search-and-connect hit a challenge/wrong landing; aborting: %s",
+                challenge,
+            )
+            if progress_callback:
+                progress_callback(
+                    "⚠️ Challenge or wrong landing detected — stopping to protect "
+                    "the account"
+                )
+            raise
+        except Exception as e:
+            logger.error("Search-and-connect failed: %s", e)
+            if progress_callback:
+                progress_callback(f"Search-and-connect failed: {e}")
+            self.db_manager.update_campaign_stats(campaign.id)
+            return {
+                "sent": sent_count,
+                "failed": failed_count,
+                "existing": existing_count,
+                "total_processed": sent_count + failed_count + existing_count,
+                "scanned": len(seen_urls),
+            }
 
     async def send_connection_requests(
         self,
@@ -1638,6 +1945,93 @@ class LinkedInAutomation:
 
         return results
 
+    @classmethod
+    def _parse_card_profile(
+        cls, href: str, text: Optional[str]
+    ) -> Optional[LinkedInProfile]:
+        """Build a :class:`LinkedInProfile` from one card's href + visible text.
+
+        Shared by the text-only SDUI extractor (:meth:`_extract_profiles_new_ui`)
+        and the handle-returning card extractor (:meth:`_extract_profile_cards`):
+        the first non-empty line is ``"Name • 2º"`` (degree marker after the
+        bullet); action labels are dropped so the headline/location fall on the
+        right lines. Returns ``None`` when no usable name can be parsed.
+        """
+        lines = [s.strip() for s in (text or "").split("\n") if s.strip()]
+        if not lines:
+            return None
+        name = lines[0].split("•")[0].strip()
+        if not name:
+            return None
+        rest = [l for l in lines[1:] if l.lower() not in cls._CARD_ACTION_WORDS]
+        return LinkedInProfile(
+            name=name,
+            profile_url=href,
+            headline=rest[0] if rest else None,
+            location=rest[1] if len(rest) > 1 else None,
+        )
+
+    async def _enumerate_card_handles(self) -> list:
+        """Return one ElementHandle per result card on the current page.
+
+        Mirrors the dual harvest path of :meth:`_extract_profiles_new_ui`: legacy
+        structured cards carry the stable result-card anchor (one node each); the
+        SDUI layout (2026) renders cards with no per-card componentkey, so they
+        are the children of the ``SearchResults_FirstResult_people`` node's
+        parent. Falls back to the registry's card selector. Handles detach on
+        navigation, so the caller must use them before the page-walk paginates.
+        """
+        legacy = await self.page.query_selector_all(sel.SEARCH_RESULT_CARDS.anchor)
+        if legacy:
+            return legacy
+
+        first = await self.page.query_selector(
+            '[componentkey="SearchResults_FirstResult_people"]'
+        )
+        if first is not None:
+            parent = (
+                await first.evaluate_handle("el => el.parentElement")
+            ).as_element()
+            if parent is not None:
+                children = await parent.query_selector_all(":scope > *")
+                if children:
+                    return children
+
+        return await self.page.query_selector_all(sel.SEARCH_RESULT_CARD.css)
+
+    async def _extract_profile_cards(self) -> List[tuple]:
+        """Harvest ``(LinkedInProfile, card_handle)`` for the current results page.
+
+        The handle-returning sibling of :meth:`_extract_profiles_new_ui`: rather
+        than parsing every card inside one ``page.evaluate`` (which discards the
+        element handles), it keeps each card's ElementHandle so
+        :meth:`_find_card_connect_control` can click that card's Connect control in
+        place — no per-profile navigation. Cards with no ``/in/`` link, a duplicate
+        href, or no usable name are skipped. Handles detach on navigation, so the
+        caller must act on them before the page-walk paginates.
+        """
+        results: List[tuple] = []
+        seen: set = set()
+        for card in await self._enumerate_card_handles():
+            try:
+                link = await card.query_selector("a[href*='/in/']")
+                if link is None:
+                    continue
+                href = (await link.get_attribute("href") or "").split("?")[0]
+                if not href or href in seen:
+                    continue
+                text = await card.inner_text()
+            except Exception:
+                # A handle can detach between enumeration and read; skip it,
+                # mirroring _find_card_connect_control's per-control guard.
+                continue
+            profile = self._parse_card_profile(href, text)
+            if profile is None:
+                continue
+            seen.add(href)
+            results.append((profile, card))
+        return results
+
     async def _extract_profiles_new_ui(self) -> List[LinkedInProfile]:
         """Extract search results from LinkedIn's SDUI search layout (2026).
 
@@ -1677,28 +2071,13 @@ class LinkedInAutomation:
         if not isinstance(raw, list):
             return []
 
-        action_words = {
-            "conectar", "connect", "seguir", "follow",
-            "mensaje", "message", "pendiente", "pending",
-        }
         profiles = []
         for item in raw:
-            lines = item.get("lines") or []
-            if not lines:
-                continue
-            # First line is "Name • 2º" (degree marker after the bullet)
-            name = lines[0].split("•")[0].strip()
-            if not name:
-                continue
-            rest = [l for l in lines[1:] if l.lower() not in action_words]
-            profiles.append(
-                LinkedInProfile(
-                    name=name,
-                    profile_url=item["href"],
-                    headline=rest[0] if rest else None,
-                    location=rest[1] if len(rest) > 1 else None,
-                )
+            profile = self._parse_card_profile(
+                item.get("href", ""), "\n".join(item.get("lines") or [])
             )
+            if profile is not None:
+                profiles.append(profile)
         return profiles
 
     @staticmethod

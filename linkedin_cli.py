@@ -983,21 +983,21 @@ class LinkedInCLI:
                     progress_update(
                         f"Searching for up to {search_limit} targeted profiles..."
                     )
-                    profiles = await automation.search_profiles(
+                    # Card-first connect: send invitations straight from the
+                    # search-result cards where possible, falling back to the
+                    # profile-page path only for cards with no Connect control
+                    # (issue #25). Search and connect are interleaved in one pass.
+                    results = await automation.search_and_connect(
                         selected, limit=search_limit, progress_callback=progress_update
                     )
 
-                    if not profiles:
+                    if results.get("scanned", 0) == 0:
                         return {"status": "no_profiles", "profiles": 0}
 
-                    progress_update("Sending connection requests...")
-                    results = await automation.send_connection_requests(
-                        selected, profiles, progress_callback=progress_update
-                    )
                     results.update(
                         {
                             "status": "success",
-                            "profiles": len(profiles),
+                            "profiles": results.get("scanned", 0),
                         }
                     )
                     return results
