@@ -309,6 +309,49 @@ class TestLogin:
                 await mock_linkedin_automation.login()
 
     @pytest.mark.asyncio
+    async def test_login_preserves_unexpected_landing(
+        self, mock_linkedin_automation
+    ):
+        """A soft-block wrong landing during login keeps its typed self.
+
+        confirm_logged_in_dom raises UnexpectedLandingException when the URL
+        leaves the login flow but no logged-in nav landmark renders (a soft
+        block / interstitial). The outer login handler must let it propagate, not
+        wrap it into a generic LoginFailedException, so the caller can stop to
+        protect the account rather than retrying credentials into a wall. This
+        exercises the credentials path, whose _wait_for_login_redirect call has
+        no inner guard and relies on the outer handler.
+        """
+        from unittest.mock import PropertyMock
+        from exceptions import UnexpectedLandingException
+        from config.settings import AppSettings
+
+        mock_linkedin_automation.is_authenticated = False
+        mock_page = mock_linkedin_automation.page
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://www.linkedin.com/login"
+
+        with patch.object(
+            AppSettings, "linkedin_email", new_callable=PropertyMock,
+            return_value="user@example.com",
+        ), patch.object(
+            AppSettings, "linkedin_password", new_callable=PropertyMock,
+            return_value="secret",
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation,
+            "_wait_for_login_redirect",
+            new=AsyncMock(
+                side_effect=UnexpectedLandingException(
+                    "soft block", reason="login_landmark_missing"
+                )
+            ),
+        ):
+            with pytest.raises(UnexpectedLandingException):
+                await mock_linkedin_automation.login()
+
+    @pytest.mark.asyncio
     async def test_slow_feed_landmark_wait_confirms_session(
         self, mock_linkedin_automation
     ):
@@ -1321,6 +1364,28 @@ class TestNavigationGuardWiring:
             # Must propagate (a walled session read as [] would let the caller
             # drive the connection run straight through the wall).
             with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.search_profiles(campaign, limit=1)
+
+    @pytest.mark.asyncio
+    async def test_search_guard_wrong_landing_reraises(self, mock_linkedin_automation):
+        """A wrong landing (path/param) during search is NOT swallowed as 'no results'.
+
+        navigate_guarded raises UnexpectedLandingException on a strict_path miss
+        or a reset requested param. That is a hard navigation failure, not an
+        empty result set, so search_profiles must re-raise it (not return []).
+        """
+        from exceptions import UnexpectedLandingException
+
+        campaign = Campaign(name="WrongLanding")
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(
+                side_effect=UnexpectedLandingException(
+                    "landed elsewhere", reason="strict_path_miss"
+                )
+            ),
+        ):
+            with pytest.raises(UnexpectedLandingException):
                 await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
     @pytest.mark.asyncio

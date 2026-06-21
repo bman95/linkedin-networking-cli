@@ -506,10 +506,17 @@ class LinkedInAutomation:
 
         except LoginFailedException:
             raise  # Re-raise login failed exceptions
-        except (CaptchaDetectedException, NotAuthenticatedException):
-            # Surface a challenge/auth wall as its typed self (not a generic
-            # LoginFailedException) so callers can stop to protect the account
-            # rather than retrying credentials into a challenge.
+        except (
+            CaptchaDetectedException,
+            NotAuthenticatedException,
+            UnexpectedLandingException,
+        ):
+            # Surface a challenge/auth wall (or a soft block that left the login
+            # URL but never rendered the logged-in nav landmark) as its typed
+            # self, not a generic LoginFailedException, so callers can stop to
+            # protect the account rather than retrying credentials into a wall.
+            # This outer handler also covers the credentials path, whose
+            # _wait_for_login_redirect call has no inner guard.
             raise
         except Exception as e:
             logger.error(f"Login failed: {str(e)}")
@@ -677,18 +684,24 @@ class LinkedInAutomation:
 
             return profiles
 
-        except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
-            # The navigation guard bounced the search to a challenge/login wall
-            # (evidence already captured). This must NOT be swallowed into an
-            # empty result list: a walled session read as "no profiles" would
-            # both misreport to the user and let the caller drive
-            # send_connection_requests straight through the wall. Re-raise so the
-            # run stops loudly, mirroring the per-profile guard's break.
-            logger.warning("Search hit a challenge/login wall; aborting: %s", challenge)
+        except (
+            CaptchaDetectedException,
+            NotAuthenticatedException,
+            UnexpectedLandingException,
+        ) as challenge:
+            # The navigation guard bounced the search to a challenge/login wall,
+            # or it landed on the wrong path / LinkedIn reset a requested param
+            # (UnexpectedLandingException). Evidence is already captured. This
+            # must NOT be swallowed into an empty result list: a walled or
+            # wrong-landed session read as "no profiles" would both misreport to
+            # the user and let the caller drive send_connection_requests straight
+            # through the wall. Re-raise so the run stops loudly, mirroring the
+            # per-profile guard's break.
+            logger.warning("Search hit a challenge/wrong landing; aborting: %s", challenge)
             if progress_callback:
                 progress_callback(
-                    "⚠️ Challenge/login wall detected during search — stopping "
-                    "to protect the account"
+                    "⚠️ Challenge or wrong landing detected during search — "
+                    "stopping to protect the account"
                 )
             raise
         except Exception as e:
