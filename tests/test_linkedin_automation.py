@@ -1887,6 +1887,159 @@ class TestNavigationGuardWiring:
         bounded.assert_awaited()
 
     @pytest.mark.asyncio
+    async def test_send_tail_runs_under_run_bounded(self, mock_linkedin_automation):
+        """The send/finalize tail is bounded by run_bounded too.
+
+        The read, click+modal, AND send tail are all wrapped, so a wedge in the
+        raw send calls (locator.count / send click / limit-modal query) is
+        bounded, not just the navigation/read and the connect click.
+        """
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "SendBounded"})
+        connect_btn = AsyncMock()
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(connect_btn, "connect")
+        )
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=False
+        )
+        # No email-required modal → the flow reaches the send tail (the default
+        # mock query_selector is truthy, which would otherwise short-circuit on
+        # the email-required path).
+        mock_linkedin_automation.page.query_selector = AsyncMock(return_value=None)
+
+        labels_seen = []
+
+        async def _passthrough(awaitable, **kwargs):
+            labels_seen.append(kwargs.get("label", ""))
+            return await awaitable
+
+        with patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)
+        ), patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_and_click", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_element", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.random_wait", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation, "_invitation_blocked_toast",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                [LinkedInProfile(name="P", profile_url="https://x/in/p/")],
+            )
+
+        # The send/finalize tail ran under its own bounded unit (label send:),
+        # alongside the read and click+modal units.
+        assert any(lbl.startswith("profile:") for lbl in labels_seen)
+        assert any(lbl.startswith("invite:") for lbl in labels_seen)
+        assert any(lbl.startswith("send:") for lbl in labels_seen)
+        # And the happy path still records a sent connection.
+        assert result["sent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_send_tail_watchdog_timeout_skips_item_not_whole_run(
+        self, mock_linkedin_automation
+    ):
+        """A wedge in the send tail is bounded; the item is skipped after refresh.
+
+        Regression for the send-tail watchdog gap (#17): a renderer that wedges
+        during the send/finalize calls (after Connect + modal) must hit the
+        per-item watchdog, refresh the browser, and skip just this profile —
+        not hang the whole loop. Two profiles: the first wedges in its send
+        tail, the second must still run on the recover-rebound page.
+        """
+        import asyncio
+
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "SendSkip"})
+        connect_btn = AsyncMock()
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(connect_btn, "connect")
+        )
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=False
+        )
+        # A DISTINCT sentinel page so the final assertion proves the recover
+        # rebind happened (not a trivial same-page pass).
+        fresh_page = MagicMock(name="recovered_page")
+        assert fresh_page is not mock_linkedin_automation.page
+        send_unit_pages = []
+
+        async def _run_bounded(awaitable, **kwargs):
+            # Bypass the real unit internals (they'd run page calls on a mock):
+            # close the coroutine and return the canned per-unit result, exactly
+            # as the existing profile-watchdog test does. Drive control flow off
+            # the label so the loop reaches the send tail.
+            label = kwargs.get("label", "")
+            awaitable.close()
+            if label.startswith("profile:"):
+                return False, connect_btn, "connect"  # (captcha, button, kind)
+            if label.startswith("invite:"):
+                return "modal_check", False, True  # (outcome, blocked, ready)
+            if label.startswith("send:"):
+                # Record the page the send tail ran against, then mirror
+                # run_bounded's wedge contract: refresh (rebinds self.page) and
+                # re-raise so the caller skips the item.
+                send_unit_pages.append(mock_linkedin_automation.page)
+                if "P0" in label:
+                    await kwargs["recover"]()
+                    raise asyncio.TimeoutError()
+                return "sent", False  # (outcome, limit_reached)
+            return None
+
+        async def _recover():
+            mock_linkedin_automation.page = fresh_page
+            return fresh_page
+
+        profiles = [
+            LinkedInProfile(name="P0", profile_url="https://x/in/p0/"),
+            LinkedInProfile(name="P1", profile_url="https://x/in/p1/"),
+        ]
+
+        with patch.object(
+            mock_linkedin_automation, "_recover", new=_recover
+        ), patch(
+            "automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)
+        ), patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_and_click", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.move_to_element", new=AsyncMock()
+        ), patch(
+            "automation.linkedin.random_wait", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ), patch.object(
+            mock_linkedin_automation, "_invitation_blocked_toast",
+            new=AsyncMock(return_value=False),
+        ):
+            messages = []
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, profiles, progress_callback=messages.append
+            )
+
+        # The first profile's send tail wedged → skipped after refresh (run did
+        # NOT break); the second profile's send tail ran on the recovered page.
+        assert result["failed"] >= 1
+        assert any("Timed out" in m for m in messages)
+        assert len(send_unit_pages) == 2
+        assert send_unit_pages[1] is fresh_page
+
+    @pytest.mark.asyncio
     async def test_dom_captcha_in_read_unit_stops_run(self, mock_linkedin_automation):
         """A DOM-level CAPTCHA detected inside the bounded read unit stops the run.
 

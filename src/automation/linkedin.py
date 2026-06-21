@@ -1235,21 +1235,55 @@ class LinkedInAutomation:
                         "LinkedIn Premium; sending without a note"
                     )
 
-                send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
-                send_exact = self.page.locator(sel.INVITE_SEND.css).first
-                send_target = send_no_note if await send_no_note.count() else send_exact
+                # Send/finalize tail — locate the send control, humanized
+                # move+click, then the weekly-limit check — all under ONE per-item
+                # interaction watchdog (run_bounded), like the read and
+                # click+modal units above. These are raw page calls
+                # (``locator.count()``, ``send_target.click()``, the limit-modal
+                # query) and a crashed renderer defeats even their own timeouts,
+                # so a wedge here would otherwise hang the whole profile loop. On
+                # a wedge the watchdog refreshes the browser and re-raises
+                # TimeoutError (caught below) so this profile is skipped without
+                # poisoning the rest of the worklist. The humanized
+                # move_to_element/click behavior stays intact inside the unit.
+                async def _send_invite_and_check_limit():
+                    send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
+                    send_exact = self.page.locator(sel.INVITE_SEND.css).first
+                    send_target = (
+                        send_no_note if await send_no_note.count() else send_exact
+                    )
 
-                logger.info("Clicking 'Send without a note' button")
-                # Natural mouse move to the send button before clicking. The
-                # click keeps its own failure handling (records the contact and
-                # skips), so don't route it through move_to_and_click's JS
-                # fallback — only humanize the approach.
-                await self._throttle_action()
-                await move_to_element(self.page, send_target)
-                try:
-                    await send_target.click(timeout=5000)
-                except Exception as send_error:
-                    logger.warning(f"Send click failed for {profile.name}: {send_error}")
+                    logger.info("Clicking 'Send without a note' button")
+                    # Natural mouse move to the send button before clicking. The
+                    # click keeps its own failure handling (caller records the
+                    # contact and skips), so don't route it through
+                    # move_to_and_click's JS fallback — only humanize the approach.
+                    await self._throttle_action()
+                    await move_to_element(self.page, send_target)
+                    try:
+                        await send_target.click(timeout=5000)
+                    except Exception as send_error:
+                        logger.warning(
+                            f"Send click failed for {profile.name}: {send_error}"
+                        )
+                        return "send_failed", False
+                    await random_wait(self.page, min_ms=2000, max_ms=3000)
+
+                    # Check for the weekly invitation limit, distinguishing the
+                    # real limit from the "near limit" warning.
+                    limit_reached = await self._handle_invitation_limit_modal(profile)
+                    return "sent", limit_reached
+
+                send_outcome, limit_reached = await run_bounded(
+                    _send_invite_and_check_limit(),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"send:{profile.name}",
+                )
+
+                if send_outcome == "send_failed":
                     contact_data = {
                         "campaign_id": campaign.id,
                         "name": profile.name,
@@ -1266,11 +1300,8 @@ class LinkedInAutomation:
                         progress_callback(f"❌ Send button not clickable for {profile.name}")
                     await random_wait(self.page, min_ms=1000, max_ms=2000)
                     continue
-                await random_wait(self.page, min_ms=2000, max_ms=3000)
 
-                # Check for the weekly invitation limit, distinguishing the real
-                # limit from the "near limit" warning.
-                if await self._handle_invitation_limit_modal(profile):
+                if limit_reached:
                     if progress_callback:
                         progress_callback("❌ LinkedIn weekly invitation limit reached!")
                     break
