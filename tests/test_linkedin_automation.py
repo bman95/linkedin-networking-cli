@@ -182,10 +182,9 @@ class TestLogin:
     @pytest.mark.asyncio
     async def test_login_with_existing_session(self, mock_linkedin_automation):
         """Test login when session already exists (feed loads without redirect)."""
-        # Login detection is DOM-backed (issue #16): a non-login URL alone is no
-        # longer enough — the logged-in nav landmark must also be present. The
-        # default mock locator reports the landmark present (count 1), so the
-        # feed landing is recognized as an authenticated session.
+        # "Already logged in?" is URL-only: an unauthenticated session is
+        # redirected away from /feed to a login wall, so staying on the feed URL
+        # is itself proof of an active session (no nav DOM landmark required).
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
         mock_page.url = "https://www.linkedin.com/feed/"
@@ -198,56 +197,37 @@ class TestLogin:
         assert mock_page.fill.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_existing_session_requires_dom_landmark(
+    async def test_existing_session_url_only_no_landmark_needed(
         self, mock_linkedin_automation
     ):
-        """A non-login URL with NO logged-in landmark is not 'already logged in'.
+        """A non-login feed URL is 'already logged in' WITHOUT a nav landmark.
 
-        Guards the DOM-backed login check (issue #16): a soft block served from
-        a non-login URL would pass a URL-only check but renders no nav landmark,
-        so the early "already authenticated" return must be skipped and the
-        login flow proceeds. Here no credentials are configured and the browser
-        is headless, so the flow raises rather than silently treating the soft
-        block as a live session.
+        Login detection is URL-only: an unauthenticated session is always
+        redirected away from /feed to a /login or /authwall, so a feed URL is a
+        live session even when no logged-in nav DOM landmark renders (LinkedIn's
+        SDUI rewrites those hooks). Even if a brittle landmark wait would time
+        out, the probe must NOT fall through to /login and re-enter credentials.
         """
-        from unittest.mock import PropertyMock
         from playwright.async_api import TimeoutError as PWTimeoutError
-        from exceptions import LoginFailedException
-        from config.settings import AppSettings
 
-        # Precondition: not yet authenticated (the fixture pre-sets True).
         mock_linkedin_automation.is_authenticated = False
         mock_page = mock_linkedin_automation.page
         mock_page.goto = AsyncMock()
-        # Non-login URL, but the logged-in landmark never renders: the probe's
-        # bounded wait_for_selector for GLOBAL_NAV_ME times out, so the early
-        # "already authenticated" return is correctly skipped.
         mock_page.url = "https://www.linkedin.com/feed/"
+        # A landmark wait, were it still attempted, would time out — prove the
+        # URL-only shortcut fires regardless of the (brittle) nav DOM.
         mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("no landmark"))
-        # ...and the secondary count fallback (issue #16 P2) also finds nothing,
-        # so the slow-feed grace period does not mistake a soft block for a live
-        # session: the landmark is genuinely absent on both the wait and the count.
-        _no_landmark = MagicMock()
-        _no_landmark.count = AsyncMock(return_value=0)
-        mock_page.locator = MagicMock(return_value=_no_landmark)
-        # No stored credentials + headless => the manual-login branch fails loud,
-        # proving the URL-only "already logged in" shortcut did NOT fire. No
-        # CAPTCHA on the login page so the flow reaches the headless guard.
-        with patch.object(
-            AppSettings, "linkedin_email", new_callable=PropertyMock, return_value=""
-        ), patch.object(
-            AppSettings, "linkedin_password", new_callable=PropertyMock, return_value=""
-        ), patch.object(
-            mock_linkedin_automation.settings,
-            "get_browser_settings",
-            return_value={"headless": True},
-        ), patch(
-            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
-        ):
-            with pytest.raises(LoginFailedException):
-                await mock_linkedin_automation.login()
 
-        assert mock_linkedin_automation.is_authenticated is False
+        result = await mock_linkedin_automation.login()
+
+        assert result is True
+        assert mock_linkedin_automation.is_authenticated is True
+        # Never fell through to /login for a session that was actually live.
+        assert all(
+            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
+        )
+        # No credentials entered.
+        assert mock_page.fill.call_count == 0
 
     @pytest.mark.asyncio
     async def test_feed_probe_authwall_raises_captcha(self, mock_linkedin_automation):
@@ -356,43 +336,6 @@ class TestLogin:
         assert mock_linkedin_automation.is_authenticated is False
 
     @pytest.mark.asyncio
-    async def test_slow_feed_landmark_count_fallback_confirms_session(
-        self, mock_linkedin_automation
-    ):
-        """A landmark that paints just past the wait still confirms the session.
-
-        Regression for issue #16 P2: a valid stored session on a slow feed gets a
-        generous landmark wait, and on a wait timeout a secondary count is checked
-        before concluding "not logged in" — so a slow-but-healthy feed is not
-        misclassified as logged out and re-driven through /login (which can
-        corrupt a good session).
-        """
-        from playwright.async_api import TimeoutError as PWTimeoutError
-
-        mock_linkedin_automation.is_authenticated = False
-        mock_page = mock_linkedin_automation.page
-        mock_page.goto = AsyncMock()
-        mock_page.url = "https://www.linkedin.com/feed/"
-        # The bounded wait times out, but the landmark IS present on the page —
-        # the secondary count fallback (returns 1) rescues the slow session.
-        mock_page.wait_for_selector = AsyncMock(side_effect=PWTimeoutError("slow"))
-        _landmark = MagicMock()
-        _landmark.count = AsyncMock(return_value=1)
-        mock_page.locator = MagicMock(return_value=_landmark)
-
-        result = await mock_linkedin_automation.login()
-
-        assert result is True
-        assert mock_linkedin_automation.is_authenticated is True
-        # The wait was given a generous (>5s) budget for the slow feed.
-        wait_kwargs = mock_page.wait_for_selector.await_args.kwargs
-        assert wait_kwargs.get("timeout", 0) > 5_000
-        # Never fell through to /login for a session that was actually live.
-        assert all(
-            "/login" not in str(c.args[0]) for c in mock_page.goto.await_args_list
-        )
-
-    @pytest.mark.asyncio
     async def test_manual_login_preserves_typed_challenge(
         self, mock_linkedin_automation
     ):
@@ -472,32 +415,6 @@ class TestLogin:
         ):
             with pytest.raises(UnexpectedLandingException):
                 await mock_linkedin_automation.login()
-
-    @pytest.mark.asyncio
-    async def test_slow_feed_landmark_wait_confirms_session(
-        self, mock_linkedin_automation
-    ):
-        """A slow-but-valid feed is recognized via the bounded landmark wait.
-
-        The probe waits for GLOBAL_NAV_ME (not an instantaneous count), so a
-        landmark that renders a beat late still confirms the session instead of
-        misclassifying it as logged out.
-        """
-        mock_linkedin_automation.is_authenticated = False
-        mock_page = mock_linkedin_automation.page
-        mock_page.goto = AsyncMock()
-        mock_page.url = "https://www.linkedin.com/feed/"
-        # The landmark resolves (no timeout) -> authenticated.
-        mock_page.wait_for_selector = AsyncMock()
-
-        result = await mock_linkedin_automation.login()
-        assert result is True
-        assert mock_linkedin_automation.is_authenticated is True
-        mock_page.wait_for_selector.assert_awaited()
-        # The wait targets the logged-in nav landmark.
-        assert sel.GLOBAL_NAV_ME.css in str(
-            mock_page.wait_for_selector.await_args.args[0]
-        )
 
     @pytest.mark.asyncio
     async def test_login_with_credentials(self, db_manager, app_settings, mock_page):
