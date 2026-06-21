@@ -468,6 +468,25 @@ async def _goto_with_retry(
             await asyncio.sleep(delay)
 
 
+# Fingerprint that *gates* surfing the generic Dismiss/Descartar button: a bare
+# "Dismiss" matches many LinkedIn dialogs, so the email-required dismiss is only
+# surfed when the email field that uniquely identifies that modal is present.
+# Without this gate, surf would click away an unrelated dialog before the
+# overlay sweep (``sweep_unexpected_overlay``) could capture it as an anomaly.
+_EMAIL_MODAL_FINGERPRINT = "label[for='email']"
+
+
+async def _interstitial_present(page, fingerprint: Optional[str]) -> bool:
+    """Whether a gating fingerprint is on the page (non-raising). None => always."""
+    if fingerprint is None:
+        return True
+    try:
+        return await page.locator(fingerprint).count() > 0
+    except Exception as exc:
+        logger.debug("Interstitial fingerprint probe %r failed: %s", fingerprint, exc)
+        return False
+
+
 async def surf_benign_interstitials(page, *, context: Optional[dict] = None) -> bool:
     """Auto-dismiss the *safe-to-surf* interstitials (cookie banner, email modal).
 
@@ -476,8 +495,16 @@ async def surf_benign_interstitials(page, *, context: Optional[dict] = None) -> 
     eat the next click; dismissing them changes nothing about the session. A
     CAPTCHA or a security checkpoint is **never** surfed here: those are handled
     by the landing guard, which hard-stops the run with a typed exception. This
-    is therefore deliberately a *closed allow-list* of two registry selectors,
-    not a generic "close any modal" sweep.
+    is therefore deliberately a *closed allow-list*, not a generic "close any
+    modal" sweep.
+
+    Each entry may carry a *fingerprint* that must be present before its dismiss
+    button is clicked. The email-required modal's dismiss button is a bare
+    ``Dismiss``/``Descartar`` that matches many unrelated dialogs, so it is gated
+    on the ``label[for='email']`` field that uniquely identifies that modal —
+    otherwise surf could click away (and hide) an unexpected overlay before the
+    landing guard's overlay sweep records it. The cookie banner's accept control
+    is specific enough to need no gate.
 
     Best-effort and non-fatal: a click failure is logged and skipped so surfing
     can never derail the navigation it is meant to smooth. Returns True if any
@@ -492,7 +519,14 @@ async def surf_benign_interstitials(page, *, context: Optional[dict] = None) -> 
         True when at least one benign interstitial was dismissed, else False.
     """
     dismissed = False
-    for selector in (sel.COOKIE_BANNER_DISMISS, sel.EMAIL_REQUIRED_DISMISS):
+    # (dismiss-control selector, gating fingerprint or None for "always safe").
+    surfable = (
+        (sel.COOKIE_BANNER_DISMISS, None),
+        (sel.EMAIL_REQUIRED_DISMISS, _EMAIL_MODAL_FINGERPRINT),
+    )
+    for selector, fingerprint in surfable:
+        if not await _interstitial_present(page, fingerprint):
+            continue
         try:
             handle = await selector.locate(page)
         except Exception as exc:
@@ -582,13 +616,39 @@ async def navigate_guarded(
         retry_backoff_base_s=retry_backoff_base_s,
         hard_timeout_margin_s=hard_timeout_margin_s,
     )
+
+    async def _navigate_once(target_page):
+        """goto -> settle -> surf -> guard on ``target_page``.
+
+        The *whole* sequence is one recoverable unit: a renderer can crash not
+        only mid-``goto`` but also during the settle/surf/guard that immediately
+        follow (those touch the page too). Keeping them inside the recovery
+        boundary means such a crash refreshes + retries rather than surfacing as
+        an ordinary exception the caller misreads (e.g. ``search_profiles``
+        returning an empty result set). The landing guard's *typed* exceptions
+        (challenge/login/wrong-landing) are not crash-shaped, so ``_is_crash_error``
+        lets them propagate unchanged — recovery never swallows a real wall.
+        """
+        await _goto_with_retry(target_page, url, **retry_kwargs)
+        await _settle(target_page, settle_timeout_ms)
+        if surf:
+            await surf_benign_interstitials(target_page, context=context)
+        await _guard_landing(
+            target_page,
+            url,
+            strict_path=strict_path,
+            check_path=check_path,
+            context=context,
+        )
+
     try:
-        await _goto_with_retry(page, url, **retry_kwargs)
+        await _navigate_once(page)
     except Exception as exc:
         # Only a crash-shaped failure with a recovery callback is recoverable;
-        # transient retries are already exhausted inside _goto_with_retry, and a
-        # non-crash error (or no callback) propagates so the caller's typed
-        # handling still runs.
+        # transient net-error retries are already exhausted inside
+        # _goto_with_retry, and a non-crash error (a typed landing exception, or
+        # any failure when no callback was supplied) propagates so the caller's
+        # typed handling still runs.
         if recover is None or not _is_crash_error(exc):
             raise
         logger.warning(
@@ -600,17 +660,11 @@ async def navigate_guarded(
         fresh = await recover()
         if fresh is not None:
             page = fresh
-        # One retry on the fresh page. A second crash propagates: a context that
-        # crashes immediately after a refresh is not something one more refresh
-        # will fix, and the caller treats it as a hard navigation failure.
-        await _goto_with_retry(page, url, **retry_kwargs)
+        # One full retry on the fresh page. A second crash propagates: a context
+        # that crashes again right after a refresh is not something one more
+        # refresh will fix, and the caller treats it as a hard nav failure.
+        await _navigate_once(page)
 
-    await _settle(page, settle_timeout_ms)
-    if surf:
-        await surf_benign_interstitials(page, context=context)
-    await _guard_landing(
-        page, url, strict_path=strict_path, check_path=check_path, context=context
-    )
     return page
 
 

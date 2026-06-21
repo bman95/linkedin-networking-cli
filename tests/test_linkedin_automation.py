@@ -1773,6 +1773,37 @@ class TestNavigationGuardWiring:
         assert mock_linkedin_automation.page is fresh_page
 
     @pytest.mark.asyncio
+    async def test_dom_captcha_in_read_unit_stops_run(self, mock_linkedin_automation):
+        """A DOM-level CAPTCHA detected inside the bounded read unit stops the run.
+
+        The captcha check now lives inside the run_bounded read unit and returns
+        a flag; the loop must still break (protect the account) on it, before
+        ever looking up the connect control.
+        """
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Captcha"})
+        find = AsyncMock(return_value=(None, "none"))
+        mock_linkedin_automation._find_connect_control = find
+
+        with patch(
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ), patch(
+            "automation.linkedin.scroll_down", new=AsyncMock()
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=True)
+        ):
+            messages = []
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=messages.append
+            )
+
+        # Broke on the first profile's captcha; never reached the connect lookup.
+        find.assert_not_awaited()
+        assert result["sent"] == 0
+        assert any("CAPTCHA detected" in m for m in messages)
+
+    @pytest.mark.asyncio
     async def test_crash_shaped_failure_in_loop_refreshes_once(
         self, mock_linkedin_automation
     ):

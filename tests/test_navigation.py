@@ -825,6 +825,58 @@ class TestCrashRecovery:
         recover.assert_awaited_once()  # only ONE refresh attempt
 
     @pytest.mark.asyncio
+    async def test_crash_after_goto_in_settle_triggers_recover(self):
+        """A crash AFTER goto resolves (during settle) is recovered.
+
+        The recovery boundary covers the whole goto->settle->surf->guard unit,
+        not just the goto: a renderer that crashes during the post-goto page
+        work must refresh + retry, not surface as an ordinary exception the
+        caller (e.g. search_profiles) misreads as 'no results'.
+        """
+        crashed = _quiet_page("https://www.linkedin.com/in/jane/")
+        fresh = _quiet_page("https://www.linkedin.com/in/jane/")
+        recover = AsyncMock(return_value=fresh)
+
+        # _settle is best-effort and never raises, so simulate the crash by
+        # patching it to raise a crash-shaped error on the FIRST page only.
+        async def _settle(page, _ms):
+            if page is crashed:
+                raise PWError("Page crashed")
+
+        with patch("automation.navigation._settle", new=_settle):
+            result = await nav.navigate_guarded(
+                crashed,
+                "https://www.linkedin.com/in/jane/",
+                check_path=False,
+                settle_timeout_ms=0,
+                recover=recover,
+            )
+        recover.assert_awaited_once()
+        # The retry completed on the fresh page (returned for rebind).
+        assert result is fresh
+
+    @pytest.mark.asyncio
+    async def test_typed_landing_exception_is_not_recovered(self):
+        """A challenge bounce is NOT crash-shaped, so it propagates (no refresh)."""
+        page = _quiet_page("https://www.linkedin.com/feed/")
+
+        async def _bounce(target, *_a, **_k):
+            page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        page.goto = AsyncMock(side_effect=_bounce)
+        recover = AsyncMock()
+        with patch("automation.navigation.capture_error_context", new=AsyncMock()):
+            with pytest.raises(CaptchaDetectedException):
+                await nav.navigate_guarded(
+                    page,
+                    "https://www.linkedin.com/feed/",
+                    check_path=False,
+                    settle_timeout_ms=0,
+                    recover=recover,
+                )
+        recover.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_transient_error_does_not_trigger_recover(self):
         """A plain net error is handled by retry, never by a context refresh."""
         page = _quiet_page()
@@ -860,7 +912,7 @@ class TestSurfBenignInterstitials:
         btn.click.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_dismisses_email_required_modal(self):
+    async def test_dismisses_email_required_modal_when_fingerprint_present(self):
         page = _page()
         email_anchor = sel.EMAIL_REQUIRED_DISMISS.anchor
         btn = AsyncMock()
@@ -869,9 +921,40 @@ class TestSurfBenignInterstitials:
             return btn if candidate == email_anchor else None
 
         page.query_selector = AsyncMock(side_effect=_qs)
+        # The email modal's gating fingerprint IS present (count > 0).
+        page.locator = MagicMock(
+            side_effect=lambda css="", *a, **k: MagicMock(
+                count=AsyncMock(
+                    return_value=1 if css == nav._EMAIL_MODAL_FINGERPRINT else 0
+                )
+            )
+        )
         dismissed = await nav.surf_benign_interstitials(page)
         assert dismissed is True
         btn.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_email_dismiss_skipped_without_fingerprint(self):
+        """A bare Dismiss button is NOT surfed unless the email field is present.
+
+        Guards against clicking away an unrelated dialog (and hiding it from the
+        overlay sweep) just because it has a generic Dismiss button.
+        """
+        page = _page()
+        email_anchor = sel.EMAIL_REQUIRED_DISMISS.anchor
+        btn = AsyncMock()
+
+        async def _qs(candidate):
+            return btn if candidate == email_anchor else None
+
+        page.query_selector = AsyncMock(side_effect=_qs)
+        # No email fingerprint on the page → the email dismiss must be skipped.
+        page.locator = MagicMock(
+            side_effect=lambda css="", *a, **k: MagicMock(count=AsyncMock(return_value=0))
+        )
+        dismissed = await nav.surf_benign_interstitials(page)
+        assert dismissed is False
+        btn.click.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_nothing_to_surf_returns_false(self):

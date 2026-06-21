@@ -954,30 +954,48 @@ class LinkedInAutomation:
                     existing_count += 1
                     continue
 
-                # Navigate to profile (throttled by the per-minute action cap).
-                # Guarded + resilient: transient-error retry + renderer-crash
-                # watchdog + one crash-recovery refresh, then goto -> settle ->
-                # surf benign interstitials -> landing guard. A bounce to a
-                # challenge/login wall raises a typed exception (caught below);
-                # path-diff is OFF because LinkedIn canonicalizes vanity profile
-                # URLs (a normal redirect, not a wrong landing). The challenge
-                # detection and overlay sweep still run.
+                # Navigate to the profile and read it — all under ONE per-item
+                # interaction watchdog (run_bounded). The whole read sequence
+                # (guarded navigation, the DOM-level CAPTCHA check, the humanized
+                # scroll/dwell, and the connect-control lookup) consists of
+                # untimeouted page calls — a crashed renderer defeats even
+                # locator.count(), so any of them can hang forever. Bounding the
+                # whole unit means a wedge at any point caps the item, refreshes
+                # the browser, and re-raises TimeoutError so this profile is
+                # skipped (caught below) without wedging the rest of the worklist.
                 #
-                # The whole per-profile navigation runs under run_bounded: a
-                # crashed renderer defeats even untimeouted page calls, so the
-                # interaction watchdog caps the unit, refreshes the browser, and
-                # re-raises TimeoutError so this profile is skipped (caught
-                # below) without wedging the rest of the worklist. On a recovered
-                # crash navigate_guarded returns a fresh page — rebind self.page.
-                await self._throttle_action()
-                self.page = await run_bounded(
-                    navigate_guarded(
+                # navigate_guarded itself is guarded + resilient (transient-error
+                # retry + renderer-crash watchdog + one crash-recovery refresh,
+                # then goto -> settle -> surf -> landing guard). check_path is OFF
+                # because LinkedIn canonicalizes vanity profile URLs (a normal
+                # redirect). A challenge/login bounce raises a typed exception
+                # (caught below). On a recovered crash navigate_guarded returns a
+                # fresh page, and the connect-control lookup uses self.page, so
+                # the helper rebinds self.page before reading it.
+                async def _navigate_and_read():
+                    self.page = await navigate_guarded(
                         self.page,
                         profile.profile_url,
                         check_path=False,
                         context={"profile_url": profile.profile_url},
                         **self._nav_kwargs(),
-                    ),
+                    )
+                    # DOM-level captcha check (an in-page widget on a non-wall
+                    # URL); the URL-level bounce is already caught by the guard.
+                    captcha = await detect_captcha(self.page)
+                    if captcha:
+                        return True, None, None
+                    # Read the profile like a human (scroll + dwell) before
+                    # acting (#15 humanization preserved). _find_connect_control
+                    # scrolls back to the top to bring the top-card action in view.
+                    await scroll_down(self.page)
+                    await self._dwell()
+                    button, kind = await self._find_connect_control(profile)
+                    return False, button, kind
+
+                await self._throttle_action()
+                captcha_detected, connect_button, control_kind = await run_bounded(
+                    _navigate_and_read(),
                     timeout_s=self.settings.get_navigation_settings()[
                         "interaction_watchdog_s"
                     ],
@@ -986,26 +1004,14 @@ class LinkedInAutomation:
                 )
 
                 # Stop early if LinkedIn challenges us — pushing through a
-                # CAPTCHA is the fastest way to get an account restricted. The
-                # guard already catches a URL-level challenge bounce; this is the
-                # DOM-level captcha check (an in-page widget on a non-wall URL).
-                if await detect_captcha(self.page):
+                # CAPTCHA is the fastest way to get an account restricted.
+                if captcha_detected:
                     logger.warning("CAPTCHA detected during connection run; stopping")
                     if progress_callback:
                         progress_callback(
                             "⚠️ CAPTCHA detected — stopping automation to protect the account"
                         )
                     break
-
-                # Read the profile like a human (scroll + dwell) before acting,
-                # right after the guarded navigation verified the landing (#15
-                # humanization preserved). _find_connect_control scrolls back to
-                # the top afterward to bring the top-card action into view.
-                await scroll_down(self.page)
-                await self._dwell()
-
-                # Find the Connect / Pending control for THIS profile.
-                connect_button, control_kind = await self._find_connect_control(profile)
 
                 if control_kind == "pending":
                     logger.info(f"Pending invitation already exists for {profile.name}")
