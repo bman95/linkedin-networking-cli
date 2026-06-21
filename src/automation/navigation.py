@@ -678,7 +678,20 @@ async def navigate_guarded(
             url,
             exc,
         )
-        fresh = await recover()
+        try:
+            fresh = await recover()
+        except Exception as recover_exc:
+            # The refresh itself could not relaunch. Preserve the ORIGINAL crash
+            # as the cause (it is the real reason the navigation failed); a
+            # recover error chained over it would make the caller misclassify a
+            # page crash as a browser-startup/teardown failure.
+            logger.error(
+                "Context refresh after crash failed (%s); re-raising original "
+                "crash for %r",
+                recover_exc,
+                url,
+            )
+            raise exc
         if fresh is not None:
             page = fresh
         # One full retry on the fresh page. A second crash propagates: a context

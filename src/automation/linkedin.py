@@ -165,28 +165,24 @@ class LinkedInAutomation:
         writes for the transient path) carries the cookies — ``start_browser``
         re-reads them, so the refreshed context resumes the same session.
 
-        The teardown is bounded by an ``asyncio`` watchdog: on a frozen,
-        memory-thrashing renderer an individual ``close`` can hang, which would
-        otherwise wedge the very refresh meant to recover from it. On timeout (or
-        any close error) the partial handles are dropped and ``start_browser``
-        relaunches from a clean slate.
+        The teardown is bounded *per step* inside ``close_browser`` itself (each
+        close gets its own ``asyncio.wait_for``), so on a frozen,
+        memory-thrashing renderer a hung step cannot wedge the very refresh meant
+        to recover from it — and, crucially, cannot starve the later steps
+        (``playwright.stop()`` frees the driver subprocess and must always run).
+        ``close_browser`` swallows its own errors, so this never needs to guard
+        the whole call with a watchdog that would cancel it mid-teardown.
 
         Returns the fresh ``Page``.
         """
         logger.warning("Refreshing browser context to recover from a wedged renderer")
-        nav = self.settings.get_navigation_settings()
-        close_budget = nav["hard_timeout_margin_s"]
-        try:
-            await asyncio.wait_for(self.close_browser(), timeout=close_budget)
-        except Exception as exc:
-            logger.warning("Error closing context during refresh: %s", exc)
-        finally:
-            # Drop any partial handles so start_browser launches from scratch
-            # rather than reusing a half-dead context.
-            self.context = None
-            self.browser = None
-            self.page = None
-            self.playwright = None
+        await self.close_browser()
+        # Drop any partial handles so start_browser launches from scratch rather
+        # than reusing a half-dead context.
+        self.context = None
+        self.browser = None
+        self.page = None
+        self.playwright = None
 
         await self.start_browser()
         return self.page
@@ -401,40 +397,46 @@ class LinkedInAutomation:
             self.page = await self.context.new_page()
             logger.info("Created new page for browser context")
 
+    # Per-step teardown budget (seconds). ``close_browser`` is called during
+    # crash recovery against a *wedged* renderer, where an individual close can
+    # HANG (not just throw). Each step is bounded on its own so a hung step
+    # cannot starve the *later* steps — in particular ``playwright.stop()``,
+    # which frees the driver subprocess — and leak a process per crash.
+    _CLOSE_STEP_TIMEOUT_S = 10
+
+    async def _close_step(self, awaitable, what: str):
+        """Run one teardown step, bounded and best-effort (never raises).
+
+        A throw OR a hang on one step must not skip the remaining steps, so each
+        is wrapped in its own ``asyncio.wait_for`` and its errors are swallowed.
+        """
+        try:
+            await asyncio.wait_for(awaitable, timeout=self._CLOSE_STEP_TIMEOUT_S)
+        except Exception as exc:
+            logger.debug("Teardown step %s did not complete cleanly: %s", what, exc)
+
     async def close_browser(self):
         """Close browser and cleanup.
 
-        Every step is independently best-effort. ``_refresh_context`` calls this
-        specifically against *crashed/half-closed* objects, where the snapshot,
-        ``context.close``, ``browser.close`` or ``playwright.stop`` can each
-        throw. An unguarded throw on any of them would skip the *later* steps and
-        orphan the still-running Chrome/Playwright node driver, so a repeated
-        crash-recovery refresh would leak a process per crash. Guarding each step
-        keeps the teardown total — every handle gets a close attempt, and
-        ``stop`` (which frees the driver subprocess) always runs.
+        Every step is independently bounded and best-effort. ``_refresh_context``
+        calls this specifically against *crashed/half-closed* objects, where the
+        snapshot, ``context.close``, ``browser.close`` or ``playwright.stop`` can
+        each throw *or hang*. Either failure on one step must not skip the later
+        steps and orphan the still-running Chrome/Playwright node driver, so a
+        repeated crash-recovery refresh would leak a process per crash. Bounding
+        each step keeps the teardown total — every handle gets a bounded close
+        attempt, and ``stop`` (which frees the driver subprocess) always runs.
         """
         if self.context:
-            # Save session state (best-effort — a dead context can't snapshot).
-            try:
-                await self.context.storage_state(
-                    path=str(self.settings.session_path)
-                )
-            except Exception as exc:
-                logger.debug("Could not save storage_state on close: %s", exc)
-            try:
-                await self.context.close()
-            except Exception as exc:
-                logger.debug("Could not close context: %s", exc)
+            await self._close_step(
+                self.context.storage_state(path=str(self.settings.session_path)),
+                "storage_state",
+            )
+            await self._close_step(self.context.close(), "context.close")
         if self.browser:
-            try:
-                await self.browser.close()
-            except Exception as exc:
-                logger.debug("Could not close browser: %s", exc)
+            await self._close_step(self.browser.close(), "browser.close")
         if self.playwright:
-            try:
-                await self.playwright.stop()
-            except Exception as exc:
-                logger.debug("Could not stop playwright: %s", exc)
+            await self._close_step(self.playwright.stop(), "playwright.stop")
 
     async def login(self, progress_callback: Optional[Callable] = None) -> bool:
         """Login to LinkedIn with enhanced session detection"""
