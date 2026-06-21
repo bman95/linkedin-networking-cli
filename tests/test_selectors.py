@@ -272,6 +272,16 @@ class TestRegistryShape:
             "[data-chameleon-result-urn]"
         )
 
+    def test_search_result_card_leads_with_data_chameleon_anchor(self):
+        # The per-card enumeration root (issue #25) leads with the legacy
+        # structured-card data-chameleon anchor; the SDUI componentkey is the
+        # fallback.
+        assert selectors.SEARCH_RESULT_CARD.anchor == "[data-chameleon-result-urn]"
+        assert selectors.SEARCH_RESULT_CARD.candidates == [
+            "[data-chameleon-result-urn]",
+            "main [componentkey]",
+        ]
+
     def test_search_no_results_anchor_and_locale_variants(self):
         # data-test anchor first; ES/EN copy variants are co-equal primaries
         # (a locale difference, not drift) so an empty page in either language

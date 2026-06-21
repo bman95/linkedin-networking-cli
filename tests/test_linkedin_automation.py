@@ -2069,3 +2069,84 @@ class TestLimitModalResolution:
         mock_linkedin_automation.page.query_selector.assert_awaited_once_with(
             sel.LIMIT_MODAL.css
         )
+
+
+@pytest.mark.unit
+class TestFindCardConnectControl:
+    """_find_card_connect_control resolves the connect/pending control scoped to
+    a single search-result card (foundation for issue #25)."""
+
+    @staticmethod
+    def _control(aria_label, *, visible=True):
+        """A fake control element with async is_visible / get_attribute."""
+        ctrl = AsyncMock()
+        ctrl.is_visible = AsyncMock(return_value=visible)
+        ctrl.get_attribute = AsyncMock(return_value=aria_label)
+        return ctrl
+
+    @staticmethod
+    def _card(controls):
+        """A fake card whose query_selector_all returns the given controls."""
+        card = AsyncMock()
+        card.query_selector_all = AsyncMock(return_value=controls)
+        return card
+
+    @pytest.mark.asyncio
+    async def test_connect_control_present_returns_connect(
+        self, mock_linkedin_automation
+    ):
+        connect = self._control("Invitar a Jane Roe a conectar")
+        card = self._card([connect])
+        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
+
+        handle, kind = await mock_linkedin_automation._find_card_connect_control(
+            card, profile
+        )
+
+        assert kind == "connect"
+        assert handle is connect
+
+    @pytest.mark.asyncio
+    async def test_only_pending_control_returns_pending(
+        self, mock_linkedin_automation
+    ):
+        pending = self._control("Invitación pendiente para Jane Roe")
+        card = self._card([pending])
+        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
+
+        handle, kind = await mock_linkedin_automation._find_card_connect_control(
+            card, profile
+        )
+
+        assert kind == "pending"
+        assert handle is pending
+
+    @pytest.mark.asyncio
+    async def test_no_connect_or_pending_returns_none(
+        self, mock_linkedin_automation
+    ):
+        other = self._control("Enviar un mensaje a Jane Roe")
+        card = self._card([other])
+        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
+
+        handle, kind = await mock_linkedin_automation._find_card_connect_control(
+            card, profile
+        )
+
+        assert kind == "none"
+        assert handle is None
+
+    @pytest.mark.asyncio
+    async def test_invisible_connect_control_is_skipped(
+        self, mock_linkedin_automation
+    ):
+        invisible = self._control("Conectar con Jane Roe", visible=False)
+        card = self._card([invisible])
+        profile = LinkedInProfile(name="Jane Roe", profile_url="u")
+
+        handle, kind = await mock_linkedin_automation._find_card_connect_control(
+            card, profile
+        )
+
+        assert kind == "none"
+        assert handle is None
