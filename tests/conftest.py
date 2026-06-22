@@ -19,6 +19,17 @@ from sqlmodel.pool import StaticPool
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+# Initialize the shared logger to a throwaway dir with NO file handlers BEFORE
+# importing any app module. App modules call get_logger() at import time, which
+# would otherwise trigger LoggerSetup.setup() with the production defaults and
+# write test/mock ERROR noise into the user's real
+# ~/.linkedin-networking-cli/logs. Setting _initialized here first wins the race.
+from utils.logging import LoggerSetup
+LoggerSetup.setup(
+    log_dir=Path(tempfile.gettempdir()) / "linkedin-cli-test-logs",
+    file_output=False,
+)
+
 from database.models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
 from database.operations import DatabaseManager
 from config.settings import AppSettings

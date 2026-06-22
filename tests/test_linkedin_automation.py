@@ -2124,11 +2124,6 @@ class TestSearchAndConnect:
         async def _find(card):
             return card._wanted
 
-        # Phase 1 collects the full target list; stub it to the canned profiles
-        # so search_and_connect's card pass + profile pass operate on them.
-        automation.search_profiles = AsyncMock(
-            return_value=[profile for profile, _ in cards]
-        )
         automation._walk_search_pages = _walk
         automation._extract_profile_cards = AsyncMock(return_value=pairs)
         automation._find_card_connect_control = AsyncMock(side_effect=_find)
@@ -2308,14 +2303,15 @@ class TestSearchAndConnect:
         assert any("captcha" in m.lower() for m in messages)
 
     @pytest.mark.asyncio
-    async def test_card_timeout_defers_remaining_to_profile_pass(
+    async def test_card_timeout_defers_wedged_card_to_profile_pass(
         self, mock_linkedin_automation, monkeypatch
     ):
-        """A card-connect timeout ends the card pass without losing later targets.
+        """A card-connect timeout ends the card pass and retries THAT card via the
+        profile page.
 
-        The timed-out card and every still-unscanned target fall through to the
-        resilient profile-page pass — parity with the old per-profile loop, which
-        a single wedge could not abort.
+        Single-pass trade-off: the wedged card is deferred to the resilient
+        profile-page fallback (so it isn't lost), but later un-scanned cards are
+        NOT recovered — there is no pre-scan to fall back on.
         """
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         auto = mock_linkedin_automation
@@ -2326,20 +2322,20 @@ class TestSearchAndConnect:
         # The first card-connect wedges (bounded click+modal raises TimeoutError).
         auto._attempt_connect = AsyncMock(side_effect=asyncio.TimeoutError())
         fallback = AsyncMock(
-            return_value={"sent": 2, "failed": 0, "existing": 0, "total_processed": 2}
+            return_value={"sent": 1, "failed": 0, "existing": 0, "total_processed": 1}
         )
         auto.send_connection_requests = fallback
 
         result = await auto.search_and_connect(campaign, limit=10)
 
-        # Card pass stopped after the first wedge (p1 never card-attempted)...
+        # Card pass stopped after the first wedge (p1 never card-attempted).
         auto._attempt_connect.assert_awaited_once()
-        # ...but nothing is lost: the timed-out p0 AND the unscanned p1 both go to
-        # the profile-page pass.
+        # Only the wedged p0 is deferred to the profile-page pass; the un-scanned
+        # p1 is not recovered (documented single-pass trade-off).
         fallback.assert_awaited_once()
         deferred = [p.profile_url for p in fallback.await_args.args[1]]
-        assert deferred == [p0.profile_url, p1.profile_url]
-        assert result["sent"] == 2
+        assert deferred == [p0.profile_url]
+        assert result["sent"] == 1
 
     @pytest.mark.asyncio
     async def test_unexpected_card_pass_error_propagates(
@@ -2411,6 +2407,23 @@ class TestExtractProfileCards:
             card.query_selector = AsyncMock(return_value=None)
         card.inner_text = AsyncMock(return_value=text)
         return card
+
+    @pytest.mark.asyncio
+    async def test_enumerate_card_handles_returns_first_matching_candidate(
+        self, mock_linkedin_automation
+    ):
+        """_enumerate_card_handles tries SEARCH_RESULT_CARD candidates in order and
+        returns the first that matches any node (SDUI list item leads)."""
+        auto = mock_linkedin_automation
+        cands = sel.SEARCH_RESULT_CARD.candidates
+        handle = AsyncMock()
+
+        async def qsa(selector):
+            # First candidate matches nothing; second yields a card.
+            return [handle] if selector == cands[1] else []
+
+        auto.page.query_selector_all = AsyncMock(side_effect=qsa)
+        assert await auto._enumerate_card_handles() == [handle]
 
     @pytest.mark.asyncio
     async def test_relative_href_normalized_to_absolute(self, mock_linkedin_automation):

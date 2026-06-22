@@ -299,13 +299,21 @@ SEARCH_RESULT_CARDS = Selector(
     ["[data-chameleon-result-urn]", "main a[href*='/in/']"],
 )
 # A single profile result card, used as the per-card enumeration root for the
-# in-card connect flow (issue #25). The legacy structured-card anchor
-# (``data-chameleon-result-urn``) leads; the SDUI ``main [componentkey]`` is the
-# fallback. Per-card enumeration is verified against the real DOM in the #25
-# follow-up (PR 2), where this selector gets wired into the flow.
+# in-card connect flow (issue #25). Verified against a real SDUI DOM dump
+# (2026-06): the results render as ``<div role="list">`` whose direct ``> div``
+# children are the per-person cards (each holds one ``/in/`` link and, when
+# connectable, an ``<a aria-label="Invita a … a conectar">``). That SDUI item
+# leads; the legacy ``data-chameleon-result-urn`` anchor and a broad
+# ``main [componentkey]`` are kept as drift fallbacks. Callers filter the matches
+# to those that actually carry a profile link, so an over-broad fallback still
+# yields the right cards after dedup.
 SEARCH_RESULT_CARD = Selector(
     "search_result_card",
-    ["[data-chameleon-result-urn]", "main [componentkey]"],
+    [
+        'main div[role="list"] > div',
+        "[data-chameleon-result-urn]",
+        "main [componentkey]",
+    ],
 )
 # Explicit "no results" empty state. Raced against the readiness selector so a
 # genuinely empty search (filters that match nobody) is distinguished from a

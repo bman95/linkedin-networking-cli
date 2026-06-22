@@ -272,12 +272,13 @@ class TestRegistryShape:
             "[data-chameleon-result-urn]"
         )
 
-    def test_search_result_card_leads_with_data_chameleon_anchor(self):
-        # The per-card enumeration root (issue #25) leads with the legacy
-        # structured-card data-chameleon anchor; the SDUI componentkey is the
-        # fallback.
-        assert selectors.SEARCH_RESULT_CARD.anchor == "[data-chameleon-result-urn]"
+    def test_search_result_card_leads_with_sdui_list_item(self):
+        # The per-card enumeration root (issue #25) leads with the SDUI result-list
+        # item verified against a real 2026 DOM dump; the legacy data-chameleon
+        # anchor and a broad componentkey selector are kept as drift fallbacks.
+        assert selectors.SEARCH_RESULT_CARD.anchor == 'main div[role="list"] > div'
         assert selectors.SEARCH_RESULT_CARD.candidates == [
+            'main div[role="list"] > div',
             "[data-chameleon-result-urn]",
             "main [componentkey]",
         ]
