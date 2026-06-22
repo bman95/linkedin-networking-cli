@@ -949,7 +949,7 @@ class LinkedInAutomation:
         from .interactions import detect_captcha
 
         automation_settings = self.settings.get_automation_settings()
-        daily_limit = automation_settings["daily_connection_limit"]
+        daily_limit = self._effective_daily_limit(campaign, automation_settings)
 
         sent_count = 0
         failed_count = 0
@@ -1189,6 +1189,20 @@ class LinkedInAutomation:
         # handler. Swallowing it into a partial-counter return would let
         # run_automation stamp a failed run as ``status="success"``.
 
+    @staticmethod
+    def _effective_daily_limit(campaign, automation_settings) -> int:
+        """The daily invitation cap actually enforced for this run.
+
+        The per-campaign ``daily_limit`` — the value shown and edited in the CLI —
+        is authoritative. It falls back to the ``DAILY_CONNECTION_LIMIT``
+        setting/env default only when the campaign carries no valid positive value
+        (so an unset/zeroed campaign still gets a sane cap).
+        """
+        campaign_limit = getattr(campaign, "daily_limit", None)
+        if isinstance(campaign_limit, int) and not isinstance(campaign_limit, bool) and campaign_limit > 0:
+            return campaign_limit
+        return automation_settings["daily_connection_limit"]
+
     def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
         """Warn (advisory only) when a prior run sent within the configured
         inter-session cooldown window.
@@ -1236,7 +1250,7 @@ class LinkedInAutomation:
         from .interactions import detect_captcha
 
         automation_settings = self.settings.get_automation_settings()
-        daily_limit = automation_settings["daily_connection_limit"]
+        daily_limit = self._effective_daily_limit(campaign, automation_settings)
         sent_count = 0
         failed_count = 0
         existing_count = 0
@@ -1565,7 +1579,7 @@ class LinkedInAutomation:
         """
         today = date.today().isoformat()
         automation_settings = self.settings.get_automation_settings()
-        daily_limit = automation_settings["daily_connection_limit"]
+        daily_limit = self._effective_daily_limit(campaign, automation_settings)
 
         # Reserve a daily slot atomically BEFORE sending. This closes
         # the check-then-send window: a concurrent run cannot also pass

@@ -2129,6 +2129,17 @@ class TestSearchAndConnect:
         automation._find_card_connect_control = AsyncMock(side_effect=_find)
         return pairs
 
+    def test_effective_daily_limit_prefers_campaign_over_settings(self):
+        """The per-campaign daily_limit is authoritative; the settings/env default
+        is only the fallback for a missing/zero campaign value."""
+        settings = {"daily_connection_limit": 20}
+        assert LinkedInAutomation._effective_daily_limit(
+            Campaign(name="c", daily_limit=7), settings
+        ) == 7
+        assert LinkedInAutomation._effective_daily_limit(
+            Campaign(name="c", daily_limit=0), settings
+        ) == 20
+
     @pytest.mark.asyncio
     async def test_card_connect_happy_path_skips_profile_visit(
         self, mock_linkedin_automation, monkeypatch
@@ -2221,9 +2232,9 @@ class TestSearchAndConnect:
         pass, so a no-control profile queued before the cap is reached is NOT
         visited once the cap stops the run.
         """
-        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "1")
         auto = mock_linkedin_automation
-        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        # The per-campaign daily_limit (now authoritative) caps the run at 1.
+        campaign = auto.db_manager.create_campaign({"name": "Cards", "daily_limit": 1})
         # none card first (queued for fallback), then a connect card hitting the cap.
         self._wire(
             auto,
@@ -2253,10 +2264,10 @@ class TestSearchAndConnect:
         self, mock_linkedin_automation, monkeypatch
     ):
         """A cap reached by a prior run blocks the card path before any send."""
-        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "2")
         auto = mock_linkedin_automation
         db = auto.db_manager
-        campaign = db.create_campaign({"name": "Cards"})
+        # The per-campaign daily_limit (now authoritative) caps the run at 2.
+        campaign = db.create_campaign({"name": "Cards", "daily_limit": 2})
         today = date.today().isoformat()
         for _ in range(2):  # prior run already used the day's quota
             db.increment_daily_connection_count(today)
