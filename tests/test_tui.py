@@ -9,6 +9,8 @@ The DB is seeded through ``DatabaseManager.create_campaign`` (the real business
 logic) so the slice exercises the actual data-flow path, not a mock.
 """
 
+import threading
+
 import pytest
 
 from textual.widgets import DataTable, ListView, Static
@@ -120,3 +122,39 @@ async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
             await pilot.pause()
         assert table.row_count == 0
         assert "No campaigns" in str(status.render())
+
+
+@pytest.mark.unit
+async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseManager):
+    """Quitting before a slow DB read returns must not error on shutdown.
+
+    Regression for the threaded-worker race: the worker can't be interrupted, so
+    it finishes after the app has exited. Marshalling back into the dead event
+    loop would raise RuntimeError (and could hang the process); the
+    ``app.is_running`` guard must make the late callback a no-op instead.
+    """
+    release = threading.Event()
+
+    class _SlowDB:
+        def get_campaigns(self, active_only=False):
+            release.wait(timeout=5)  # block the worker until the test releases it
+            return []
+
+    app = LinkedInTUI(db_manager=_SlowDB())
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        menu = app.screen.query_one("#main-menu", ListView)
+        menu.index = 0
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, CampaignsScreen)
+
+        screen = app.screen
+        app.exit()  # quit while the worker is still blocked in get_campaigns
+
+    # Loop is now torn down. Simulate the in-flight worker reaching its marshal
+    # step after exit (it captured the app reference before quitting); the guard
+    # must skip call_from_thread rather than raise/hang.
+    assert not app.is_running
+    screen._marshal_populate(app, [], None)  # must be a silent no-op now
+    release.set()
