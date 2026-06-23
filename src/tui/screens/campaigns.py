@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Static
@@ -133,7 +134,10 @@ class CampaignsScreen(BaseScreen):
             return
         for campaign in campaigns:
             table.add_row(
-                campaign.name,
+                # User-controlled — render literally so a name containing Rich
+                # markup (e.g. "Q4 [/] Outreach") can't raise MarkupError and
+                # tear down the UI.
+                Text(campaign.name),
                 "Active" if campaign.active else "Inactive",
                 str(campaign.total_sent),
                 str(campaign.total_accepted),

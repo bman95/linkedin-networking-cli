@@ -16,9 +16,10 @@ populate step bails if the screen was detached.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional, Tuple
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Grid
@@ -41,7 +42,7 @@ class DashboardData:
     """An immutable snapshot handed from the worker thread to the UI thread."""
 
     stats: dict
-    recent: List[Tuple[str, str, str, str, str]]  # name, status, sent, accepted, rate
+    recent: List[Tuple]  # (name: Text, status, sent, accepted, rate) — ready for add_row
     used_today: Optional[int]
     daily_limit: Optional[int]
 
@@ -146,17 +147,21 @@ class DashboardScreen(BaseScreen):
             return None, None
 
     @staticmethod
-    def _recent_rows(campaigns) -> List[Tuple[str, str, str, str, str]]:
+    def _recent_rows(campaigns) -> List[Tuple]:
         """Top-N campaigns, most recently active first, as table-ready rows."""
 
         def _key(c):
-            # Newest activity first: last_run, else created_at; None sorts last.
-            return (c.last_run or c.created_at) or date.min
+            # Newest activity first: last_run, else created_at. Both are
+            # datetimes; the datetime.min fallback keeps the key type-coherent
+            # if a campaign ever lacks a created_at (sorting a datetime against a
+            # date would raise).
+            return (c.last_run or c.created_at) or datetime.min
 
         ordered = sorted(campaigns, key=_key, reverse=True)[:RECENT_LIMIT]
         return [
             (
-                c.name,
+                # User-controlled — render literally (see CampaignsScreen).
+                Text(c.name),
                 "Active" if c.active else "Inactive",
                 str(c.total_sent),
                 str(c.total_accepted),

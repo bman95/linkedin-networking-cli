@@ -83,7 +83,11 @@ class SettingsScreen(BaseScreen):
             ):
                 with Container(classes="settings-section", id=f"section-{section_id}"):
                     yield Static(title, classes="settings-section-title")
-                    yield Static("", id=f"body-{section_id}")
+                    # markup=False: bodies render filesystem paths and env-derived
+                    # values (executable path, user-data dir, …) that could
+                    # contain Rich markup characters; treat them literally so a
+                    # stray "[/]" can't raise MarkupError and crash the screen.
+                    yield Static("", id=f"body-{section_id}", markup=False)
         yield Static("Loading settings…", id="settings-status", classes="status-line")
 
     def on_mount(self) -> None:

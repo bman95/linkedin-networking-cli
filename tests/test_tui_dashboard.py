@@ -204,6 +204,90 @@ async def test_dashboard_recent_campaigns_table(seeded_db_manager: DatabaseManag
 
 
 @pytest.mark.unit
+async def test_dashboard_recent_orders_and_truncates(db_manager: DatabaseManager):
+    """Recent table is newest-first by last_run/created_at and capped at 5."""
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    # Seven campaigns with increasing last_run; only the newest five should show,
+    # newest first.
+    for i in range(7):
+        db_manager.create_campaign(
+            {"name": f"Camp {i}", "daily_limit": 10, "last_run": base + timedelta(days=i)}
+        )
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "dashboard")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
+        table = screen.query_one("#dashboard-recent", DataTable)
+        assert table.row_count == 5  # RECENT_LIMIT
+        names = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+        # Newest (Camp 6) first, oldest shown (Camp 2) last; Camp 0/1 truncated.
+        assert names == ["Camp 6", "Camp 5", "Camp 4", "Camp 3", "Camp 2"]
+
+
+@pytest.mark.unit
+async def test_dashboard_used_today_states(db_manager: DatabaseManager, monkeypatch):
+    """The 'Used Today' card colours by quota and degrades to — when missing."""
+    from textual.widgets import Static
+
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "dashboard")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
+        used = screen.query_one("#value-used-today", Static)
+        # Default limit is 20 and usage is 0 -> "0/20", not warned.
+        assert card_value(screen, "used-today") == "0/20"
+        assert "-warn" not in used.classes
+
+        # Simulate at-cap: re-populate with used == limit and assert the warn class.
+        from tui.screens.dashboard import DashboardData
+
+        screen._populate(
+            screen._load_generation,
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=20, daily_limit=20),
+            None,
+        )
+        assert card_value(screen, "used-today") == "20/20"
+        assert "-warn" in used.classes
+
+        # Quota unavailable -> blank dash, neutral.
+        screen._populate(
+            screen._load_generation,
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=None, daily_limit=None),
+            None,
+        )
+        assert card_value(screen, "used-today") == "—"
+        assert "-warn" not in used.classes
+
+
+@pytest.mark.unit
+async def test_dashboard_campaign_name_with_markup_does_not_crash(
+    db_manager: DatabaseManager,
+):
+    """A campaign name containing Rich markup must render literally, not crash.
+
+    Regression: ``Static``/``DataTable`` parse cell strings as Rich markup, so a
+    user-typed name like ``Q4 [/] Outreach`` would raise ``MarkupError`` and tear
+    down the TUI. Names must be rendered as literal text.
+    """
+    db_manager.create_campaign({"name": "Q4 [/] Outreach", "daily_limit": 10})
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "dashboard")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
+        table = screen.query_one("#dashboard-recent", DataTable)
+        assert table.row_count == 1
+        assert "Q4 [/] Outreach" in str(table.get_row_at(0)[0])
+
+
+@pytest.mark.unit
 async def test_dashboard_empty_db(db_manager: DatabaseManager):
     """An empty DB renders zeros and a friendly empty message, not blanks."""
     app = LinkedInTUI(db_manager=db_manager)
@@ -408,3 +492,23 @@ async def test_settings_error_state(db_manager: DatabaseManager, monkeypatch):
         screen = app.screen
         text = await wait_for_status(pilot, screen, "#settings-status", "unavailable")
         assert "Settings unavailable" in text
+
+
+@pytest.mark.unit
+async def test_settings_path_with_markup_does_not_crash(
+    db_manager: DatabaseManager, monkeypatch
+):
+    """Env-derived values with Rich markup must render literally, not crash.
+
+    The browser executable / user-agent come from env and flow into the Settings
+    body; a value like ``/opt/[/]chrome`` would otherwise raise MarkupError.
+    """
+    monkeypatch.setenv("PLAYWRIGHT_BROWSER_EXECUTABLE", "/opt/[/]chrome")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "settings")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        body = str(screen.query_one("#body-browser", Static).render())
+        assert "/opt/[/]chrome" in body

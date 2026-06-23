@@ -141,6 +141,28 @@ async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_campaign_name_with_markup_does_not_crash(db_manager: DatabaseManager):
+    """A campaign name with Rich markup must render literally, not crash.
+
+    Regression: ``DataTable`` parses string cells as Rich markup, so a user-typed
+    name like ``Q4 [/] Outreach`` would raise ``MarkupError`` and tear down the
+    UI. Names must be rendered as literal text.
+    """
+    db_manager.create_campaign({"name": "Q4 [/] Outreach", "daily_limit": 10})
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
+        table = app.screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if table.row_count == 1:
+                break
+            await pilot.pause()
+        assert table.row_count == 1
+        assert "Q4 [/] Outreach" in str(table.get_row_at(0)[0])
+
+
+@pytest.mark.unit
 async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseManager):
     """Quitting before a slow DB read returns must not error on shutdown.
 
