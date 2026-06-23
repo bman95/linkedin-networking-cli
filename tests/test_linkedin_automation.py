@@ -2099,6 +2099,63 @@ class TestResilientSendTail:
         assert rows[0].status == "sent"
 
     @pytest.mark.asyncio
+    async def test_confirmed_sent_reconcile_failure_promotes_to_possibly_sent(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 finding 1: a failed ``sent`` reconcile still leaves a finalized row.
+
+        On a confirmed send whose reconcile upsert fails (DB locked / disk full),
+        the fallback promotes the lingering ``reserved`` marker to ``possibly_sent``
+        (finalized, non-deletable) so a concurrent cleanup cannot erase it — the
+        slot is kept and the cap stays conservative. The label degrades from
+        ``sent`` to ``possibly_sent`` only on the failure, which is acceptable.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        original_upsert = db.upsert_contact
+        calls = {"n": 0}
+
+        def _upsert(data, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return original_upsert(data)  # pre-send reserved marker persists
+            raise RuntimeError("db locked")  # confirmed-sent reconcile fails
+
+        db.upsert_contact = MagicMock(side_effect=_upsert)
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        try:
+            with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+                 patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+                 patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+                result = await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+        finally:
+            db.upsert_contact = original_upsert
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "sent"
+        # The slot is KEPT despite the reconcile-write failure.
+        assert db.get_daily_connection_count(today) == 1
+        # The fallback promoted the reserved marker to a finalized status.
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        assert len(rows) == 1
+        assert rows[0].status == "possibly_sent"
+
+    @pytest.mark.asyncio
     async def test_non_crash_send_click_failure_is_plain_send_failed(
         self, mock_linkedin_automation, monkeypatch
     ):
