@@ -55,6 +55,11 @@ class CampaignsScreen(Screen):
     def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
         super().__init__()
         self._db_manager = db_manager
+        # Monotonic token identifying the most recent load. A thread worker can't
+        # be cancelled mid-read, so a superseded (slower) load would otherwise
+        # overwrite the table with a stale snapshot; results are applied only if
+        # their token still matches.
+        self._load_generation = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -71,25 +76,30 @@ class CampaignsScreen(Screen):
     def action_refresh(self) -> None:
         self.load_campaigns()
 
-    @work(thread=True, exclusive=True)
     def load_campaigns(self) -> None:
+        """Start a fresh load, invalidating any in-flight (slower) one."""
+        self._load_generation += 1
+        self._run_load(self._load_generation)
+
+    @work(thread=True, exclusive=True)
+    def _run_load(self, generation: int) -> None:
         """Fetch campaigns off the event loop, then populate the table."""
         # Capture the app reference now, while the screen is still attached. The
         # worker can't be interrupted, so by the time it finishes the screen may
         # be detached and ``self.app`` would no longer resolve.
         app = self.app
         if self._db_manager is None:
-            self._marshal_populate(app, [], "Database unavailable.")
+            self._marshal_populate(app, generation, [], "Database unavailable.")
             return
         try:
             campaigns = self._db_manager.get_campaigns(active_only=False)
         except Exception as exc:  # surface the failure in-place, don't crash the UI
-            self._marshal_populate(app, [], f"Error loading campaigns: {exc}")
+            self._marshal_populate(app, generation, [], f"Error loading campaigns: {exc}")
             return
-        self._marshal_populate(app, campaigns, None)
+        self._marshal_populate(app, generation, campaigns, None)
 
     def _marshal_populate(
-        self, app: App, campaigns: List[Campaign], error: Optional[str]
+        self, app: App, generation: int, campaigns: List[Campaign], error: Optional[str]
     ) -> None:
         """Hand results back to the UI thread, but only while the app runs.
 
@@ -102,15 +112,21 @@ class CampaignsScreen(Screen):
         if not app.is_running:
             return
         try:
-            app.call_from_thread(self._populate, campaigns, error)
+            app.call_from_thread(self._populate, generation, campaigns, error)
         except RuntimeError:
             # App stopped between the is_running check and the call; ignore.
             return
 
-    def _populate(self, campaigns: List[Campaign], error: Optional[str]) -> None:
+    def _populate(
+        self, generation: int, campaigns: List[Campaign], error: Optional[str]
+    ) -> None:
         # The worker body can't be interrupted, so it may still call this after
         # the screen was popped (its widgets gone). Bail out if we're detached.
         if not self.is_mounted:
+            return
+        # Drop results from a superseded load so a slower older read can't
+        # overwrite the table with a stale snapshot.
+        if generation != self._load_generation:
             return
         table = self.query_one("#campaigns-table", DataTable)
         table.clear()

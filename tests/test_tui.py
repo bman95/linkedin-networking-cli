@@ -155,7 +155,7 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
     # step after exit (it captured the app reference before quitting); the guard
     # must skip call_from_thread rather than raise/hang.
     assert not app.is_running
-    screen._marshal_populate(app, [], None)  # must be a silent no-op now
+    screen._marshal_populate(app, screen._load_generation, [], None)  # silent no-op
     release.set()
 
 
@@ -182,3 +182,36 @@ async def test_campaigns_screen_handles_missing_db_manager(db_manager: DatabaseM
             await pilot.pause()
         assert table.row_count == 0
         assert "Database unavailable" in str(status.render())
+
+
+@pytest.mark.unit
+async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
+    """A superseded (slower, older) load must not overwrite a newer one.
+
+    Drives the generation-token invariant deterministically: a result tagged
+    with an older generation is ignored, while the current generation applies.
+    """
+    app = LinkedInTUI(db_manager=seeded_db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, CampaignsScreen)
+        table = screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if table.row_count == 2:
+                break
+            await pilot.pause()
+        assert table.row_count == 2
+
+        current = screen._load_generation
+        # A late result from a superseded load (older token) is dropped.
+        screen._populate(current - 1, [], None)
+        assert table.row_count == 2
+        # The current generation applies normally.
+        screen._populate(current, [], "Database unavailable.")
+        assert table.row_count == 0
+        assert "Database unavailable" in str(
+            screen.query_one("#campaigns-status", Static).render()
+        )
