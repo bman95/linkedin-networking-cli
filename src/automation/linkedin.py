@@ -1943,6 +1943,14 @@ class LinkedInAutomation:
                             "Browser refresh after possibly-sent crash failed: %s",
                             refresh_exc,
                         )
+                # Keep the reserved slot BEFORE any further DB write: the
+                # irreversible click already fired, so the slot decision must not
+                # hinge on the contact-record write succeeding. If create_contact
+                # raised here (DB locked / disk full) AFTER slot_consumed was set,
+                # the finally would otherwise release a slot whose invite may
+                # already be out — exactly the mis-accounting #31 prevents.
+                slot_consumed = True
+                total_today = reserved_count
                 contact_data = {
                     "campaign_id": campaign.id,
                     "name": profile.name,
@@ -1957,11 +1965,16 @@ class LinkedInAutomation:
                         "assuming sent to avoid re-contact and cap drift"
                     ),
                 }
-                self.db_manager.create_contact(contact_data)
-                # The slot was reserved before the (irreversible) click, so keep
-                # it: an ambiguous send counts against the daily cap.
-                slot_consumed = True
-                total_today = reserved_count
+                # Best-effort: a failed record write must not release the slot
+                # (already kept above). It only loses the non-retryable marker —
+                # the cap stays conservative, which is the priority on ambiguity.
+                try:
+                    self.db_manager.create_contact(contact_data)
+                except Exception as record_exc:
+                    logger.error(
+                        "Failed to record possibly_sent contact for %s "
+                        "(slot kept): %s", profile.name, record_exc,
+                    )
                 # Stamp the cooldown timestamp: we are treating this as a real
                 # send, so the inter-session cooldown should reflect it.
                 self.db_manager.mark_connection_sent(today)
@@ -1978,7 +1991,12 @@ class LinkedInAutomation:
                     progress_callback("❌ LinkedIn weekly invitation limit reached!")
                 return ConnectResult("limit_reached")
 
-            # Success - connection sent
+            # Success - connection sent. Consume the slot BEFORE the record
+            # write: the send already happened, so a record-write failure must
+            # not release a slot whose invite is already out (same invariant as
+            # the possibly_sent path). reserved_count is the cumulative day total.
+            slot_consumed = True
+            total_today = reserved_count
             contact_data = {
                 "campaign_id": campaign.id,
                 "name": profile.name,
@@ -1989,12 +2007,13 @@ class LinkedInAutomation:
                 "status": "sent",
                 "connection_sent_at": datetime.now(timezone.utc),
             }
-            self.db_manager.create_contact(contact_data)
-            # The slot was reserved (and persisted) before the send, so the
-            # request is now confirmed and the reservation is consumed —
-            # don't release it. reserved_count is the cumulative day total.
-            slot_consumed = True
-            total_today = reserved_count
+            try:
+                self.db_manager.create_contact(contact_data)
+            except Exception as record_exc:
+                logger.error(
+                    "Failed to record sent contact for %s (slot kept): %s",
+                    profile.name, record_exc,
+                )
             # Stamp the cooldown timestamp now (only on a real send, not on
             # reservation), so a failed send never triggers a false cooldown.
             self.db_manager.mark_connection_sent(today)

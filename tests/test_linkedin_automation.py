@@ -1526,6 +1526,48 @@ class TestResilientSendTail:
         assert contact.status == "possibly_sent"
 
     @pytest.mark.asyncio
+    async def test_possibly_sent_keeps_slot_even_if_contact_write_fails(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A failed possibly_sent record write must NOT release the slot.
+
+        We are in the possibly_sent branch because the irreversible click fired,
+        so the slot decision must not hinge on the contact-record write. If
+        create_contact raises (DB locked / disk full), the slot stays consumed
+        (cap stays conservative) and the outcome is still possibly_sent.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The post-click limit check wedges (possibly_sent), AND the possibly_sent
+        # contact write then fails.
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-limit"
+        )
+        original_create = db.create_contact
+        db.create_contact = MagicMock(side_effect=RuntimeError("db locked"))
+
+        today = date.today().isoformat()
+        try:
+            with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+                 patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+                 patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+                result = await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+        finally:
+            db.create_contact = original_create
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "possibly_sent"
+        # The slot is KEPT despite the record-write failure (no cap drift).
+        assert db.get_daily_connection_count(today) == 1
+
+    @pytest.mark.asyncio
     async def test_non_crash_send_click_failure_is_plain_send_failed(
         self, mock_linkedin_automation, monkeypatch
     ):
@@ -2474,6 +2516,56 @@ class TestSearchAndConnect:
         # ...without any per-profile navigation or profile-page fallback.
         assert not auto.page.goto.called
         auto.send_connection_requests.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_card_possibly_sent_is_tallied_and_ends_card_pass(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A possibly_sent from a card is tallied apart from failed and ends the pass.
+
+        The browser may have refreshed mid-walk, so the remaining card handles
+        are stale: the card pass ends, the possibly_sent card is NOT deferred to
+        the profile fallback (it's already recorded — no re-contact), and the
+        result surfaces it in the ``possibly_sent`` bucket.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        # Two connectable cards; the first is an ambiguous send.
+        self._wire(
+            auto,
+            [(self._profile(0), "connect"), (self._profile(1), "connect")],
+            monkeypatch,
+        )
+
+        auto._attempt_connect = AsyncMock(
+            return_value=ConnectResult("possibly_sent", total_today=1)
+        )
+        # The fallback must NOT re-contact the possibly_sent card.
+        auto.send_connection_requests = AsyncMock(
+            return_value={
+                "sent": 0, "possibly_sent": 0, "failed": 0,
+                "existing": 0, "total_processed": 0,
+            }
+        )
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["possibly_sent"] == 1
+        assert result["sent"] == 0
+        # Not mis-counted as a retryable failure.
+        assert result["failed"] == 0
+        # The card pass ended after the first card (stale handles); the second
+        # card was never attempted.
+        assert auto._attempt_connect.await_count == 1
+        # The possibly_sent card was not handed to the profile fallback.
+        if auto.send_connection_requests.await_args is not None:
+            fb_profiles = auto.send_connection_requests.await_args.args[1]
+            assert all(
+                p.profile_url != self._profile(0).profile_url for p in fb_profiles
+            )
 
     @pytest.mark.asyncio
     async def test_card_without_connect_falls_back_to_profile_path(
