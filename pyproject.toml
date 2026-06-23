@@ -23,6 +23,7 @@ dependencies = [
     "pydantic>=2.5.0",
     "inquirerpy>=0.3.4",
     "psutil>=5.9.0",
+    "textual>=8.2.7",
 ]
 
 [project.urls]
@@ -41,6 +42,7 @@ dev = [
 
 [project.scripts]
 linkedin-cli = "linkedin_cli:main"
+linkedin-tui = "linkedin_tui:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -48,9 +50,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # The runtime modules live under src/ and are imported as top-level packages
-# (database, automation, config, utils, exceptions). Map src/ to the wheel root
-# and ship the top-level entry point alongside them.
-only-include = ["src", "linkedin_cli.py"]
+# (database, automation, config, utils, exceptions, tui). Map src/ to the wheel
+# root and ship the top-level entry points alongside them.
+only-include = ["src", "linkedin_cli.py", "linkedin_tui.py"]
 exclude = ["src/__init__.py"]
 
 [tool.hatch.build.targets.wheel.sources]
