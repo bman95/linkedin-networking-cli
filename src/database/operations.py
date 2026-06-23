@@ -130,7 +130,35 @@ class DatabaseManager:
             logger.error(f"Failed to create contact: {e}")
             raise
 
-    def upsert_contact(self, contact_data: Dict[str, Any]) -> Contact:
+    # A contact row in one of these statuses represents a real, recorded
+    # outcome (an invite is out, or a terminal acceptance/decline/pending). The
+    # send tail (#39) must never delete or downgrade such a row from a retryable
+    # cleanup path — under concurrent runs on the same profile that would erase
+    # another run's confirmed send and re-open re-contact.
+    _FINALIZED_CONTACT_STATUSES = frozenset(
+        {"sent", "accepted", "declined", "pending"}
+    )
+
+    def _is_finalized_contact(self, contact: Contact) -> bool:
+        """True if the row is a recorded outcome that must not be clobbered.
+
+        ``possibly_sent`` is split by ``connection_sent_at``: the pre-send
+        reservation marker (#39) leaves it unset and IS clobberable; a finalized
+        possibly_sent (the post-send wedge sets ``connection_sent_at``) means an
+        invite may be out and is NOT clobberable.
+        """
+        if contact.status in self._FINALIZED_CONTACT_STATUSES:
+            return True
+        if (
+            contact.status == "possibly_sent"
+            and contact.connection_sent_at is not None
+        ):
+            return True
+        return False
+
+    def upsert_contact(
+        self, contact_data: Dict[str, Any], protect_finalized: bool = False
+    ) -> Contact:
         """Create a contact, or update the existing one for this profile.
 
         Keyed on ``(campaign_id, profile_url)``. Lets the resilient send tail
@@ -139,12 +167,17 @@ class DatabaseManager:
         afterward, without ever creating a duplicate row for one profile. On a
         fresh profile it behaves exactly like ``create_contact``.
 
+        With ``protect_finalized=True`` an existing row that already records a
+        real outcome (see ``_is_finalized_contact``) is returned unchanged — a
+        retryable downgrade (e.g. a clean send-failure writing ``found``) must
+        not overwrite a confirmed send a concurrent run may have just recorded.
+
         Note: the connect flow's dedup that decides whether to skip a profile
         looks up by ``profile_url`` ALONE (not scoped by campaign), so it always
         finds this marker regardless of the campaign scoping here. The connect
         path only reaches this write when no row exists for that ``profile_url``
         in any campaign (the dedup skipped otherwise), so the scoped lookup
-        always creates fresh and never collides cross-campaign.
+        normally creates fresh and never collides cross-campaign.
         """
         try:
             campaign_id = contact_data.get("campaign_id")
@@ -166,6 +199,12 @@ class DatabaseManager:
                         f"(ID: {contact.id}, Campaign: {contact.campaign_id})"
                     )
                     return contact
+                if protect_finalized and self._is_finalized_contact(existing):
+                    logger.debug(
+                        f"Skipped downgrade of finalized contact {existing.id} "
+                        f"for {profile_url} (status={existing.status})"
+                    )
+                    return existing
                 for key, value in contact_data.items():
                     setattr(existing, key, value)
                 existing.updated_at = datetime.now()
@@ -180,12 +219,19 @@ class DatabaseManager:
             logger.error(f"Failed to upsert contact: {e}")
             raise
 
-    def delete_contacts_by_profile(self, campaign_id: int, profile_url: str) -> int:
+    def delete_contacts_by_profile(
+        self, campaign_id: int, profile_url: str, only_unfinalized: bool = False
+    ) -> int:
         """Delete contact rows for a profile in a campaign; return the count.
 
         Used by the send tail (#39) to clear a durable pre-send marker on a
         genuinely-not-sent, retryable outcome (e.g. the LinkedIn weekly limit
         modal), so a future run can legitimately re-contact that profile.
+
+        With ``only_unfinalized=True`` rows that record a real outcome (see
+        ``_is_finalized_contact``) are preserved — so this retryable cleanup can
+        never erase a confirmed send a concurrent run on the same profile may
+        have already recorded.
         """
         try:
             with self.get_session() as session:
@@ -195,14 +241,18 @@ class DatabaseManager:
                         Contact.profile_url == profile_url,
                     )
                 ).all()
+                deleted = 0
                 for row in rows:
+                    if only_unfinalized and self._is_finalized_contact(row):
+                        continue
                     session.delete(row)
+                    deleted += 1
                 session.commit()
-                if rows:
+                if deleted:
                     logger.debug(
-                        f"Deleted {len(rows)} contact row(s) for {profile_url}"
+                        f"Deleted {deleted} contact row(s) for {profile_url}"
                     )
-                return len(rows)
+                return deleted
         except Exception as e:
             logger.error(f"Failed to delete contacts for {profile_url}: {e}")
             raise

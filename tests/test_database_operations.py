@@ -395,6 +395,86 @@ class TestContactOperations:
         )
         assert deleted == 0
 
+    def test_delete_only_unfinalized_preserves_confirmed_send(self, db_manager):
+        """only_unfinalized never deletes a confirmed send (concurrency guard)."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, only_unfinalized=True
+        )
+        assert deleted == 0
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "sent"
+
+    def test_delete_only_unfinalized_clears_reservation_marker(self, db_manager):
+        """only_unfinalized clears an unsent possibly_sent reservation marker."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        # Pre-send reservation marker: possibly_sent with no connection_sent_at.
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "possibly_sent",
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, only_unfinalized=True
+        )
+        assert deleted == 1
+        assert db_manager.get_contacts(campaign.id) == []
+
+    def test_delete_only_unfinalized_preserves_finalized_possibly_sent(
+        self, db_manager
+    ):
+        """A finalized possibly_sent (connection_sent_at set) is preserved."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "possibly_sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, only_unfinalized=True
+        )
+        assert deleted == 0
+        assert len(db_manager.get_contacts(campaign.id)) == 1
+
+    def test_upsert_protect_finalized_does_not_downgrade_sent(self, db_manager):
+        """protect_finalized leaves a confirmed send unchanged on downgrade."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "found", "notes": "downgrade attempt",
+        }, protect_finalized=True)
+        # The confirmed send wins; the downgrade is a no-op.
+        assert result.status == "sent"
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "sent"
+
+    def test_upsert_protect_finalized_still_updates_reservation(self, db_manager):
+        """protect_finalized still updates an unsent reservation marker."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "possibly_sent",  # no connection_sent_at
+        })
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "found",
+        }, protect_finalized=True)
+        assert result.status == "found"
+
 
 # ============================================================================
 # Analytics Operations Tests

@@ -1552,7 +1552,7 @@ class TestResilientSendTail:
         original_upsert = db.upsert_contact
         calls = {"n": 0}
 
-        def _upsert(data):
+        def _upsert(data, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return original_upsert(data)  # pre-send marker persists
@@ -1600,7 +1600,7 @@ class TestResilientSendTail:
         original_upsert = db.upsert_contact
         calls = {"n": 0}
 
-        def _upsert(data):
+        def _upsert(data, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return original_upsert(data)  # pre-send marker persists
@@ -1658,7 +1658,7 @@ class TestResilientSendTail:
         original_upsert = db.upsert_contact
         calls = {"n": 0}
 
-        def _upsert(data):
+        def _upsert(data, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
                 return original_upsert(data)  # pre-send marker persists
@@ -1836,6 +1836,58 @@ class TestResilientSendTail:
                 select(Contact).where(Contact.profile_url == profile.profile_url)
             ).first()
         assert contact is None
+
+    @pytest.mark.asyncio
+    async def test_weekly_limit_cleanup_preserves_concurrent_confirmed_send(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 concurrency: a weekly-limit cleanup must not erase a confirmed send.
+
+        Simulates two overlapping runs on the same profile: run A already
+        recorded a confirmed ``sent`` row. Run B then hits the weekly-limit modal
+        on the same profile. B's retryable cleanup must NOT delete A's durable
+        ``sent`` marker (which would re-open re-contact of an already-invited
+        person), because the cleanup only clears unfinalized reservation markers.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # Run B finds a real weekly-limit modal after its click.
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=True
+        )
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Run A's confirmed send already persisted for this profile.
+        db.create_contact({
+            "campaign_id": campaign.id,
+            "name": profile.name,
+            "profile_url": profile.profile_url,
+            "status": "sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert result.outcome == "limit_reached"
+        # A's confirmed send survives B's retryable cleanup.
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        assert len(rows) == 1
+        assert rows[0].status == "sent"
 
     @pytest.mark.asyncio
     async def test_confirmed_sent_reconciles_marker_to_sent_no_duplicate(

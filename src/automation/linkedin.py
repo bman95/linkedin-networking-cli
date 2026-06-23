@@ -1881,7 +1881,12 @@ class LinkedInAutomation:
                 ),
             }
             try:
-                self.db_manager.upsert_contact(presend_marker)
+                # protect_finalized: if a concurrent run on this same profile
+                # already recorded a real outcome, don't downgrade it to a
+                # reservation marker — the existing durable row stands.
+                self.db_manager.upsert_contact(
+                    presend_marker, protect_finalized=True
+                )
             except Exception as marker_exc:
                 # Could not persist the durable marker. Nothing irreversible has
                 # happened, so do NOT click: a send with no durable skip marker is
@@ -1945,7 +1950,11 @@ class LinkedInAutomation:
                         "status": "found",
                         "notes": "Send button not clickable after clicking Connect",
                     }
-                    self.db_manager.upsert_contact(contact_data)
+                    # protect_finalized: never downgrade a confirmed send a
+                    # concurrent run on this profile may have just recorded.
+                    self.db_manager.upsert_contact(
+                        contact_data, protect_finalized=True
+                    )
                     if progress_callback:
                         progress_callback(
                             f"❌ Send button not clickable for {profile.name}"
@@ -1989,7 +1998,8 @@ class LinkedInAutomation:
                     # error. Symmetric with the weekly-limit clear below.
                     try:
                         self.db_manager.delete_contacts_by_profile(
-                            campaign.id, profile.profile_url
+                            campaign.id, profile.profile_url,
+                            only_unfinalized=True,
                         )
                     except Exception as clear_exc:
                         logger.error(
@@ -2071,7 +2081,7 @@ class LinkedInAutomation:
                 # (skips a still-contactable profile) — never a re-contact.
                 try:
                     self.db_manager.delete_contacts_by_profile(
-                        campaign.id, profile.profile_url
+                        campaign.id, profile.profile_url, only_unfinalized=True
                     )
                 except Exception as clear_exc:
                     logger.error(
