@@ -48,12 +48,14 @@ class DatabaseManager:
         hold duplicate contact rows for one profile (the pre-existing
         ``create_contact`` was a non-atomic read-then-write with no uniqueness),
         which would block the new ``UniqueConstraint(campaign_id, profile_url)``.
-        For each duplicate group keep the single best row — a finalized outcome
-        (an invite that is or may be out, or a terminal state) wins over a
-        pre-send ``reserved``/plain marker, ties broken by the largest id (the
-        most recent write) — and delete the rest, so the surviving row is always
-        the safest skip-key. A no-op when the contact table is absent (fresh DB)
-        or already free of duplicates. Returns the number of rows deleted.
+        For each duplicate group keep the single best row by status precedence
+        (``_STATUS_KEEPER_RANK``): a terminal ``accepted``/``declined`` wins over
+        a later but weaker ``sent``/``pending``, which win over a pre-send
+        ``reserved``/plain marker; ties are broken by the largest id (the most
+        recent write). The rest are deleted, so the surviving row is always the
+        strongest recorded outcome and a safe skip-key. A no-op when the contact
+        table is absent (fresh DB) or already free of duplicates. Returns the
+        number of rows deleted.
         """
         from sqlalchemy import inspect as sa_inspect, text
 
@@ -61,7 +63,7 @@ class DatabaseManager:
         if not inspector.has_table("contact"):
             return 0
 
-        finalized = self._FINALIZED_CONTACT_STATUSES
+        rank = self._STATUS_KEEPER_RANK
         deleted = 0
         with self.get_session() as session:
             groups = session.exec(
@@ -76,10 +78,11 @@ class DatabaseManager:
                         Contact.profile_url == profile_url,
                     )
                 ).all()
-                # Keep the safest row: finalized first, then highest id.
+                # Keep the strongest outcome by status precedence, then the most
+                # recent (highest id) among equal-precedence rows.
                 keeper = max(
                     rows,
-                    key=lambda r: (r.status in finalized, r.id or 0),
+                    key=lambda r: (rank.get(r.status, -1), r.id or 0),
                 )
                 for row in rows:
                     if row.id != keeper.id:
@@ -226,6 +229,22 @@ class DatabaseManager:
         {"sent", "possibly_sent", "accepted", "declined", "pending"}
     )
 
+    # Status precedence for the de-dup migration's keeper selection (higher wins).
+    # A terminal acceptance/decline must never be discarded for a later but
+    # weaker send/pending row, so the order is: terminal outcomes > pending >
+    # confirmed send > ambiguous send > pre-send reservation > plain markers.
+    # An unknown status sorts at the bottom (treated as a plain marker).
+    _STATUS_KEEPER_RANK = {
+        "accepted": 6,
+        "declined": 6,
+        "pending": 5,
+        "sent": 4,
+        "possibly_sent": 3,
+        "reserved": 2,
+        "found": 1,
+        "failed": 0,
+    }
+
     def _is_finalized_contact(self, contact: Contact) -> bool:
         """True if the row is a recorded outcome that must not be clobbered.
 
@@ -316,7 +335,11 @@ class DatabaseManager:
             raise
 
     def delete_contacts_by_profile(
-        self, campaign_id: int, profile_url: str, only_unfinalized: bool = False
+        self,
+        campaign_id: int,
+        profile_url: str,
+        only_unfinalized: bool = False,
+        reserved_only: bool = False,
     ) -> int:
         """Delete contact rows for a profile in a campaign; return the count.
 
@@ -324,10 +347,17 @@ class DatabaseManager:
         genuinely-not-sent, retryable outcome (e.g. the LinkedIn weekly limit
         modal), so a future run can legitimately re-contact that profile.
 
-        With ``only_unfinalized=True`` rows that record a real outcome (see
-        ``_is_finalized_contact``) are preserved — so this retryable cleanup can
-        never erase a confirmed send a concurrent run on the same profile may
-        have already recorded.
+        ``reserved_only=True`` deletes ONLY the temporary ``reserved`` pre-send
+        marker — the send-tail cleanup paths must not erase any other status. In
+        particular a concurrent run on the same profile can legitimately reconcile
+        the shared row to a durable ``found``/``failed`` skip record (e.g. email
+        required, no Connect button); deleting that would make the next run retry
+        an already-classified non-contactable profile. This is the mode the send
+        tail uses.
+
+        ``only_unfinalized=True`` (kept for the general cleanup case) preserves
+        rows that record a real outcome (see ``_is_finalized_contact``) but still
+        deletes other unfinalized statuses. With no flags, all rows are deleted.
         """
         try:
             with self.get_session() as session:
@@ -339,6 +369,8 @@ class DatabaseManager:
                 ).all()
                 deleted = 0
                 for row in rows:
+                    if reserved_only and row.status != "reserved":
+                        continue
                     if only_unfinalized and self._is_finalized_contact(row):
                         continue
                     session.delete(row)

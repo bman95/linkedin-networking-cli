@@ -1124,6 +1124,12 @@ class LinkedInAutomation:
                     if result.outcome in ("day_full", "limit_reached"):
                         scan_done = stop_all = True
                         break
+                    # A concurrent run finalized this profile in the dedup->marker
+                    # window, so _attempt_connect aborted without sending. Count it
+                    # as already-contacted, not a failure, and move on.
+                    if result.outcome == "existing":
+                        existing_count += 1
+                        continue
                     # "sent" and "possibly_sent" both consumed the reserved slot
                     # (an ambiguous send counts against the cap; #31). Tally them
                     # apart but treat them identically for cap/delay so neither is
@@ -1483,6 +1489,13 @@ class LinkedInAutomation:
                 )
                 if result.outcome in ("day_full", "limit_reached"):
                     break
+                # A concurrent run finalized this profile in the dedup->marker
+                # window, so _attempt_connect aborted without sending (the durable
+                # skip marker already exists). Count it as already-contacted, not
+                # a failure.
+                if result.outcome == "existing":
+                    existing_count += 1
+                    continue
                 # "sent" and "possibly_sent" both consumed their reserved daily
                 # slot, so for cap accounting they are equivalent — an ambiguous
                 # send counts against the cap (no drift, no re-contact). Only the
@@ -1920,7 +1933,7 @@ class LinkedInAutomation:
                 # protect_finalized: if a concurrent run on this same profile
                 # already recorded a real outcome, don't downgrade it to a
                 # reservation marker — the existing durable row stands.
-                self.db_manager.upsert_contact(
+                marker_row = self.db_manager.upsert_contact(
                     presend_marker, protect_finalized=True
                 )
             except Exception as marker_exc:
@@ -1939,6 +1952,29 @@ class LinkedInAutomation:
                         f"❌ Skipped {profile.name}: could not persist send marker"
                     )
                 return ConnectResult("send_failed")
+
+            # A concurrent run on this same profile may have finalized it in the
+            # window between this run's dedup check and the marker write. In that
+            # case protect_finalized left the existing finalized row untouched
+            # (our reservation was NOT written), so clicking Send now would
+            # double-contact someone already (possibly) invited — exactly the
+            # harm #39 fixes. The durable skip marker already exists, so abort
+            # WITHOUT clicking; the finally releases our reserved slot.
+            if marker_row is not None and self.db_manager._is_finalized_contact(
+                marker_row
+            ):
+                logger.info(
+                    "Profile %s was finalized (status=%s) by a concurrent run "
+                    "before the pre-send marker write; skipping the send to "
+                    "avoid a double-contact",
+                    profile.name, marker_row.status,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Skipped {profile.name}: already contacted by a "
+                        "concurrent run"
+                    )
+                return ConnectResult("existing")
 
             try:
                 logger.info("Clicking 'Send without a note' button")
@@ -2029,15 +2065,16 @@ class LinkedInAutomation:
                     # first: the invite was provably NOT sent, so leaving a
                     # ``reserved`` row would wrongly block a legitimate future
                     # re-contact (the opposite harm to the one #39 fixes).
-                    # only_unfinalized: clears only the ``reserved`` reservation,
-                    # never a concurrent run's finalized send (finding 1). This is
-                    # a no-op when the failure preceded the marker write (e.g. the
-                    # locate wedge); best-effort so it never masks the original
-                    # error. Symmetric with the weekly-limit clear below.
+                    # reserved_only: clears ONLY this run's ``reserved`` marker,
+                    # never a concurrent run's finalized send OR its durable
+                    # ``found``/``failed`` skip record. This is a no-op when the
+                    # failure preceded the marker write (e.g. the locate wedge);
+                    # best-effort so it never masks the original error. Symmetric
+                    # with the weekly-limit clear below.
                     try:
                         self.db_manager.delete_contacts_by_profile(
                             campaign.id, profile.profile_url,
-                            only_unfinalized=True,
+                            reserved_only=True,
                         )
                     except Exception as clear_exc:
                         logger.error(
@@ -2124,15 +2161,15 @@ class LinkedInAutomation:
                 # was provably NOT sent. This outcome is retryable (the finally
                 # releases the slot), so clear the durable pre-send marker (#39)
                 # so a future run, after the weekly limit resets, can legitimately
-                # re-contact this profile. only_unfinalized: delete only the
-                # ``reserved`` reservation, never a concurrent run's finalized
-                # send on the same profile (finding 1). Best-effort: if the delete
-                # fails the row stays ``reserved``, which is merely
-                # over-conservative (skips a still-contactable profile) — never a
-                # re-contact.
+                # re-contact this profile. reserved_only: delete ONLY this run's
+                # ``reserved`` reservation, never a concurrent run's finalized send
+                # OR its durable ``found``/``failed`` skip record on the same
+                # profile. Best-effort: if the delete fails the row stays
+                # ``reserved``, which is merely over-conservative (skips a
+                # still-contactable profile) — never a re-contact.
                 try:
                     self.db_manager.delete_contacts_by_profile(
-                        campaign.id, profile.profile_url, only_unfinalized=True
+                        campaign.id, profile.profile_url, reserved_only=True
                     )
                 except Exception as clear_exc:
                     logger.error(

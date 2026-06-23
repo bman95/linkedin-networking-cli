@@ -533,6 +533,42 @@ class TestContactOperations:
         rows = db_manager.get_contacts(campaign.id)
         assert len(rows) == 1 and rows[0].status == "sent"
 
+    def test_delete_reserved_only_clears_reservation(self, db_manager):
+        """reserved_only deletes the temporary reserved marker."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, reserved_only=True
+        )
+        assert deleted == 1
+        assert db_manager.get_contacts(campaign.id) == []
+
+    def test_delete_reserved_only_preserves_found_skip_record(self, db_manager):
+        """#39: reserved_only must NOT delete a concurrent run's found/failed row.
+
+        The send-tail cleanup only intends to clear THIS run's reserved marker. A
+        concurrent run can legitimately reconcile the shared row to a durable
+        ``found`` skip record (email required / no Connect button); deleting it
+        would make the next run retry an already-non-contactable profile.
+        """
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "found",
+            "notes": "Email required for connection",
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, reserved_only=True
+        )
+        assert deleted == 0
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "found"
+
 
 # ============================================================================
 # Contact uniqueness + atomic upsert (issue #39 finding 2)
@@ -696,6 +732,29 @@ class TestContactDedupeMigration:
         assert len(rows) == 1
         # Both clobberable; the later insert (reserved, higher id) is kept.
         assert rows[0].status == "reserved"
+
+    def test_migration_preserves_terminal_status_over_later_send(
+        self, temp_db_path
+    ):
+        """#39: a terminal accepted/declined wins over a later but weaker row.
+
+        Legacy duplicates may hold an ``accepted`` row followed by a stale
+        ``sent``/``pending`` (higher id). The keeper must be the terminal outcome
+        by status precedence, not merely the most recent write — otherwise the
+        migration would regress an accepted contact back to pending and skew
+        stats.
+        """
+        manager = DatabaseManager(str(temp_db_path))
+        campaign = manager.create_campaign({"name": "Migrate"})
+        url = "https://linkedin.com/in/dup"
+        # accepted first (lower id), then a stale sent + pending (higher ids).
+        self._seed_duplicates(
+            temp_db_path, campaign.id, url, ["accepted", "sent", "pending"],
+        )
+        migrated = DatabaseManager(str(temp_db_path))
+        rows = migrated.get_contacts(campaign.id)
+        assert len(rows) == 1
+        assert rows[0].status == "accepted"
 
     def test_migration_applies_unique_index(self, temp_db_path):
         """After migration the unique index rejects a fresh duplicate insert."""

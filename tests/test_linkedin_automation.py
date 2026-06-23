@@ -1905,25 +1905,23 @@ class TestResilientSendTail:
         assert contact is None
 
     @pytest.mark.asyncio
-    async def test_weekly_limit_cleanup_preserves_concurrent_confirmed_send(
+    async def test_concurrent_finalized_send_aborts_before_click(
         self, mock_linkedin_automation, monkeypatch
     ):
-        """#39 concurrency: a weekly-limit cleanup must not erase a confirmed send.
+        """#39 concurrency: a profile finalized by a concurrent run is not re-sent.
 
-        Simulates two overlapping runs on the same profile: run A already
-        recorded a confirmed ``sent`` row. Run B then hits the weekly-limit modal
-        on the same profile. B's retryable cleanup must NOT delete A's durable
-        ``sent`` marker (which would re-open re-contact of an already-invited
-        person), because the cleanup only clears unfinalized reservation markers.
+        Simulates two overlapping runs on the same profile: run A already recorded
+        a confirmed ``sent`` row. Run B then reaches ``_attempt_connect`` for the
+        same profile (it passed its dedup check before A's row landed). B's
+        pre-send marker upsert (protect_finalized) finds A's finalized row and
+        leaves it untouched, so B must ABORT without clicking Send — clicking would
+        double-contact someone already invited. Outcome is ``existing``, the slot
+        is released, and A's durable ``sent`` row survives intact.
         """
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         db = mock_linkedin_automation.db_manager
         campaign = db.create_campaign({"name": "Send Tail"})
         send_loc = self._wire_send_tail(mock_linkedin_automation)
-        # Run B finds a real weekly-limit modal after its click.
-        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
-            return_value=True
-        )
         profile = self._profile()
         connect_button = AsyncMock()
 
@@ -1939,6 +1937,7 @@ class TestResilientSendTail:
         async def _passthrough(awaitable, **kwargs):
             return await awaitable
 
+        today = date.today().isoformat()
         with patch("automation.linkedin.random_wait", new=AsyncMock()), \
              patch("automation.linkedin.move_to_element", new=AsyncMock()), \
              patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
@@ -1946,8 +1945,12 @@ class TestResilientSendTail:
                 campaign, profile, connect_button, progress_callback=None
             )
 
-        assert result.outcome == "limit_reached"
-        # A's confirmed send survives B's retryable cleanup.
+        # Aborted before the irreversible click — never double-contacted.
+        assert result.outcome == "existing"
+        assert send_loc.click.await_count == 0
+        # The reserved slot is released (no send happened).
+        assert db.get_daily_connection_count(today) == 0
+        # A's confirmed send survives intact (one row, still sent).
         with db.get_session() as session:
             from sqlmodel import select
             rows = session.exec(
@@ -1957,27 +1960,24 @@ class TestResilientSendTail:
         assert rows[0].status == "sent"
 
     @pytest.mark.asyncio
-    async def test_weekly_limit_cleanup_preserves_concurrent_possibly_sent(
+    async def test_concurrent_finalized_possibly_sent_aborts_before_click(
         self, mock_linkedin_automation, monkeypatch
     ):
-        """#39 finding 1: a cleanup must not erase a concurrent possibly_sent.
+        """#39 finding 1: a profile finalized possibly_sent by a concurrent run.
 
         This is the exact hazard the dedicated ``reserved`` status closes. Run A
         clicked Send and recorded an ambiguous ``possibly_sent`` (invite may be
-        out). Run B then hits the weekly-limit modal on the same profile and runs
-        its retryable cleanup. Because ``possibly_sent`` is now unconditionally
-        finalized (never a pre-send marker), B's ``only_unfinalized`` cleanup
-        leaves it intact — so the durable marker of an invite that may already be
-        out is never deleted, and re-contact is prevented.
+        out) — with NO connection_sent_at, the worst case for the old
+        connection_sent_at split. Run B then reaches ``_attempt_connect`` for the
+        same profile. Because ``possibly_sent`` is now unconditionally finalized,
+        B's pre-send marker upsert (protect_finalized) leaves A's row intact and B
+        aborts WITHOUT clicking — A's durable marker of a (possibly) out invite is
+        never deleted and never re-contacted.
         """
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         db = mock_linkedin_automation.db_manager
         campaign = db.create_campaign({"name": "Send Tail"})
         send_loc = self._wire_send_tail(mock_linkedin_automation)
-        # Run B finds a real weekly-limit modal after its click.
-        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
-            return_value=True
-        )
         profile = self._profile()
         connect_button = AsyncMock()
 
@@ -1994,6 +1994,7 @@ class TestResilientSendTail:
         async def _passthrough(awaitable, **kwargs):
             return await awaitable
 
+        today = date.today().isoformat()
         with patch("automation.linkedin.random_wait", new=AsyncMock()), \
              patch("automation.linkedin.move_to_element", new=AsyncMock()), \
              patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
@@ -2001,8 +2002,11 @@ class TestResilientSendTail:
                 campaign, profile, connect_button, progress_callback=None
             )
 
-        assert result.outcome == "limit_reached"
-        # A's possibly_sent survives B's retryable cleanup (no re-contact).
+        # Aborted before the irreversible click — never double-contacted.
+        assert result.outcome == "existing"
+        assert send_loc.click.await_count == 0
+        assert db.get_daily_connection_count(today) == 0
+        # A's possibly_sent survives intact (no re-contact, no duplicate).
         with db.get_session() as session:
             from sqlmodel import select
             rows = session.exec(
