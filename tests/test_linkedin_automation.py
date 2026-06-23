@@ -2076,13 +2076,15 @@ class TestResilientSendTail:
     async def test_clean_send_failure_does_not_clobber_foreign_reservation(
         self, mock_linkedin_automation, monkeypatch
     ):
-        """#39 finding 2: a clean send-failure downgrade is token-scoped.
+        """#39 finding 2: a foreign live reservation is never downgraded.
 
-        Even if this attempt's own clean send-failure fires, the downgrade to
-        ``found`` only touches the row WE own. Here a foreign attempt B holds the
-        live reservation, so this attempt aborts at the pre-send check before the
-        click — but we additionally assert (DB-layer) that the downgrade helper is
-        token-scoped so B's reservation can never become a retryable ``found``.
+        With attempt B holding the live reservation, this attempt aborts at the
+        pre-send foreign-reservation check BEFORE the click (so its clean
+        send-failure downgrade never even runs), and B's reservation is left
+        intact — never turned into a retryable ``found`` a later run would
+        re-contact. The token-scoping of the downgrade helper itself is verified
+        directly at the DB layer in
+        ``test_downgrade_own_reservation_only_touches_own``.
         """
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         db = mock_linkedin_automation.db_manager
@@ -2308,9 +2310,11 @@ class TestResilientSendTail:
             contact = session.exec(
                 select(Contact).where(Contact.profile_url == profile.profile_url)
             ).first()
-        # Recorded, but NOT as possibly_sent (it is retryable).
+        # Recorded as a retryable ``found`` (the own-reservation downgrade), with
+        # the reservation token cleared — never possibly_sent.
         assert contact is not None
-        assert contact.status != "possibly_sent"
+        assert contact.status == "found"
+        assert contact.reservation_token is None
         assert db.get_last_connection_at() is None
 
     @pytest.mark.asyncio

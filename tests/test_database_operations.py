@@ -826,6 +826,11 @@ class TestContactDedupeMigration:
 
         # A fresh manager over the same file runs the startup migration.
         migrated = DatabaseManager(str(temp_db_path))
+        # The additive migration added the reservation_token column to the
+        # legacy table (the dedupe's ORM read would otherwise fail).
+        from sqlalchemy import inspect as sa_inspect
+        cols = {c["name"] for c in sa_inspect(migrated.engine).get_columns("contact")}
+        assert "reservation_token" in cols
         rows = migrated.get_contacts(campaign.id)
         assert len(rows) == 1
         # The finalized row (the invite-may-be-out marker) is the keeper.
