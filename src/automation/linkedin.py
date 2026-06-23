@@ -4,6 +4,7 @@ import subprocess
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import namedtuple
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -1042,7 +1043,11 @@ class LinkedInAutomation:
                             "Pending invitation already exists for %s (from card)",
                             profile.name,
                         )
-                        self.db_manager.create_contact({
+                        # upsert (not create): the UniqueConstraint (#39) makes a
+                        # plain insert raise if a concurrent same-profile run
+                        # already wrote a row; protect_finalized so this never
+                        # clobbers that run's confirmed send.
+                        self.db_manager.upsert_contact({
                             "campaign_id": campaign.id,
                             "name": profile.name,
                             "profile_url": url,
@@ -1051,7 +1056,7 @@ class LinkedInAutomation:
                             "company": profile.company,
                             "status": "pending",
                             "notes": "Already sent (found Pending button on card)",
-                        })
+                        }, protect_finalized=True)
                         existing_count += 1
                         if progress_callback:
                             progress_callback(f"⚠️ Already pending for {profile.name}")
@@ -1120,6 +1125,12 @@ class LinkedInAutomation:
                     if result.outcome in ("day_full", "limit_reached"):
                         scan_done = stop_all = True
                         break
+                    # A concurrent run finalized this profile in the dedup->marker
+                    # window, so _attempt_connect aborted without sending. Count it
+                    # as already-contacted, not a failure, and move on.
+                    if result.outcome == "existing":
+                        existing_count += 1
+                        continue
                     # "sent" and "possibly_sent" both consumed the reserved slot
                     # (an ambiguous send counts against the cap; #31). Tally them
                     # apart but treat them identically for cap/delay so neither is
@@ -1430,7 +1441,12 @@ class LinkedInAutomation:
                         "status": "pending",
                         "notes": "Already sent (found Pending button)",
                     }
-                    self.db_manager.create_contact(contact_data)
+                    # upsert + protect_finalized: the UniqueConstraint (#39) would
+                    # make a plain insert raise under a concurrent same-profile
+                    # run; never clobber that run's confirmed send.
+                    self.db_manager.upsert_contact(
+                        contact_data, protect_finalized=True
+                    )
                     existing_count += 1
                     if progress_callback:
                         progress_callback(f"⚠️ Already pending for {profile.name}")
@@ -1451,7 +1467,12 @@ class LinkedInAutomation:
                         "status": "found",
                         "notes": "No connect button available - likely already connected",
                     }
-                    self.db_manager.create_contact(contact_data)
+                    # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                    # IntegrityError under a concurrent same-profile run, and
+                    # never downgrade that run's confirmed send.
+                    self.db_manager.upsert_contact(
+                        contact_data, protect_finalized=True
+                    )
                     failed_count += 1
                     if progress_callback:
                         progress_callback(f"⚠️ No Connect button for {profile.name}")
@@ -1469,6 +1490,13 @@ class LinkedInAutomation:
                 )
                 if result.outcome in ("day_full", "limit_reached"):
                     break
+                # A concurrent run finalized this profile in the dedup->marker
+                # window, so _attempt_connect aborted without sending (the durable
+                # skip marker already exists). Count it as already-contacted, not
+                # a failure.
+                if result.outcome == "existing":
+                    existing_count += 1
+                    continue
                 # "sent" and "possibly_sent" both consumed their reserved daily
                 # slot, so for cap accounting they are equivalent — an ambiguous
                 # send counts against the cap (no drift, no re-contact). Only the
@@ -1657,6 +1685,12 @@ class LinkedInAutomation:
         # Tracks whether this attempt has consumed (vs. merely reserved) its
         # slot; the finally gives back any slot a non-send outcome left reserved.
         slot_consumed = False
+        # Per-attempt ownership token for the pre-send ``reserved`` marker (#39
+        # concurrency). Stamped on this attempt's reservation so a retryable
+        # cleanup/downgrade in a concurrent attempt on the same profile can never
+        # erase/clobber a reservation THIS attempt may already have clicked Send
+        # on (and vice versa).
+        reservation_token = uuid.uuid4().hex
         try:
             # Click Connect and wait for the invitation modal — under the
             # SAME per-item watchdog as the read unit. ``move_to_and_click``,
@@ -1751,7 +1785,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Email required for connection",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"❌ Email required for {profile.name}")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -1776,7 +1815,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Invitation blocked (recently withdrawn / 3-week cooldown)",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"⚠️ Invitation blocked for {profile.name} (cooldown)")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -1794,7 +1838,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Invitation modal did not appear after clicking Connect",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"❌ Invitation modal not found for {profile.name}")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -1852,6 +1901,115 @@ class LinkedInAutomation:
                 label=f"send-locate:{profile.name}",
             )
 
+            # Durable pre-send skip marker (issue #39). Persist a per-profile
+            # row BEFORE the irreversible click so the durable "don't re-contact"
+            # marker does NOT hinge on a post-send write succeeding. Without this,
+            # a post-send contact-write failure (DB locked / disk full) keeps the
+            # slot for THIS run but leaves no row for a FUTURE run to skip on, so
+            # it could re-contact someone already (possibly) invited — the exact
+            # harm #31 prevents, displaced to a later run. Written as the
+            # dedicated ``reserved`` status (#39 retry), NOT ``possibly_sent``: a
+            # reservation marker is a skip-key for future runs but no invite is
+            # known to be out yet, so it must stay clobberable by a retryable
+            # cleanup and must NOT count as a sent invite in stats. Keeping it
+            # distinct from ``possibly_sent`` (which now unambiguously means "the
+            # invite may be out, never delete") closes the concurrency hazard
+            # where a same-profile cleanup could delete the durable marker of an
+            # invite that already went out. The post-click handlers below
+            # reconcile it to its true final status (``sent``, ``possibly_sent``
+            # on an ambiguous send, downgraded to ``found`` on a clean
+            # send-failure, or deleted if the invite was provably NOT sent at the
+            # weekly limit). This write runs BEFORE the click boundary: if IT
+            # fails nothing irreversible has happened yet, so we abort to a clean
+            # retryable ``send_failed`` and the finally releases the slot — never
+            # click without a durable marker.
+            presend_marker = {
+                "campaign_id": campaign.id,
+                "name": profile.name,
+                "profile_url": profile.profile_url,
+                "headline": profile.headline,
+                "location": profile.location,
+                "company": profile.company,
+                "status": "reserved",
+                "reservation_token": reservation_token,
+                "notes": (
+                    "Reserved before Send click (durable skip marker #39); "
+                    "reconciled after send"
+                ),
+            }
+            try:
+                # protect_finalized: if a concurrent run on this same profile
+                # already recorded a real outcome, don't downgrade it to a
+                # reservation marker — the existing durable row stands.
+                # protect_other_reservation: don't steal a live reservation a
+                # concurrent attempt already holds (it may have clicked Send).
+                marker_row = self.db_manager.upsert_contact(
+                    presend_marker,
+                    protect_finalized=True,
+                    protect_other_reservation=True,
+                )
+            except Exception as marker_exc:
+                # Could not persist the durable marker. Nothing irreversible has
+                # happened, so do NOT click: a send with no durable skip marker is
+                # exactly the gap #39 closes. Abort to a clean retryable
+                # send_failed; the finally releases the reserved slot.
+                logger.error(
+                    "Could not persist pre-send marker for %s; skipping send to "
+                    "avoid an unrecorded invite: %s",
+                    profile.name,
+                    marker_exc,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"❌ Skipped {profile.name}: could not persist send marker"
+                    )
+                return ConnectResult("send_failed")
+
+            # A concurrent run on this same profile may have finalized it in the
+            # window between this run's dedup check and the marker write. In that
+            # case protect_finalized left the existing finalized row untouched
+            # (our reservation was NOT written), so clicking Send now would
+            # double-contact someone already (possibly) invited — exactly the
+            # harm #39 fixes. The durable skip marker already exists, so abort
+            # WITHOUT clicking; the finally releases our reserved slot.
+            if marker_row is not None and self.db_manager._is_finalized_contact(
+                marker_row
+            ):
+                logger.info(
+                    "Profile %s was finalized (status=%s) by a concurrent run "
+                    "before the pre-send marker write; skipping the send to "
+                    "avoid a double-contact",
+                    profile.name, marker_row.status,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Skipped {profile.name}: already contacted by a "
+                        "concurrent run"
+                    )
+                return ConnectResult("existing")
+
+            # A concurrent attempt may instead hold a LIVE ``reserved`` marker
+            # (it reserved first and may already have clicked Send). In that case
+            # protect_other_reservation left ITS row untouched, so the returned
+            # row carries a different token. Don't click — that would duplicate a
+            # send the other attempt is mid-flight on; abort to ``existing`` (the
+            # finally releases our slot). When WE own the reservation the tokens
+            # match and we fall through to the click.
+            if (
+                marker_row is not None
+                and marker_row.status == "reserved"
+                and marker_row.reservation_token != reservation_token
+            ):
+                logger.info(
+                    "Profile %s is reserved by a concurrent attempt; skipping "
+                    "the send to avoid a double-contact", profile.name,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Skipped {profile.name}: reserved by a concurrent run"
+                    )
+                return ConnectResult("existing")
+
             try:
                 logger.info("Clicking 'Send without a note' button")
                 # Natural mouse move to the send button before clicking. The
@@ -1882,17 +2040,21 @@ class LinkedInAutomation:
                     logger.warning(
                         f"Send click failed for {profile.name}: {send_error}"
                     )
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Send button not clickable after clicking Connect",
-                    }
-                    self.db_manager.create_contact(contact_data)
+                    # Clean pre-send failure (the click never landed). Downgrade
+                    # the durable pre-send marker (#39) from ``reserved`` back to
+                    # ``found``: nothing irreversible happened, so the recorded
+                    # status must stay the retryable ``found`` this path has always
+                    # used. Scoped to OUR reservation token, so it can never
+                    # clobber a concurrent attempt's live reservation (which that
+                    # attempt may already have clicked Send on) into a retryable
+                    # ``found`` that a later run would re-contact (finding 2). A
+                    # no-op if our reservation was already reconciled/claimed away.
+                    self.db_manager.downgrade_own_reservation_to_found(
+                        campaign.id,
+                        profile.profile_url,
+                        reservation_token,
+                        notes="Send button not clickable after clicking Connect",
+                    )
                     if progress_callback:
                         progress_callback(
                             f"❌ Send button not clickable for {profile.name}"
@@ -1923,9 +2085,32 @@ class LinkedInAutomation:
                 # crash-shaped raise that escaped it so the page is live again.
                 if not send_click_attempted:
                     # Pre-click failure that wasn't a plain send_failed (e.g. the
-                    # locate watchdog, or a crash before the click boundary):
-                    # nothing irreversible happened, so let it propagate and the
-                    # finally release the slot — the caller skips this profile.
+                    # locate watchdog, or a failure in the reversible
+                    # throttle/move window between the marker write and the click
+                    # boundary): nothing irreversible happened, so let it
+                    # propagate and the finally release the slot — the caller
+                    # skips this profile. Clear the durable pre-send marker (#39)
+                    # first: the invite was provably NOT sent, so leaving a
+                    # ``reserved`` row would wrongly block a legitimate future
+                    # re-contact (the opposite harm to the one #39 fixes).
+                    # reserved_only: clears ONLY this run's ``reserved`` marker,
+                    # never a concurrent run's finalized send OR its durable
+                    # ``found``/``failed`` skip record. This is a no-op when the
+                    # failure preceded the marker write (e.g. the locate wedge);
+                    # best-effort so it never masks the original error. Symmetric
+                    # with the weekly-limit clear below.
+                    try:
+                        self.db_manager.delete_contacts_by_profile(
+                            campaign.id, profile.profile_url,
+                            reserved_only=True,
+                            reservation_token=reservation_token,
+                        )
+                    except Exception as clear_exc:
+                        logger.error(
+                            "Failed to clear pre-send marker for %s after a "
+                            "pre-click failure (profile may be skipped next "
+                            "run): %s", profile.name, clear_exc,
+                        )
                     raise
                 logger.warning(
                     "Send-tail wedge/crash for %s AFTER the send click "
@@ -1945,9 +2130,9 @@ class LinkedInAutomation:
                         )
                 # Keep the reserved slot BEFORE any further DB write: the
                 # irreversible click already fired, so the slot decision must not
-                # hinge on the contact-record write succeeding. If create_contact
-                # raised here (DB locked / disk full) AFTER slot_consumed was set,
-                # the finally would otherwise release a slot whose invite may
+                # hinge on the contact-record write succeeding. If the reconcile
+                # write raised here (DB locked / disk full) AFTER slot_consumed was
+                # set, the finally would otherwise release a slot whose invite may
                 # already be out — exactly the mis-accounting #31 prevents.
                 slot_consumed = True
                 total_today = reserved_count
@@ -1960,20 +2145,38 @@ class LinkedInAutomation:
                     "company": profile.company,
                     "status": "possibly_sent",
                     "connection_sent_at": datetime.now(timezone.utc),
+                    # Authoritative post-click outcome: clear the reservation
+                    # token so the finalized row carries no stale owner.
+                    "reservation_token": None,
                     "notes": (
                         "Possibly sent: renderer wedged after the Send click; "
                         "assuming sent to avoid re-contact and cap drift"
                     ),
                 }
-                # Best-effort: a failed record write must not release the slot
-                # (already kept above). It only loses the non-retryable marker —
-                # the cap stays conservative, which is the priority on ambiguity.
+                # Best-effort reconcile of the durable pre-send marker (#39) from
+                # ``reserved`` to ``possibly_sent``: the invite may be out, so the
+                # row must become non-deletable (``possibly_sent`` is finalized,
+                # so a concurrent ``only_unfinalized`` cleanup can no longer erase
+                # it — finding 1). The marker was already persisted before the
+                # click, so the skip-key survives even if THIS write fails (DB
+                # locked / disk full). On failure, fall back to the minimal
+                # single-row promotion of the ``reserved`` marker to
+                # ``possibly_sent``: a reserved row left behind IS still
+                # deletable by a concurrent cleanup, so promoting it to a
+                # finalized status closes that residual re-contact window whenever
+                # the DB is writable at all. The slot is likewise already kept
+                # above, so the cap stays conservative regardless.
                 try:
-                    self.db_manager.create_contact(contact_data)
+                    self.db_manager.upsert_contact(contact_data)
                 except Exception as record_exc:
                     logger.error(
-                        "Failed to record possibly_sent contact for %s "
-                        "(slot kept): %s", profile.name, record_exc,
+                        "Failed to reconcile possibly_sent contact for %s "
+                        "(slot kept; promoting reserved marker as a fallback): %s",
+                        profile.name, record_exc,
+                    )
+                    self.db_manager.promote_reserved_to_possibly_sent(
+                        campaign.id, profile.profile_url,
+                        reservation_token=reservation_token,
                     )
                 # Stamp the cooldown timestamp: we are treating this as a real
                 # send, so the inter-session cooldown should reflect it.
@@ -1987,6 +2190,27 @@ class LinkedInAutomation:
 
             # Confirmed limit modal (no wedge): real weekly limit reached.
             if limit_reached:
+                # The weekly-limit modal means LinkedIn refused the invite — it
+                # was provably NOT sent. This outcome is retryable (the finally
+                # releases the slot), so clear the durable pre-send marker (#39)
+                # so a future run, after the weekly limit resets, can legitimately
+                # re-contact this profile. reserved_only: delete ONLY this run's
+                # ``reserved`` reservation, never a concurrent run's finalized send
+                # OR its durable ``found``/``failed`` skip record on the same
+                # profile. Best-effort: if the delete fails the row stays
+                # ``reserved``, which is merely over-conservative (skips a
+                # still-contactable profile) — never a re-contact.
+                try:
+                    self.db_manager.delete_contacts_by_profile(
+                        campaign.id, profile.profile_url, reserved_only=True,
+                        reservation_token=reservation_token,
+                    )
+                except Exception as clear_exc:
+                    logger.error(
+                        "Failed to clear pre-send marker for %s after weekly "
+                        "limit (profile may be skipped next run): %s",
+                        profile.name, clear_exc,
+                    )
                 if progress_callback:
                     progress_callback("❌ LinkedIn weekly invitation limit reached!")
                 return ConnectResult("limit_reached")
@@ -2006,13 +2230,32 @@ class LinkedInAutomation:
                 "company": profile.company,
                 "status": "sent",
                 "connection_sent_at": datetime.now(timezone.utc),
+                # Authoritative post-click outcome: clear the reservation token so
+                # the finalized row carries no stale owner.
+                "reservation_token": None,
+                "notes": None,
             }
+            # Reconcile the durable pre-send marker (#39) from ``reserved`` to the
+            # confirmed ``sent`` status via upsert (no protect_finalized: this is
+            # the authoritative post-click outcome and must win over the
+            # reservation). Best-effort: the marker already persisted before the
+            # click. On failure, fall back to promoting the ``reserved`` marker to
+            # ``possibly_sent`` (a reserved row left behind is still deletable by a
+            # concurrent cleanup; promoting it to a finalized status keeps it a
+            # protected skip-key — finding 1). The slot is already kept so the cap
+            # stays conservative; the only loss on a failed write is the less
+            # precise ``possibly_sent`` label instead of ``sent``.
             try:
-                self.db_manager.create_contact(contact_data)
+                self.db_manager.upsert_contact(contact_data)
             except Exception as record_exc:
                 logger.error(
-                    "Failed to record sent contact for %s (slot kept): %s",
+                    "Failed to reconcile sent contact for %s "
+                    "(slot kept; promoting reserved marker as a fallback): %s",
                     profile.name, record_exc,
+                )
+                self.db_manager.promote_reserved_to_possibly_sent(
+                    campaign.id, profile.profile_url,
+                    reservation_token=reservation_token,
                 )
             # Stamp the cooldown timestamp now (only on a real send, not on
             # reservation), so a failed send never triggers a false cooldown.
