@@ -2611,8 +2611,14 @@ class LinkedInAutomation:
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
-        # Filter to only sent contacts and get their IDs
-        sent_contacts = [contact for contact in contacts if contact.status == "sent"]
+        # Filter to invites awaiting acceptance and get their IDs.
+        # "possibly_sent" (issue #31) is an assumed-sent invite, so poll it for
+        # acceptance like a "sent" one — otherwise a delivered ambiguous invite
+        # would stay stuck in possibly_sent and never update on acceptance.
+        sent_contacts = [
+            contact for contact in contacts
+            if contact.status in ("sent", "possibly_sent")
+        ]
         contact_ids = [contact.id for contact in sent_contacts]
 
         if not contact_ids:
