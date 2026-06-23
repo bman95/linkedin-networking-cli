@@ -46,6 +46,7 @@ linkedin-cli
 
 **UI Layer**:
 - `linkedin_cli.py` - **Main application**: InquirerPy-based CLI with rich interactive menus
+- `src/tui/` - Full-screen **Textual** presentation layer (issue #24), entry point `linkedin-tui`. Coexists with the classic CLI and reuses the same business logic read-only. Design tokens live in `theme.py`, layout in `app.tcss`, screens under `screens/`. See `docs/tui-migration.md` for the migration plan and architecture invariants.
 
 **Configuration (`src/config/`)**:
 - `settings.py` - AppSettings class managing environment variables and app configuration

@@ -22,6 +22,22 @@ from database.operations import DatabaseManager
 from tui.app import CampaignsScreen, LinkedInTUI, MainMenuScreen
 
 
+async def open_menu_item(pilot, item_id: str) -> None:
+    """Drive the real main-menu navigation to a specific entry.
+
+    The menu is keyboard-first and focused on mount; this walks the highlight to
+    the target item and activates it, exercising the same path a user takes
+    (rather than calling ``push_screen`` directly).
+    """
+    menu = pilot.app.screen.query_one("#main-menu", ListView)
+    item_ids = [item.id for item in menu.query("ListItem")]
+    target = item_ids.index(f"menu-{item_id}")
+    while menu.index != target:
+        await pilot.press("down")
+    await pilot.press("enter")
+    await pilot.pause()
+
+
 @pytest.fixture
 def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
     """A DatabaseManager with two campaigns, one active and one inactive."""
@@ -71,10 +87,7 @@ async def test_navigate_to_campaigns_screen_renders_db_data(
     app = LinkedInTUI(db_manager=seeded_db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        # The first item ("Campaigns") is highlighted and the menu is focused on
-        # mount, so Enter activates it with no manual selection.
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
 
         assert isinstance(app.screen, CampaignsScreen)
 
@@ -114,8 +127,7 @@ async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
 
         assert isinstance(app.screen, CampaignsScreen)
         table = app.screen.query_one("#campaigns-table", DataTable)
@@ -126,6 +138,28 @@ async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
             await pilot.pause()
         assert table.row_count == 0
         assert "No campaigns" in str(status.render())
+
+
+@pytest.mark.unit
+async def test_campaign_name_with_markup_does_not_crash(db_manager: DatabaseManager):
+    """A campaign name with Rich markup must render literally, not crash.
+
+    Regression: ``DataTable`` parses string cells as Rich markup, so a user-typed
+    name like ``Q4 [/] Outreach`` would raise ``MarkupError`` and tear down the
+    UI. Names must be rendered as literal text.
+    """
+    db_manager.create_campaign({"name": "Q4 [/] Outreach", "daily_limit": 10})
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
+        table = app.screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if table.row_count == 1:
+                break
+            await pilot.pause()
+        assert table.row_count == 1
+        assert "Q4 [/] Outreach" in str(table.get_row_at(0)[0])
 
 
 @pytest.mark.unit
@@ -147,8 +181,7 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
     app = LinkedInTUI(db_manager=_SlowDB())
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
         assert isinstance(app.screen, CampaignsScreen)
 
         screen = app.screen
@@ -178,8 +211,7 @@ async def test_app_ref_captured_on_ui_thread_at_schedule_time(
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
         screen = app.screen
         assert isinstance(screen, CampaignsScreen)
 
@@ -212,8 +244,7 @@ async def test_campaigns_screen_handles_missing_db_manager(db_manager: DatabaseM
     app.db_manager = None
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
         assert isinstance(app.screen, CampaignsScreen)
         status = app.screen.query_one("#campaigns-status", Static)
         table = app.screen.query_one("#campaigns-table", DataTable)
@@ -235,8 +266,7 @@ async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
     app = LinkedInTUI(db_manager=seeded_db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("enter")
-        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
         screen = app.screen
         assert isinstance(screen, CampaignsScreen)
         table = screen.query_one("#campaigns-table", DataTable)
@@ -279,6 +309,9 @@ def test_importing_package_does_not_eagerly_load_app():
             "import tui",
             # Importing the package must not drag in the app module.
             "assert 'tui.app' not in sys.modules, 'tui.app imported eagerly'",
+            # Nor the screen modules (each calls get_logger at module scope).
+            "eager = [m for m in sys.modules if m.startswith('tui.screens.')]",
+            "assert not eager, f'screen modules imported eagerly: {eager}'",
             # Default-setup side effect (log dir under HOME) must not happen.
             "logdir = Path(os.environ['HOME']) / '.linkedin-networking-cli' / 'logs'",
             "assert not logdir.exists(), 'LoggerSetup ran with defaults at import'",

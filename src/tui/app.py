@@ -1,223 +1,60 @@
-"""Textual application: main menu + the first real screen (Campaigns).
+"""Textual application shell for the LinkedIn networking CLI (issue #24).
 
-Vertical slice for issue #24. The app reuses the existing business logic:
-``AppSettings`` for the DB path and ``DatabaseManager`` for reads. The chosen
-real screen is read-only (list campaigns) so the slice locks the data-flow
-pattern without triggering any automation side effects or requiring credentials.
+This is the app frame: it registers the design-system theme, loads the external
+stylesheet, wires the command palette, and routes to the screens. The screens
+themselves live under ``tui.screens``; the design tokens live in ``tui.theme``
+and the layout in ``app.tcss`` — one source of truth each.
 
-``DatabaseManager`` reads are synchronous and blocking (each opens its own
-short-lived SQLite session), so they are run in a threaded worker to keep the
-Textual event loop responsive. A threaded worker body cannot be interrupted
-mid-call, so a read contended by another writer on the same SQLite file (e.g.
-the classic CLI mid-campaign) holds the worker until the read returns; the read
-here is a single small query, so that window stays short.
+The app reuses the existing business logic untouched: ``AppSettings`` for the DB
+path and ``DatabaseManager`` for reads. Every shipped screen is read-only, so the
+TUI needs no LinkedIn credentials and no browser, and stays driveable in the
+Textual headless harness.
+
+``MainMenuScreen`` and ``CampaignsScreen`` are re-exported here for backwards
+compatibility with importers (and tests) that predate the screens split.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
-from textual import work
-from textual.app import App, ComposeResult
-from textual.containers import Center, Middle
-from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView, Static
+from textual.app import App
 
 from config.settings import AppSettings
-from database.models import Campaign
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
+from .commands import NavCommands
+from .screens.campaigns import CampaignsScreen
+from .screens.dashboard import DashboardScreen
+from .screens.main_menu import MainMenuScreen
+from .screens.settings_view import SettingsScreen
+from .theme import LINKEDIN_THEME
+
 logger = get_logger(__name__)
 
-
-def _acceptance_rate(campaign: Campaign) -> float:
-    """Acceptance rate as a percentage, mirroring the InquirerPy CLI."""
-    if campaign.total_sent > 0:
-        return campaign.total_accepted / campaign.total_sent * 100
-    return 0.0
-
-
-class CampaignsScreen(Screen):
-    """Read-only screen listing campaigns from the database.
-
-    Loads data through ``DatabaseManager.get_campaigns`` in a threaded worker so
-    the blocking SQLite read does not stall the UI.
-    """
-
-    BINDINGS = [
-        ("escape", "app.pop_screen", "Back"),
-        ("r", "refresh", "Refresh"),
-    ]
-
-    COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate", "Daily Limit")
-
-    def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
-        super().__init__()
-        self._db_manager = db_manager
-        # Monotonic token identifying the most recent load. A thread worker can't
-        # be cancelled mid-read, so a superseded (slower) load would otherwise
-        # overwrite the table with a stale snapshot; results are applied only if
-        # their token still matches.
-        self._load_generation = 0
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Static("Campaigns", id="campaigns-title")
-        yield DataTable(id="campaigns-table", zebra_stripes=True, cursor_type="row")
-        yield Static("", id="campaigns-status")
-        yield Footer()
-
-    def on_mount(self) -> None:
-        table = self.query_one("#campaigns-table", DataTable)
-        table.add_columns(*self.COLUMNS)
-        self.load_campaigns()
-
-    def action_refresh(self) -> None:
-        self.load_campaigns()
-
-    def load_campaigns(self) -> None:
-        """Start a fresh load, invalidating any in-flight (slower) one."""
-        self._load_generation += 1
-        # Capture the app reference here, on the UI thread while the screen is
-        # still attached. ``@work(thread=True)`` defers the worker body, so
-        # resolving ``self.app`` inside it would run later on a worker thread —
-        # and if the user popped/quit the screen first, that lookup would raise
-        # before the shutdown guards in ``_marshal_populate`` get a chance to run.
-        self._run_load(self.app, self._load_generation)
-
-    @work(thread=True, exclusive=True)
-    def _run_load(self, app: App, generation: int) -> None:
-        """Fetch campaigns off the event loop, then populate the table."""
-        if self._db_manager is None:
-            self._marshal_populate(app, generation, [], "Database unavailable.")
-            return
-        try:
-            campaigns = self._db_manager.get_campaigns(active_only=False)
-        except Exception as exc:  # surface the failure in-place, don't crash the UI
-            self._marshal_populate(app, generation, [], f"Error loading campaigns: {exc}")
-            return
-        self._marshal_populate(app, generation, campaigns, None)
-
-    def _marshal_populate(
-        self, app: App, generation: int, campaigns: List[Campaign], error: Optional[str]
-    ) -> None:
-        """Hand results back to the UI thread, but only while the app runs.
-
-        The thread worker can't be interrupted, so it may finish after the user
-        quit. ``call_from_thread`` raises ``RuntimeError`` once the event loop is
-        torn down; treating a late callback as a no-op lets the worker thread
-        exit cleanly instead of erroring (and hanging the ``linkedin-tui``
-        process on shutdown).
-        """
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, campaigns, error)
-        except RuntimeError:
-            # App stopped between the is_running check and the call; ignore.
-            return
-
-    def _populate(
-        self, generation: int, campaigns: List[Campaign], error: Optional[str]
-    ) -> None:
-        # The worker body can't be interrupted, so it may still call this after
-        # the screen was popped (its widgets gone). Bail out if we're detached.
-        if not self.is_mounted:
-            return
-        # Drop results from a superseded load so a slower older read can't
-        # overwrite the table with a stale snapshot.
-        if generation != self._load_generation:
-            return
-        table = self.query_one("#campaigns-table", DataTable)
-        table.clear()
-        status = self.query_one("#campaigns-status", Static)
-        if error is not None:
-            status.update(error)
-            return
-        for campaign in campaigns:
-            table.add_row(
-                campaign.name,
-                "Active" if campaign.active else "Inactive",
-                str(campaign.total_sent),
-                str(campaign.total_accepted),
-                f"{_acceptance_rate(campaign):.1f}%",
-                str(campaign.daily_limit),
-            )
-        if campaigns:
-            status.update(f"{len(campaigns)} campaign(s). Press Esc to go back, r to refresh.")
-        else:
-            status.update("No campaigns yet. Create one in the classic CLI (linkedin-cli).")
-
-
-class MainMenuScreen(Screen):
-    """Full-screen main menu rendered in place."""
-
-    BINDINGS = [("q", "app.quit", "Quit")]
-
-    # Each entry: (item id, label). Only "campaigns" is wired in this slice;
-    # "quit" exits. The remaining flows are migrated in later PRs of issue #24.
-    MENU_ITEMS = (
-        ("campaigns", "Campaigns"),
-        ("quit", "Quit"),
-    )
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        with Middle():
-            with Center():
-                yield Label("LinkedIn Networking CLI", id="menu-title")
-            with Center():
-                yield ListView(
-                    *(
-                        ListItem(Label(label), id=f"menu-{item_id}")
-                        for item_id, label in self.MENU_ITEMS
-                    ),
-                    id="main-menu",
-                )
-        yield Footer()
-
-    def on_mount(self) -> None:
-        # Focus the menu so the highlighted first item responds to Enter on the
-        # very first launch (without it, a keyboard user pressing Enter sees
-        # nothing happen).
-        self.query_one("#main-menu", ListView).focus()
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        item_id = event.item.id or ""
-        if item_id == "menu-campaigns":
-            self.app.push_screen(CampaignsScreen(self.app.db_manager))
-        elif item_id == "menu-quit":
-            self.app.exit()
+__all__ = [
+    "LinkedInTUI",
+    "MainMenuScreen",
+    "CampaignsScreen",
+    "DashboardScreen",
+    "SettingsScreen",
+    "run",
+]
 
 
 class LinkedInTUI(App):
-    """Full-screen Textual front end (vertical slice for issue #24)."""
+    """Full-screen Textual front end for issue #24."""
 
     TITLE = "LinkedIn Networking CLI"
 
-    CSS = """
-    #menu-title {
-        text-style: bold;
-        padding: 1 0;
-    }
+    # External stylesheet (resolved relative to this module): the single source
+    # of layout truth. Colour comes from the registered theme below.
+    CSS_PATH = "app.tcss"
 
-    #main-menu {
-        width: 40;
-        height: auto;
-        border: round $accent;
-    }
-
-    #campaigns-title {
-        text-style: bold;
-        padding: 1 2 0 2;
-    }
-
-    #campaigns-status {
-        padding: 0 2 1 2;
-        color: $text-muted;
-    }
-    """
+    # Extend the built-in palette commands with the app's navigation, rather
+    # than replacing them, so theme/quit/etc. stay available.
+    COMMANDS = App.COMMANDS | {NavCommands}
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None) -> None:
         super().__init__()
@@ -225,7 +62,7 @@ class LinkedInTUI(App):
             # Build the default manager, but degrade gracefully on a startup
             # failure (e.g. read-only home, bad DB path) the same way the classic
             # CLI does, rather than crashing before any screen is shown. A None
-            # manager surfaces "Database unavailable." in the Campaigns screen.
+            # manager surfaces "Database unavailable." in the data screens.
             try:
                 settings = AppSettings()
                 db_manager = DatabaseManager(str(settings.db_path))
@@ -235,6 +72,10 @@ class LinkedInTUI(App):
         self.db_manager = db_manager
 
     def on_mount(self) -> None:
+        # Register and select the design-system theme before the first screen
+        # mounts so every screen renders against the brand palette.
+        self.register_theme(LINKEDIN_THEME)
+        self.theme = "linkedin"
         self.push_screen(MainMenuScreen())
 
 
