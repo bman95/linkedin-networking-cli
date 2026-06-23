@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import Optional, Dict, Any
 from sqlmodel import SQLModel, Field, create_engine, Session, select
+from sqlalchemy import UniqueConstraint
 import json
 
 
@@ -51,6 +52,15 @@ class Campaign(SQLModel, table=True):
 
 class Contact(SQLModel, table=True):
     """Contact model for storing individual LinkedIn connections"""
+    # One canonical row per profile within a campaign. The resilient send tail
+    # (#39) writes a pre-send marker and later reconciles the SAME row to its
+    # final status; this constraint lets that be an atomic INSERT ... ON CONFLICT
+    # DO UPDATE (see DatabaseManager.upsert_contact) so two overlapping runs on
+    # one profile can never double-insert a duplicate skip marker. Existing DBs
+    # may already hold duplicates from the pre-existing non-atomic create_contact;
+    # DatabaseManager de-duplicates them before creating the unique index.
+    __table_args__ = (UniqueConstraint("campaign_id", "profile_url"),)
+
     id: Optional[int] = Field(default=None, primary_key=True)
     campaign_id: int = Field(foreign_key="campaign.id")
 
@@ -62,9 +72,17 @@ class Contact(SQLModel, table=True):
     company: Optional[str] = None
 
     # Connection status
-    # possibly_sent: a renderer wedge struck after the irreversible Send click,
-    # so we assume sent (non-retryable) rather than re-contact (issue #31).
-    status: str = Field(default="found")  # found, sent, possibly_sent, accepted, declined, failed
+    # reserved: a durable pre-send skip marker written BEFORE the irreversible
+    #   Send click (issue #39). It means "a future run must not re-contact this
+    #   profile" but the invite is NOT yet (known) out — so it does NOT count as
+    #   a sent invite in stats, is NOT polled for acceptance, and is the only
+    #   pre-send status a retryable cleanup may delete/downgrade. It is reconciled
+    #   to sent / possibly_sent / found after the click resolves.
+    # possibly_sent: a renderer wedge struck AFTER the irreversible Send click,
+    #   so we assume sent (non-retryable) rather than re-contact (issue #31).
+    #   Unlike reserved, it means the invite may already be out, so it is never
+    #   deleted/downgraded by a retryable cleanup.
+    status: str = Field(default="found")  # found, reserved, sent, possibly_sent, accepted, declined, failed
     connection_sent_at: Optional[datetime] = None
     connection_accepted_at: Optional[datetime] = None
 

@@ -1622,14 +1622,17 @@ class TestResilientSendTail:
         assert result.outcome == "possibly_sent"
         # The post-send reconcile write was attempted and failed...
         assert calls["n"] == 2
-        # ...yet a durable, non-retryable per-profile marker survives.
+        # ...yet the durable pre-send marker survives. It stays ``reserved``
+        # (the reconcile to possibly_sent never landed) but is still a skip-key:
+        # the dedup looks up by profile_url alone, so a future run finds it and
+        # refuses to re-contact.
         with db.get_session() as session:
             from sqlmodel import select
             contact = session.exec(
                 select(Contact).where(Contact.profile_url == profile.profile_url)
             ).first()
         assert contact is not None
-        assert contact.status == "possibly_sent"
+        assert contact.status == "reserved"
 
     @pytest.mark.asyncio
     async def test_subsequent_run_skips_profile_after_post_send_write_failure(
@@ -1888,6 +1891,109 @@ class TestResilientSendTail:
             ).all()
         assert len(rows) == 1
         assert rows[0].status == "sent"
+
+    @pytest.mark.asyncio
+    async def test_weekly_limit_cleanup_preserves_concurrent_possibly_sent(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 finding 1: a cleanup must not erase a concurrent possibly_sent.
+
+        This is the exact hazard the dedicated ``reserved`` status closes. Run A
+        clicked Send and recorded an ambiguous ``possibly_sent`` (invite may be
+        out). Run B then hits the weekly-limit modal on the same profile and runs
+        its retryable cleanup. Because ``possibly_sent`` is now unconditionally
+        finalized (never a pre-send marker), B's ``only_unfinalized`` cleanup
+        leaves it intact — so the durable marker of an invite that may already be
+        out is never deleted, and re-contact is prevented.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # Run B finds a real weekly-limit modal after its click.
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=True
+        )
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Run A's ambiguous send already persisted for this profile, with NO
+        # connection_sent_at (a partially-failed post-send reconcile) — the
+        # worst case for the old connection_sent_at split.
+        db.create_contact({
+            "campaign_id": campaign.id,
+            "name": profile.name,
+            "profile_url": profile.profile_url,
+            "status": "possibly_sent",
+        })
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert result.outcome == "limit_reached"
+        # A's possibly_sent survives B's retryable cleanup (no re-contact).
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        assert len(rows) == 1
+        assert rows[0].status == "possibly_sent"
+
+    @pytest.mark.asyncio
+    async def test_pre_send_marker_is_reserved_status(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 finding 1: the pre-send marker is written as ``reserved``.
+
+        It must NOT be ``possibly_sent`` (which now means "invite may be out"):
+        a reservation is a skip-key but no invite is known out, so it stays
+        clobberable by a retryable cleanup. Captured at the moment of the click,
+        before any reconcile.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Snapshot the marker status the instant the irreversible click fires
+        # (before the post-click reconcile to sent).
+        captured = {}
+
+        async def _capture_click(*a, **k):
+            with db.get_session() as session:
+                from sqlmodel import select
+                row = session.exec(
+                    select(Contact).where(
+                        Contact.profile_url == profile.profile_url
+                    )
+                ).first()
+                captured["status"] = row.status if row else None
+
+        send_loc.click = AsyncMock(side_effect=_capture_click)
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert result.outcome == "sent"
+        # The durable marker that existed at click time was a reservation.
+        assert captured["status"] == "reserved"
 
     @pytest.mark.asyncio
     async def test_confirmed_sent_reconciles_marker_to_sent_no_duplicate(

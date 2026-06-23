@@ -1858,15 +1858,22 @@ class LinkedInAutomation:
             # a post-send contact-write failure (DB locked / disk full) keeps the
             # slot for THIS run but leaves no row for a FUTURE run to skip on, so
             # it could re-contact someone already (possibly) invited — the exact
-            # harm #31 prevents, displaced to a later run. Written as
-            # ``possibly_sent`` (the conservative, non-retryable, no-re-contact
-            # status) because once we click it may already be out; the post-click
-            # handlers below reconcile it to its true final status (``sent``,
-            # downgraded to ``found`` on a clean send-failure, or deleted if the
-            # invite was provably NOT sent at the weekly limit). This write runs
-            # BEFORE the click boundary: if IT fails nothing irreversible has
-            # happened yet, so we abort to a clean retryable ``send_failed`` and
-            # the finally releases the slot — never click without a durable marker.
+            # harm #31 prevents, displaced to a later run. Written as the
+            # dedicated ``reserved`` status (#39 retry), NOT ``possibly_sent``: a
+            # reservation marker is a skip-key for future runs but no invite is
+            # known to be out yet, so it must stay clobberable by a retryable
+            # cleanup and must NOT count as a sent invite in stats. Keeping it
+            # distinct from ``possibly_sent`` (which now unambiguously means "the
+            # invite may be out, never delete") closes the concurrency hazard
+            # where a same-profile cleanup could delete the durable marker of an
+            # invite that already went out. The post-click handlers below
+            # reconcile it to its true final status (``sent``, ``possibly_sent``
+            # on an ambiguous send, downgraded to ``found`` on a clean
+            # send-failure, or deleted if the invite was provably NOT sent at the
+            # weekly limit). This write runs BEFORE the click boundary: if IT
+            # fails nothing irreversible has happened yet, so we abort to a clean
+            # retryable ``send_failed`` and the finally releases the slot — never
+            # click without a durable marker.
             presend_marker = {
                 "campaign_id": campaign.id,
                 "name": profile.name,
@@ -1874,7 +1881,7 @@ class LinkedInAutomation:
                 "headline": profile.headline,
                 "location": profile.location,
                 "company": profile.company,
-                "status": "possibly_sent",
+                "status": "reserved",
                 "notes": (
                     "Reserved before Send click (durable skip marker #39); "
                     "reconciled after send"
@@ -1935,7 +1942,7 @@ class LinkedInAutomation:
                         f"Send click failed for {profile.name}: {send_error}"
                     )
                     # Clean pre-send failure (the click never landed). Downgrade
-                    # the durable pre-send marker (#39) from possibly_sent back to
+                    # the durable pre-send marker (#39) from ``reserved`` back to
                     # ``found`` via upsert: nothing irreversible happened, so the
                     # recorded status must stay the retryable ``found`` this path
                     # has always used. Re-contact behaviour is unchanged — the row
@@ -1991,8 +1998,10 @@ class LinkedInAutomation:
                     # propagate and the finally release the slot — the caller
                     # skips this profile. Clear the durable pre-send marker (#39)
                     # first: the invite was provably NOT sent, so leaving a
-                    # possibly_sent row would wrongly block a legitimate future
-                    # re-contact (the opposite harm to the one #39 fixes). This is
+                    # ``reserved`` row would wrongly block a legitimate future
+                    # re-contact (the opposite harm to the one #39 fixes).
+                    # only_unfinalized: clears only the ``reserved`` reservation,
+                    # never a concurrent run's finalized send (finding 1). This is
                     # a no-op when the failure preceded the marker write (e.g. the
                     # locate wedge); best-effort so it never masks the original
                     # error. Symmetric with the weekly-limit clear below.
@@ -2046,12 +2055,15 @@ class LinkedInAutomation:
                         "assuming sent to avoid re-contact and cap drift"
                     ),
                 }
-                # Best-effort reconcile of the durable pre-send marker (#39) to
-                # its final possibly_sent note. The marker was already persisted
-                # before the click, so the non-retryable skip-key survives even if
-                # THIS write fails (DB locked / disk full): a future run still
-                # finds the row and refuses to re-contact. The slot is likewise
-                # already kept above, so the cap stays conservative regardless.
+                # Best-effort reconcile of the durable pre-send marker (#39) from
+                # ``reserved`` to ``possibly_sent``: the invite may be out, so the
+                # row must become non-deletable (``possibly_sent`` is finalized,
+                # so a concurrent ``only_unfinalized`` cleanup can no longer erase
+                # it — finding 1). The marker was already persisted before the
+                # click, so the skip-key survives even if THIS write fails (DB
+                # locked / disk full): a future run still finds the (``reserved``)
+                # row and refuses to re-contact. The slot is likewise already kept
+                # above, so the cap stays conservative regardless.
                 try:
                     self.db_manager.upsert_contact(contact_data)
                 except Exception as record_exc:
@@ -2076,9 +2088,12 @@ class LinkedInAutomation:
                 # was provably NOT sent. This outcome is retryable (the finally
                 # releases the slot), so clear the durable pre-send marker (#39)
                 # so a future run, after the weekly limit resets, can legitimately
-                # re-contact this profile. Best-effort: if the delete fails the
-                # row stays possibly_sent, which is merely over-conservative
-                # (skips a still-contactable profile) — never a re-contact.
+                # re-contact this profile. only_unfinalized: delete only the
+                # ``reserved`` reservation, never a concurrent run's finalized
+                # send on the same profile (finding 1). Best-effort: if the delete
+                # fails the row stays ``reserved``, which is merely
+                # over-conservative (skips a still-contactable profile) — never a
+                # re-contact.
                 try:
                     self.db_manager.delete_contacts_by_profile(
                         campaign.id, profile.profile_url, only_unfinalized=True
@@ -2110,12 +2125,14 @@ class LinkedInAutomation:
                 "connection_sent_at": datetime.now(timezone.utc),
                 "notes": None,
             }
-            # Reconcile the durable pre-send marker (#39) to the confirmed sent
-            # status via upsert. Best-effort: the marker already persisted before
-            # the click, so even if this write fails the row stays possibly_sent —
-            # still non-retryable and counted as sent+pending, so no re-contact
-            # and the cap stays conservative (the worst case is the slightly less
-            # precise possibly_sent label instead of sent).
+            # Reconcile the durable pre-send marker (#39) from ``reserved`` to the
+            # confirmed ``sent`` status via upsert (no protect_finalized: this is
+            # the authoritative post-click outcome and must win over the
+            # reservation). Best-effort: the marker already persisted before the
+            # click, so even if this write fails the row stays ``reserved`` — still
+            # a durable skip-key (dedup is by profile_url alone), so no re-contact,
+            # and the slot is already kept so the cap stays conservative. The only
+            # loss on a failed write is the less precise label.
             try:
                 self.db_manager.upsert_contact(contact_data)
             except Exception as record_exc:

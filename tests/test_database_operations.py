@@ -412,13 +412,13 @@ class TestContactOperations:
         assert len(rows) == 1 and rows[0].status == "sent"
 
     def test_delete_only_unfinalized_clears_reservation_marker(self, db_manager):
-        """only_unfinalized clears an unsent possibly_sent reservation marker."""
+        """only_unfinalized clears a ``reserved`` pre-send reservation marker."""
         campaign = db_manager.create_campaign({"name": "Test Campaign"})
         url = "https://linkedin.com/in/johndoe"
-        # Pre-send reservation marker: possibly_sent with no connection_sent_at.
+        # Pre-send reservation marker (#39 retry): the dedicated reserved status.
         db_manager.create_contact({
             "campaign_id": campaign.id, "name": "John Doe",
-            "profile_url": url, "status": "possibly_sent",
+            "profile_url": url, "status": "reserved",
         })
         deleted = db_manager.delete_contacts_by_profile(
             campaign.id, url, only_unfinalized=True
@@ -426,22 +426,31 @@ class TestContactOperations:
         assert deleted == 1
         assert db_manager.get_contacts(campaign.id) == []
 
-    def test_delete_only_unfinalized_preserves_finalized_possibly_sent(
+    def test_delete_only_unfinalized_preserves_possibly_sent(
         self, db_manager
     ):
-        """A finalized possibly_sent (connection_sent_at set) is preserved."""
+        """#39 finding 1: a possibly_sent row is NEVER deleted by a cleanup.
+
+        With the dedicated ``reserved`` pre-send status, ``possibly_sent`` can
+        only mean an ambiguous send whose invite may be out, so it is finalized
+        unconditionally — a concurrent ``only_unfinalized`` cleanup must not
+        erase the durable marker of an invite that already went out, even when
+        ``connection_sent_at`` did not get stamped (a failed/partial reconcile).
+        """
         campaign = db_manager.create_campaign({"name": "Test Campaign"})
         url = "https://linkedin.com/in/johndoe"
+        # No connection_sent_at: the post-send reconcile partially failed, yet
+        # the invite may be out — this must still be protected.
         db_manager.create_contact({
             "campaign_id": campaign.id, "name": "John Doe",
             "profile_url": url, "status": "possibly_sent",
-            "connection_sent_at": datetime.now(timezone.utc),
         })
         deleted = db_manager.delete_contacts_by_profile(
             campaign.id, url, only_unfinalized=True
         )
         assert deleted == 0
-        assert len(db_manager.get_contacts(campaign.id)) == 1
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "possibly_sent"
 
     def test_upsert_protect_finalized_does_not_downgrade_sent(self, db_manager):
         """protect_finalized leaves a confirmed send unchanged on downgrade."""
@@ -462,7 +471,27 @@ class TestContactOperations:
         assert len(rows) == 1 and rows[0].status == "sent"
 
     def test_upsert_protect_finalized_still_updates_reservation(self, db_manager):
-        """protect_finalized still updates an unsent reservation marker."""
+        """protect_finalized still updates a ``reserved`` reservation marker."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+        })
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "found",
+        }, protect_finalized=True)
+        assert result.status == "found"
+
+    def test_upsert_protect_finalized_does_not_downgrade_possibly_sent(
+        self, db_manager
+    ):
+        """#39 finding 1: protect_finalized leaves a possibly_sent untouched.
+
+        A possibly_sent (invite may be out) must not be downgraded by a
+        concurrent run's retryable cleanup, regardless of connection_sent_at.
+        """
         campaign = db_manager.create_campaign({"name": "Test Campaign"})
         url = "https://linkedin.com/in/johndoe"
         db_manager.create_contact({
@@ -473,7 +502,207 @@ class TestContactOperations:
             "campaign_id": campaign.id, "name": "John Doe",
             "profile_url": url, "status": "found",
         }, protect_finalized=True)
-        assert result.status == "found"
+        assert result.status == "possibly_sent"
+
+
+# ============================================================================
+# Contact uniqueness + atomic upsert (issue #39 finding 2)
+# ============================================================================
+
+@pytest.mark.unit
+class TestContactUniqueness:
+    """``(campaign_id, profile_url)`` is unique and the upsert is atomic."""
+
+    def test_unique_constraint_blocks_duplicate_insert(self, db_manager):
+        """A second create for the same (campaign, profile) is rejected by the DB.
+
+        With the UniqueConstraint, the non-atomic create_contact can no longer
+        leave two rows for one profile — the second raises rather than inserting.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/dup"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "Dup", "profile_url": url,
+            "status": "reserved",
+        })
+        with pytest.raises(IntegrityError):
+            db_manager.create_contact({
+                "campaign_id": campaign.id, "name": "Dup", "profile_url": url,
+                "status": "found",
+            })
+
+    def test_upsert_is_single_row_under_repeated_calls(self, db_manager):
+        """Repeated upserts for one profile keep exactly one canonical row.
+
+        Models two overlapping runs both writing a marker then reconciling: the
+        atomic INSERT ... ON CONFLICT DO UPDATE collapses onto one row.
+        """
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/race"
+        for status in ("reserved", "reserved", "possibly_sent", "sent"):
+            db_manager.upsert_contact({
+                "campaign_id": campaign.id, "name": "Race",
+                "profile_url": url, "status": status,
+            })
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1
+        assert rows[0].status == "sent"
+
+    def test_upsert_protect_finalized_atomic_guard_blocks_downgrade(
+        self, db_manager
+    ):
+        """The ON CONFLICT WHERE guard, not a pre-read, protects a finalized row.
+
+        Exercises the atomic path: an existing possibly_sent is left intact by a
+        protect_finalized upsert even though the conflict update is attempted.
+        """
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/guard"
+        db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "Guard",
+            "profile_url": url, "status": "possibly_sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "Guard",
+            "profile_url": url, "status": "reserved",
+        }, protect_finalized=True)
+        assert result.status == "possibly_sent"
+        assert len(db_manager.get_contacts(campaign.id)) == 1
+
+
+# ============================================================================
+# Idempotent contact de-dup migration (issue #39 finding 2)
+# ============================================================================
+
+@pytest.mark.unit
+class TestContactDedupeMigration:
+    """Existing duplicate contact rows are de-duped, then uniqueness applies."""
+
+    def _seed_duplicates(self, db_path, campaign_id, url, statuses):
+        """Reconstruct a legacy DB state: a contact table WITHOUT uniqueness.
+
+        Existing user DBs predate the UniqueConstraint, so their contact table
+        has no (campaign_id, profile_url) uniqueness and can hold duplicates.
+        The model's create_all builds the table WITH an inline UNIQUE constraint
+        (SQLite's un-droppable sqlite_autoindex), so to reproduce the legacy
+        shape we drop and recreate the table without the constraint, then insert
+        one duplicate row per status.
+        """
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE contact"))
+            # Legacy schema: same columns, NO unique constraint/index.
+            conn.execute(
+                text(
+                    "CREATE TABLE contact ("
+                    " id INTEGER PRIMARY KEY,"
+                    " campaign_id INTEGER NOT NULL,"
+                    " name VARCHAR NOT NULL,"
+                    " profile_url VARCHAR NOT NULL,"
+                    " headline VARCHAR, location VARCHAR, company VARCHAR,"
+                    " status VARCHAR NOT NULL,"
+                    " connection_sent_at DATETIME,"
+                    " connection_accepted_at DATETIME,"
+                    " notes VARCHAR,"
+                    " contact_info VARCHAR NOT NULL,"
+                    " created_at DATETIME NOT NULL,"
+                    " updated_at DATETIME"
+                    ")"
+                )
+            )
+            for status in statuses:
+                conn.execute(
+                    text(
+                        "INSERT INTO contact "
+                        "(campaign_id, name, profile_url, status, "
+                        " contact_info, created_at) "
+                        "VALUES (:cid, :name, :url, :status, '{}', :now)"
+                    ),
+                    {
+                        "cid": campaign_id, "name": "Dup", "url": url,
+                        "status": status, "now": datetime.now().isoformat(),
+                    },
+                )
+        engine.dispose()
+
+    def test_migration_dedupes_existing_duplicates(self, temp_db_path):
+        """A DB carrying duplicate rows is collapsed to one canonical row.
+
+        The keeper is the safest skip-key: a finalized outcome (an invite that
+        is or may be out) wins over a pre-send reservation, so the surviving row
+        is the one that prevents re-contact.
+        """
+        manager = DatabaseManager(str(temp_db_path))
+        campaign = manager.create_campaign({"name": "Migrate"})
+        url = "https://linkedin.com/in/dup"
+        # Reconstruct a legacy state: three rows for one profile, the middle a
+        # confirmed possibly_sent (invite may be out).
+        self._seed_duplicates(
+            temp_db_path, campaign.id, url,
+            ["reserved", "possibly_sent", "found"],
+        )
+
+        # A fresh manager over the same file runs the startup migration.
+        migrated = DatabaseManager(str(temp_db_path))
+        rows = migrated.get_contacts(campaign.id)
+        assert len(rows) == 1
+        # The finalized row (the invite-may-be-out marker) is the keeper.
+        assert rows[0].status == "possibly_sent"
+
+    def test_migration_keeps_highest_id_when_no_finalized(self, temp_db_path):
+        """With no finalized row, the most recent (highest id) write wins."""
+        manager = DatabaseManager(str(temp_db_path))
+        campaign = manager.create_campaign({"name": "Migrate"})
+        url = "https://linkedin.com/in/dup"
+        self._seed_duplicates(
+            temp_db_path, campaign.id, url, ["found", "reserved"],
+        )
+        migrated = DatabaseManager(str(temp_db_path))
+        rows = migrated.get_contacts(campaign.id)
+        assert len(rows) == 1
+        # Both clobberable; the later insert (reserved, higher id) is kept.
+        assert rows[0].status == "reserved"
+
+    def test_migration_applies_unique_index(self, temp_db_path):
+        """After migration the unique index rejects a fresh duplicate insert."""
+        from sqlalchemy.exc import IntegrityError
+
+        manager = DatabaseManager(str(temp_db_path))
+        campaign = manager.create_campaign({"name": "Migrate"})
+        url = "https://linkedin.com/in/dup"
+        self._seed_duplicates(
+            temp_db_path, campaign.id, url, ["reserved", "reserved"],
+        )
+        migrated = DatabaseManager(str(temp_db_path))
+        # The de-duped DB now enforces uniqueness on new writes.
+        with pytest.raises(IntegrityError):
+            migrated.create_contact({
+                "campaign_id": campaign.id, "name": "Dup",
+                "profile_url": url, "status": "found",
+            })
+
+    def test_migration_is_idempotent_on_rerun(self, temp_db_path):
+        """Re-running the migration on an already-clean DB changes nothing."""
+        manager = DatabaseManager(str(temp_db_path))
+        campaign = manager.create_campaign({"name": "Migrate"})
+        url = "https://linkedin.com/in/dup"
+        self._seed_duplicates(
+            temp_db_path, campaign.id, url, ["reserved", "possibly_sent"],
+        )
+        # First migration de-dupes.
+        DatabaseManager(str(temp_db_path))
+        # Second migration over the now-clean DB is a no-op (no raise, one row).
+        again = DatabaseManager(str(temp_db_path))
+        rows = again.get_contacts(campaign.id)
+        assert len(rows) == 1
+        assert rows[0].status == "possibly_sent"
+        # And the dedupe helper itself reports zero deletions on a clean DB.
+        assert again._dedupe_contacts_before_unique_index() == 0
 
 
 # ============================================================================
@@ -808,6 +1037,33 @@ class TestCampaignStatistics:
         assert updated.total_sent == 2       # sent + possibly_sent
         assert updated.total_pending == 2    # both await acceptance
         assert updated.total_accepted == 0
+
+    def test_update_campaign_stats_excludes_reserved(self, db_manager):
+        """#39: a ``reserved`` pre-send marker does NOT count as a sent invite.
+
+        It is only a skip-key (no invite is known out), so it must be excluded
+        from both sent and pending totals — otherwise a reservation that never
+        sent would inflate the campaign stats.
+        """
+        campaign = db_manager.create_campaign({"name": "Reserved"})
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Confirmed",
+            "profile_url": "https://linkedin.com/in/confirmed",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Reserved",
+            "profile_url": "https://linkedin.com/in/reserved",
+            "status": "reserved",
+        })
+
+        db_manager.update_campaign_stats(campaign.id)
+
+        updated = db_manager.get_campaign(campaign.id)
+        assert updated.total_sent == 1       # only the confirmed send
+        assert updated.total_pending == 1    # reserved excluded
 
     def test_update_campaign_stats_nonexistent_campaign(self, db_manager):
         """Test updating stats for non-existent campaign."""

@@ -24,13 +24,93 @@ class DatabaseManager:
         self.create_tables()
 
     def create_tables(self):
-        """Create all database tables"""
+        """Create all database tables, migrating an existing DB if needed."""
         try:
+            # De-duplicate any existing (campaign_id, profile_url) rows BEFORE
+            # the unique index is enforced. A new DB has no contact table yet, so
+            # this is a no-op there; an existing DB may carry duplicates from the
+            # pre-existing non-atomic create_contact (#39 retry).
+            self._dedupe_contacts_before_unique_index()
             SQLModel.metadata.create_all(self.engine)
+            # create_all only stamps the UniqueConstraint onto a freshly created
+            # table; for a pre-existing contact table it is a no-op, so add the
+            # equivalent unique index explicitly. Both are idempotent.
+            self._ensure_contact_unique_index()
             logger.info("Database tables created/verified successfully")
         except Exception as e:
             logger.error(f"Failed to create database tables: {e}")
             raise
+
+    def _dedupe_contacts_before_unique_index(self) -> int:
+        """Collapse duplicate (campaign_id, profile_url) contact rows.
+
+        Idempotent startup migration (#39 retry): existing user DBs may already
+        hold duplicate contact rows for one profile (the pre-existing
+        ``create_contact`` was a non-atomic read-then-write with no uniqueness),
+        which would block the new ``UniqueConstraint(campaign_id, profile_url)``.
+        For each duplicate group keep the single best row — a finalized outcome
+        (an invite that is or may be out, or a terminal state) wins over a
+        pre-send ``reserved``/plain marker, ties broken by the largest id (the
+        most recent write) — and delete the rest, so the surviving row is always
+        the safest skip-key. A no-op when the contact table is absent (fresh DB)
+        or already free of duplicates. Returns the number of rows deleted.
+        """
+        from sqlalchemy import inspect as sa_inspect, text
+
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table("contact"):
+            return 0
+
+        finalized = self._FINALIZED_CONTACT_STATUSES
+        deleted = 0
+        with self.get_session() as session:
+            groups = session.exec(
+                select(Contact.campaign_id, Contact.profile_url)
+                .group_by(Contact.campaign_id, Contact.profile_url)
+                .having(text("COUNT(*) > 1"))
+            ).all()
+            for campaign_id, profile_url in groups:
+                rows = session.exec(
+                    select(Contact).where(
+                        Contact.campaign_id == campaign_id,
+                        Contact.profile_url == profile_url,
+                    )
+                ).all()
+                # Keep the safest row: finalized first, then highest id.
+                keeper = max(
+                    rows,
+                    key=lambda r: (r.status in finalized, r.id or 0),
+                )
+                for row in rows:
+                    if row.id != keeper.id:
+                        session.delete(row)
+                        deleted += 1
+            session.commit()
+        if deleted:
+            logger.info(
+                f"De-duplicated {deleted} duplicate contact row(s) before "
+                f"applying the unique index"
+            )
+        return deleted
+
+    def _ensure_contact_unique_index(self) -> None:
+        """Create the (campaign_id, profile_url) unique index if it is missing.
+
+        Idempotent: ``CREATE UNIQUE INDEX IF NOT EXISTS``. Needed for existing
+        DBs whose contact table predates the model's ``UniqueConstraint`` —
+        ``create_all`` will not retrofit a constraint onto an existing table, so
+        the index is what actually enforces uniqueness there.
+        """
+        from sqlalchemy import text
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "ix_contact_campaign_profile "
+                    "ON contact (campaign_id, profile_url)"
+                )
+            )
 
     def get_session(self) -> Session:
         """Get database session"""
@@ -131,46 +211,59 @@ class DatabaseManager:
             raise
 
     # A contact row in one of these statuses represents a real, recorded
-    # outcome (an invite is out, or a terminal acceptance/decline/pending). The
-    # send tail (#39) must never delete or downgrade such a row from a retryable
-    # cleanup path — under concurrent runs on the same profile that would erase
-    # another run's confirmed send and re-open re-contact.
+    # outcome (an invite is out or may be out, or a terminal
+    # acceptance/decline/pending). The send tail (#39) must never delete or
+    # downgrade such a row from a retryable cleanup path — under concurrent runs
+    # on the same profile that would erase another run's confirmed send and
+    # re-open re-contact.
+    #
+    # ``possibly_sent`` is finalized UNCONDITIONALLY: with the dedicated
+    # ``reserved`` pre-send status (#39 retry) it can only be the post-click
+    # ambiguous-send outcome (the invite may be out), never a pre-send
+    # reservation. The only clobberable pre-send marker is ``reserved`` (and the
+    # plain retryable ``found``/``failed``), which is NOT in this set.
     _FINALIZED_CONTACT_STATUSES = frozenset(
-        {"sent", "accepted", "declined", "pending"}
+        {"sent", "possibly_sent", "accepted", "declined", "pending"}
     )
 
     def _is_finalized_contact(self, contact: Contact) -> bool:
         """True if the row is a recorded outcome that must not be clobbered.
 
-        ``possibly_sent`` is split by ``connection_sent_at``: the pre-send
-        reservation marker (#39) leaves it unset and IS clobberable; a finalized
-        possibly_sent (the post-send wedge sets ``connection_sent_at``) means an
-        invite may be out and is NOT clobberable.
+        ``reserved`` (the durable pre-send skip marker) and the plain retryable
+        statuses are clobberable; everything in
+        ``_FINALIZED_CONTACT_STATUSES`` — including any ``possibly_sent``, which
+        now unambiguously means the invite may be out — is preserved.
         """
-        if contact.status in self._FINALIZED_CONTACT_STATUSES:
-            return True
-        if (
-            contact.status == "possibly_sent"
-            and contact.connection_sent_at is not None
-        ):
-            return True
-        return False
+        return contact.status in self._FINALIZED_CONTACT_STATUSES
+
+    # Columns the upsert conflict-update must never overwrite: the conflict keys
+    # themselves and the immutable creation timestamp.
+    _UPSERT_PRESERVE_COLUMNS = frozenset(
+        {"id", "campaign_id", "profile_url", "created_at"}
+    )
 
     def upsert_contact(
         self, contact_data: Dict[str, Any], protect_finalized: bool = False
     ) -> Contact:
         """Create a contact, or update the existing one for this profile.
 
-        Keyed on ``(campaign_id, profile_url)``. Lets the resilient send tail
-        (#39) write a durable per-profile skip marker BEFORE the irreversible
-        Send click and then reconcile that same row to its final status
-        afterward, without ever creating a duplicate row for one profile. On a
-        fresh profile it behaves exactly like ``create_contact``.
+        Keyed on ``(campaign_id, profile_url)`` (a ``UniqueConstraint`` on the
+        ``Contact`` model). Lets the resilient send tail (#39) write a durable
+        per-profile skip marker BEFORE the irreversible Send click and then
+        reconcile that same row to its final status afterward, without ever
+        creating a duplicate row for one profile. On a fresh profile it behaves
+        exactly like ``create_contact``.
 
-        With ``protect_finalized=True`` an existing row that already records a
-        real outcome (see ``_is_finalized_contact``) is returned unchanged — a
-        retryable downgrade (e.g. a clean send-failure writing ``found``) must
-        not overwrite a confirmed send a concurrent run may have just recorded.
+        Atomic: a single SQLite ``INSERT ... ON CONFLICT DO UPDATE`` (mirroring
+        :meth:`reserve_daily_slot`) so two overlapping runs on the same profile
+        cannot both pass a SELECT and double-insert — one inserts, the other
+        takes the conflict-update path against the single canonical row.
+
+        With ``protect_finalized=True`` the conflict update is guarded so a row
+        that already records a real outcome (see ``_is_finalized_contact``) is
+        left unchanged — a retryable downgrade (e.g. a clean send-failure writing
+        ``found``) must not overwrite a confirmed/ambiguous send a concurrent run
+        may have just recorded.
 
         Note: the connect flow's dedup that decides whether to skip a profile
         looks up by ``profile_url`` ALONE (not scoped by campaign), so it always
@@ -182,39 +275,42 @@ class DatabaseManager:
         try:
             campaign_id = contact_data.get("campaign_id")
             profile_url = contact_data.get("profile_url")
+            now_naive = datetime.now()
+            # The conflict update sets every provided mutable column plus
+            # updated_at; never the conflict keys or created_at.
+            update_set = {
+                key: value
+                for key, value in contact_data.items()
+                if key not in self._UPSERT_PRESERVE_COLUMNS
+            }
+            update_set["updated_at"] = now_naive
             with self.get_session() as session:
-                existing = session.exec(
+                stmt = sqlite_insert(Contact).values(**contact_data)
+                on_conflict_kwargs = {
+                    "index_elements": ["campaign_id", "profile_url"],
+                    "set_": update_set,
+                }
+                if protect_finalized:
+                    # Make the update a no-op when the existing row is finalized,
+                    # so a concurrent run's confirmed/ambiguous send is never
+                    # downgraded to a reservation/retryable marker.
+                    on_conflict_kwargs["where"] = Contact.status.notin_(
+                        self._FINALIZED_CONTACT_STATUSES
+                    )
+                stmt = stmt.on_conflict_do_update(**on_conflict_kwargs)
+                session.exec(stmt)
+                session.commit()
+                contact = session.exec(
                     select(Contact).where(
                         Contact.campaign_id == campaign_id,
                         Contact.profile_url == profile_url,
                     )
                 ).first()
-                if existing is None:
-                    contact = Contact(**contact_data)
-                    session.add(contact)
-                    session.commit()
-                    session.refresh(contact)
-                    logger.debug(
-                        f"Created contact: {contact.name} "
-                        f"(ID: {contact.id}, Campaign: {contact.campaign_id})"
-                    )
-                    return contact
-                if protect_finalized and self._is_finalized_contact(existing):
-                    logger.debug(
-                        f"Skipped downgrade of finalized contact {existing.id} "
-                        f"for {profile_url} (status={existing.status})"
-                    )
-                    return existing
-                for key, value in contact_data.items():
-                    setattr(existing, key, value)
-                existing.updated_at = datetime.now()
-                session.commit()
-                session.refresh(existing)
                 logger.debug(
-                    f"Updated contact {existing.id} for {profile_url}: "
-                    f"status={existing.status}"
+                    f"Upserted contact for {profile_url}: "
+                    f"status={contact.status if contact else None}"
                 )
-                return existing
+                return contact
         except Exception as e:
             logger.error(f"Failed to upsert contact: {e}")
             raise
@@ -618,6 +714,8 @@ class DatabaseManager:
                 # consumed a daily slot, so it counts as sent and as pending
                 # (awaiting acceptance) just like "sent" — otherwise an ambiguous
                 # send would under-report totals and overstate the acceptance rate.
+                # "reserved" (issue #39) is a pre-send skip marker only (no invite
+                # is known to be out), so it is deliberately excluded from both.
                 total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
                 total_accepted = len([c for c in contacts if c.status == "accepted"])
                 total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
@@ -645,7 +743,8 @@ class DatabaseManager:
                 total_contacts = len(contacts)
                 # See update_campaign_stats: "possibly_sent" counts as sent and
                 # pending (assumed-sent, awaiting acceptance) so an ambiguous send
-                # doesn't under-report or skew the acceptance rate.
+                # doesn't under-report or skew the acceptance rate. "reserved"
+                # (issue #39, a pre-send skip marker only) is excluded from both.
                 total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
                 total_accepted = len([c for c in contacts if c.status == "accepted"])
                 total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
