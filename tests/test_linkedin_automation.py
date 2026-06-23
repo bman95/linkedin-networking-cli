@@ -1313,6 +1313,359 @@ class TestPersistedDailyCap:
 
 
 # ============================================================================
+# Resilient Send/Finalize Tail Tests (issue #31)
+# ============================================================================
+
+@pytest.mark.unit
+class TestResilientSendTail:
+    """The irreversible send tail is wedge-safe without mis-accounting sends.
+
+    A renderer wedge BEFORE the Send click is safe to retry/skip (the slot is
+    released, the contact is a plain retryable failure). A wedge AFTER the
+    (irreversible) Send click is recorded conservatively as ``possibly_sent``:
+    the reserved daily slot is KEPT (no cap drift) and the contact is recorded
+    non-retryable (no re-contact), because the invitation may already be out.
+    """
+
+    def _profile(self):
+        return LinkedInProfile(
+            name="Wedge Target",
+            profile_url="https://www.linkedin.com/in/wedge/",
+        )
+
+    def _wire_send_tail(self, automation):
+        """Wire the page so _attempt_connect reaches the send-control locate.
+
+        The click+modal unit (``invite:`` run_bounded) returns a ready modal so
+        the flow falls through to the send tail; the send control clicks cleanly
+        and the post-click limit check is a no-op. Tests then override the
+        targeted send-tail unit via a label-aware run_bounded fake (below).
+        """
+        # Move helpers are no-ops (bounding_box None -> clean mouse move).
+        automation._throttle_action = AsyncMock()
+        automation._invitation_blocked_toast = AsyncMock(return_value=False)
+        automation._handle_invitation_limit_modal = AsyncMock(return_value=False)
+        automation.page.query_selector = AsyncMock(return_value=None)  # no email
+        automation.page.wait_for_timeout = AsyncMock()
+
+        send_loc = AsyncMock()
+        send_loc.count = AsyncMock(return_value=1)
+        send_loc.click = AsyncMock()
+        send_loc.bounding_box = AsyncMock(return_value=None)
+        first = MagicMock()
+        first.first = send_loc
+        automation.page.locator = MagicMock(return_value=first)
+        return send_loc
+
+    def _label_aware_run_bounded(self, automation, *, wedge_label, on_wedge=None):
+        """Build a run_bounded fake that passes through except for ``wedge_label``.
+
+        The matching unit closes its coroutine, optionally runs ``on_wedge``
+        (e.g. to fire the real recover), then raises asyncio.TimeoutError —
+        mirroring run_bounded's contract (refresh-then-raise).
+        """
+        async def _run_bounded(awaitable, **kwargs):
+            label = kwargs.get("label", "")
+            if label.startswith(wedge_label):
+                awaitable.close()
+                if on_wedge is not None:
+                    await on_wedge(kwargs)
+                raise asyncio.TimeoutError()
+            return await awaitable
+        return _run_bounded
+
+    @pytest.mark.asyncio
+    async def test_wedge_before_send_click_releases_slot(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A wedge while locating the Send control releases the reserved slot.
+
+        Nothing irreversible happened yet, so the TimeoutError propagates out of
+        _attempt_connect, the finally releases the reservation (count back to 0),
+        and NO possibly_sent contact is recorded (it is safe to retry/skip).
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        refreshed = {"n": 0}
+
+        async def _recover(kwargs):
+            refreshed["n"] += 1
+
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-locate", on_wedge=_recover
+        )
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+            with pytest.raises(asyncio.TimeoutError):
+                await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+
+        # Pre-click wedge: the reserved slot was given back (no cap drift toward
+        # consuming a slot that never sent).
+        assert db.get_daily_connection_count(today) == 0
+        # No possibly_sent contact — the profile is safe to retry/skip.
+        with db.get_session() as session:
+            from sqlmodel import select
+            contacts = session.exec(select(Contact)).all()
+        assert all(c.status != "possibly_sent" for c in contacts)
+        # A failed send must NOT stamp the cooldown timestamp.
+        assert db.get_last_connection_at() is None
+
+    @pytest.mark.asyncio
+    async def test_wedge_after_send_click_records_possibly_sent(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A wedge after the irreversible Send click is a conservative possibly_sent.
+
+        The slot stays consumed (no cap drift, no re-contact) and the contact is
+        recorded with status ``possibly_sent`` (non-retryable), because the
+        invite may already have been delivered.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The Send click lands cleanly; the POST-click limit check wedges.
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-limit"
+        )
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        # The irreversible click did fire.
+        assert send_loc.click.await_count == 1
+        # Conservative outcome: assume sent on ambiguity.
+        assert result.outcome == "possibly_sent"
+        assert result.total_today == 1
+        # The reserved slot is KEPT (counts against the daily cap).
+        assert db.get_daily_connection_count(today) == 1
+        # The contact is recorded non-retryable so it is not re-contacted.
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert contact is not None
+        assert contact.status == "possibly_sent"
+        # An assumed send stamps the cooldown timestamp.
+        assert db.get_last_connection_at() is not None
+
+    @pytest.mark.asyncio
+    async def test_crash_after_send_click_records_possibly_sent_and_refreshes(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A crash-shaped raise after the Send click is possibly_sent + refresh.
+
+        A renderer crash that surfaces by *raising* (not hanging) after the click
+        is the ambiguous case: keep the slot, record possibly_sent, and refresh
+        the wedged browser so the rest of the run continues on a live page.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The post-click limit check raises a crash-shaped error (escapes the
+        # watchdog by raising rather than hanging).
+        async def _run_bounded(awaitable, **kwargs):
+            label = kwargs.get("label", "")
+            if label.startswith("send-limit"):
+                awaitable.close()
+                raise RuntimeError("Page crashed")
+            return await awaitable
+
+        refreshed = {"n": 0}
+
+        async def _refresh():
+            refreshed["n"] += 1
+            return mock_linkedin_automation.page
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch.object(
+                 mock_linkedin_automation, "_refresh_context", new=_refresh
+             ), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "possibly_sent"
+        # Crash-shaped raise after the click triggered a browser refresh.
+        assert refreshed["n"] == 1
+        # Slot kept; contact non-retryable.
+        assert db.get_daily_connection_count(today) == 1
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert contact is not None
+        assert contact.status == "possibly_sent"
+
+    @pytest.mark.asyncio
+    async def test_possibly_sent_keeps_slot_even_if_contact_write_fails(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A failed possibly_sent record write must NOT release the slot.
+
+        We are in the possibly_sent branch because the irreversible click fired,
+        so the slot decision must not hinge on the contact-record write. If
+        create_contact raises (DB locked / disk full), the slot stays consumed
+        (cap stays conservative) and the outcome is still possibly_sent.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The post-click limit check wedges (possibly_sent), AND the possibly_sent
+        # contact write then fails.
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-limit"
+        )
+        original_create = db.create_contact
+        db.create_contact = MagicMock(side_effect=RuntimeError("db locked"))
+
+        today = date.today().isoformat()
+        try:
+            with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+                 patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+                 patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+                result = await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+        finally:
+            db.create_contact = original_create
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "possibly_sent"
+        # The slot is KEPT despite the record-write failure (no cap drift).
+        assert db.get_daily_connection_count(today) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_crash_send_click_failure_is_plain_send_failed(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A non-crash Send-click failure stays a retryable send_failed.
+
+        A plain click error (element not actionable, its own 5s timeout) means
+        the click never landed, so the slot is released and the contact is a
+        retryable failure — NOT a possibly_sent.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # The Send click raises a non-crash error.
+        send_loc.click = AsyncMock(side_effect=Exception("not clickable"))
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Pass-through run_bounded (no wedge); only the click fails.
+        async def _run_bounded(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_run_bounded)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert result.outcome == "send_failed"
+        # Slot released; not counted against the cap.
+        assert db.get_daily_connection_count(today) == 0
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        # Recorded, but NOT as possibly_sent (it is retryable).
+        assert contact is not None
+        assert contact.status != "possibly_sent"
+        assert db.get_last_connection_at() is None
+
+    @pytest.mark.asyncio
+    async def test_possibly_sent_counted_in_send_loop_not_failed(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """send_connection_requests tallies possibly_sent apart from failed.
+
+        End-to-end: a possibly_sent from _attempt_connect must surface in the
+        ``possibly_sent`` bucket (not ``failed``) and must not be re-contacted.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+
+        profiles = [
+            LinkedInProfile(
+                name=f"P{i}", profile_url=f"https://www.linkedin.com/in/p{i}/"
+            )
+            for i in range(2)
+        ]
+        # First profile is an ambiguous send; the second is a clean send.
+        outcomes = iter([
+            ConnectResult("possibly_sent", total_today=1),
+            ConnectResult("sent", total_today=2),
+        ])
+        mock_linkedin_automation._attempt_connect = AsyncMock(
+            side_effect=lambda *a, **k: next(outcomes)
+        )
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(AsyncMock(), "connect")
+        )
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        messages = []
+        with patch("automation.linkedin.navigate_guarded",
+                   new=AsyncMock(side_effect=lambda page, *a, **k: page)), \
+             patch("automation.linkedin.run_bounded",
+                   new=AsyncMock(side_effect=_passthrough)), \
+             patch("automation.linkedin.scroll_down", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha",
+                   new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, profiles, progress_callback=messages.append
+            )
+
+        assert result["sent"] == 1
+        assert result["possibly_sent"] == 1
+        # The ambiguous send is NOT mis-counted as a retryable failure.
+        assert result["failed"] == 0
+
+
+# ============================================================================
 # Navigation Landing Guard Wiring (issue #16)
 # ============================================================================
 
@@ -2163,6 +2516,56 @@ class TestSearchAndConnect:
         # ...without any per-profile navigation or profile-page fallback.
         assert not auto.page.goto.called
         auto.send_connection_requests.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_card_possibly_sent_is_tallied_and_ends_card_pass(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A possibly_sent from a card is tallied apart from failed and ends the pass.
+
+        The browser may have refreshed mid-walk, so the remaining card handles
+        are stale: the card pass ends, the possibly_sent card is NOT deferred to
+        the profile fallback (it's already recorded — no re-contact), and the
+        result surfaces it in the ``possibly_sent`` bucket.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        # Two connectable cards; the first is an ambiguous send.
+        self._wire(
+            auto,
+            [(self._profile(0), "connect"), (self._profile(1), "connect")],
+            monkeypatch,
+        )
+
+        auto._attempt_connect = AsyncMock(
+            return_value=ConnectResult("possibly_sent", total_today=1)
+        )
+        # The fallback must NOT re-contact the possibly_sent card.
+        auto.send_connection_requests = AsyncMock(
+            return_value={
+                "sent": 0, "possibly_sent": 0, "failed": 0,
+                "existing": 0, "total_processed": 0,
+            }
+        )
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["possibly_sent"] == 1
+        assert result["sent"] == 0
+        # Not mis-counted as a retryable failure.
+        assert result["failed"] == 0
+        # The card pass ended after the first card (stale handles); the second
+        # card was never attempted.
+        assert auto._attempt_connect.await_count == 1
+        # The possibly_sent card was not handed to the profile fallback.
+        if auto.send_connection_requests.await_args is not None:
+            fb_profiles = auto.send_connection_requests.await_args.args[1]
+            assert all(
+                p.profile_url != self._profile(0).profile_url for p in fb_profiles
+            )
 
     @pytest.mark.asyncio
     async def test_card_without_connect_falls_back_to_profile_path(

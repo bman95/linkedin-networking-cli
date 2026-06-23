@@ -487,9 +487,13 @@ class DatabaseManager:
                     select(Contact).where(Contact.campaign_id == campaign_id)
                 ).all()
 
-                total_sent = len([c for c in contacts if c.status in ["sent", "accepted", "declined"]])
+                # "possibly_sent" (issue #31) is an assumed-sent invite that
+                # consumed a daily slot, so it counts as sent and as pending
+                # (awaiting acceptance) just like "sent" — otherwise an ambiguous
+                # send would under-report totals and overstate the acceptance rate.
+                total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
                 total_accepted = len([c for c in contacts if c.status == "accepted"])
-                total_pending = len([c for c in contacts if c.status == "sent"])
+                total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
 
                 campaign.total_sent = total_sent
                 campaign.total_accepted = total_accepted
@@ -512,9 +516,12 @@ class DatabaseManager:
                 total_campaigns = len(campaigns)
                 active_campaigns = len([c for c in campaigns if c.active])
                 total_contacts = len(contacts)
-                total_sent = len([c for c in contacts if c.status in ["sent", "accepted", "declined"]])
+                # See update_campaign_stats: "possibly_sent" counts as sent and
+                # pending (assumed-sent, awaiting acceptance) so an ambiguous send
+                # doesn't under-report or skew the acceptance rate.
+                total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
                 total_accepted = len([c for c in contacts if c.status == "accepted"])
-                total_pending = len([c for c in contacts if c.status == "sent"])
+                total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
 
                 acceptance_rate = (total_accepted / total_sent * 100) if total_sent > 0 else 0
 

@@ -90,6 +90,18 @@ class TestSmartChecker:
         result = await smart_connection_checker(automation, 1)
         assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
 
+    @pytest.mark.asyncio
+    async def test_sweep_includes_possibly_sent(self):
+        """The smart sweep queries both 'sent' and 'possibly_sent' (issue #31)."""
+        automation = _automation(pending=[])
+        await smart_connection_checker(automation, 1)
+        queried = {
+            call.args[1]
+            for call in automation.db_manager.get_contacts_by_status.call_args_list
+        }
+        assert "sent" in queried
+        assert "possibly_sent" in queried
+
 
 @pytest.mark.unit
 class TestCheckSpecificContacts:
@@ -119,6 +131,19 @@ class TestCheckSpecificContacts:
         stats = await check_specific_contacts(automation, [2])
         assert stats["checked"] == 0
         automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_possibly_sent_contact_is_checked(self):
+        """possibly_sent (issue #31) is polled for acceptance like sent."""
+        contact = SimpleNamespace(
+            id=3, name="Ann", status="possibly_sent",
+            profile_url="https://x/in/ann/",
+        )
+        automation = _automation(contact=contact, is_connected=True)
+        stats = await check_specific_contacts(automation, [3])
+        assert stats["checked"] == 1
+        assert stats["newly_accepted"] == 1
+        automation.db_manager.update_contact.assert_called_once()
 
 
 @pytest.mark.unit

@@ -629,6 +629,33 @@ class TestCampaignStatistics:
         assert updated_campaign.total_accepted == 1
         assert updated_campaign.total_pending == 2  # sent only
 
+    def test_update_campaign_stats_counts_possibly_sent(self, db_manager):
+        """possibly_sent counts as sent AND pending (issue #31).
+
+        An assumed-sent invite consumed a daily slot, so it must not under-report
+        the campaign totals or skew the acceptance rate.
+        """
+        campaign = db_manager.create_campaign({"name": "Possibly Sent"})
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Confirmed",
+            "profile_url": "https://linkedin.com/in/confirmed",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Ambiguous",
+            "profile_url": "https://linkedin.com/in/ambiguous",
+            "status": "possibly_sent",
+        })
+
+        db_manager.update_campaign_stats(campaign.id)
+
+        updated = db_manager.get_campaign(campaign.id)
+        assert updated.total_sent == 2       # sent + possibly_sent
+        assert updated.total_pending == 2    # both await acceptance
+        assert updated.total_accepted == 0
+
     def test_update_campaign_stats_nonexistent_campaign(self, db_manager):
         """Test updating stats for non-existent campaign."""
         # Should not raise an error
@@ -690,6 +717,34 @@ class TestDashboardStatistics:
         assert stats["total_accepted"] == 1
         assert stats["total_pending"] == 1
         assert stats["acceptance_rate"] == 50.0
+
+    def test_get_dashboard_stats_counts_possibly_sent(self, db_manager):
+        """Dashboard totals include possibly_sent as sent+pending (issue #31)."""
+        campaign = db_manager.create_campaign({"name": "Campaign"})
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Confirmed",
+            "profile_url": "https://linkedin.com/in/confirmed",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Ambiguous",
+            "profile_url": "https://linkedin.com/in/ambiguous",
+            "status": "possibly_sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Accepted",
+            "profile_url": "https://linkedin.com/in/accepted",
+            "status": "accepted",
+        })
+
+        stats = db_manager.get_dashboard_stats()
+
+        assert stats["total_sent"] == 3       # sent + possibly_sent + accepted
+        assert stats["total_pending"] == 2    # sent + possibly_sent
+        assert stats["total_accepted"] == 1
 
     def test_get_dashboard_stats_acceptance_rate_calculation(self, db_manager):
         """Test acceptance rate calculation."""

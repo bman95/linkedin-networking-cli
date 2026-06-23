@@ -36,8 +36,12 @@ async def smart_connection_checker(
     if progress_callback:
         progress_callback("Starting smart connection checker...")
 
-    # Get pending contacts for this campaign
-    pending_contacts = automation.db_manager.get_contacts_by_status(campaign_id, "sent")
+    # Get pending contacts for this campaign. "possibly_sent" (issue #31) is an
+    # assumed-sent invite awaiting acceptance, so sweep it alongside "sent".
+    pending_contacts = (
+        automation.db_manager.get_contacts_by_status(campaign_id, "sent")
+        + automation.db_manager.get_contacts_by_status(campaign_id, "possibly_sent")
+    )
 
     if not pending_contacts:
         if progress_callback:
@@ -286,9 +290,10 @@ async def check_specific_contacts(
 
     for contact_id in contact_ids:
         try:
-            # Get contact from database
+            # Get contact from database. "possibly_sent" (issue #31) is an
+            # assumed-sent invite awaiting acceptance, so check it like "sent".
             contact = automation.db_manager.get_contact(contact_id)
-            if not contact or contact.status != "sent":
+            if not contact or contact.status not in ("sent", "possibly_sent"):
                 continue
 
             if progress_callback:

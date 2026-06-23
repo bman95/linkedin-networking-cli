@@ -68,11 +68,19 @@ logger = get_logger(__name__)
 
 
 # Outcome of one per-profile connect attempt (see _attempt_connect). ``outcome``
-# is the terminal state string the send loop branches on ("sent", "day_full",
-# "limit_reached", "email_required", "blocked", "modal_not_found",
-# "send_failed"); ``total_today`` is only set on a confirmed send (the
-# cumulative day count the caller uses to decide whether to stop), and defaults
-# to None for every non-send outcome.
+# is the terminal state string the send loop branches on ("sent",
+# "possibly_sent", "day_full", "limit_reached", "email_required", "blocked",
+# "modal_not_found", "send_failed"); ``total_today`` is set on a confirmed send
+# AND on a conservative "possibly_sent" (both consume the reserved slot, so it
+# carries the cumulative day count the caller uses to decide whether to stop),
+# and defaults to None for every outcome that releases its slot.
+#
+# "possibly_sent" is the resilient send-tail outcome (issue #31): a watchdog
+# timeout or crash that strikes AFTER the irreversible "Send" click was fired
+# but before the result could be confirmed. The invitation may well have been
+# delivered, so we assume sent on ambiguity — the reserved daily slot is KEPT
+# (no cap drift) and the contact is recorded non-retryable (no re-contact),
+# rather than released and marked a plain retryable ``failed``.
 ConnectResult = namedtuple("ConnectResult", ["outcome", "total_today"])
 ConnectResult.__new__.__defaults__ = (None,)
 
@@ -952,6 +960,7 @@ class LinkedInAutomation:
         daily_limit = self._effective_daily_limit(campaign, automation_settings)
 
         sent_count = 0
+        possibly_sent_count = 0  # ambiguous sends that consumed a slot (issue #31)
         failed_count = 0
         existing_count = 0
         seen_urls: set = set()
@@ -1111,14 +1120,26 @@ class LinkedInAutomation:
                     if result.outcome in ("day_full", "limit_reached"):
                         scan_done = stop_all = True
                         break
-                    if result.outcome == "sent":
-                        sent_count += 1
+                    # "sent" and "possibly_sent" both consumed the reserved slot
+                    # (an ambiguous send counts against the cap; #31). Tally them
+                    # apart but treat them identically for cap/delay so neither is
+                    # re-contacted via the profile fallback.
+                    if result.outcome in ("sent", "possibly_sent"):
+                        if result.outcome == "sent":
+                            sent_count += 1
+                        else:
+                            possibly_sent_count += 1
                         # Random delay between connections (mirrors the profile path).
+                        # A possibly_sent may have refreshed the browser, so its
+                        # delay is a page-independent wall-clock sleep.
                         delay = random.randint(
                             automation_settings["connection_delay_min"],
                             automation_settings["connection_delay_max"],
                         )
-                        await self.page.wait_for_timeout(delay * 1000)
+                        if result.outcome == "sent":
+                            await self.page.wait_for_timeout(delay * 1000)
+                        else:
+                            await asyncio.sleep(delay)
                         if (
                             result.total_today is not None
                             and result.total_today >= daily_limit
@@ -1129,6 +1150,13 @@ class LinkedInAutomation:
                                     f"({result.total_today}/{daily_limit} used today)"
                                 )
                             scan_done = stop_all = True
+                            break
+                        # A possibly_sent refreshed the browser mid-walk, so the
+                        # remaining card handles on this page are stale. End the
+                        # card pass cleanly (later pages are not recovered — the
+                        # single-pass design's trade-off, same as a card wedge).
+                        if result.outcome == "possibly_sent":
+                            scan_done = True
                             break
                         continue
                     # Soft failure (email_required / blocked / modal_not_found /
@@ -1155,15 +1183,19 @@ class LinkedInAutomation:
                     campaign, fallback_profiles, progress_callback
                 )
                 sent_count += fb["sent"]
+                possibly_sent_count += fb.get("possibly_sent", 0)
                 failed_count += fb["failed"]
                 existing_count += fb["existing"]
 
             self.db_manager.update_campaign_stats(campaign.id)
             return {
                 "sent": sent_count,
+                "possibly_sent": possibly_sent_count,
                 "failed": failed_count,
                 "existing": existing_count,
-                "total_processed": sent_count + failed_count + existing_count,
+                "total_processed": (
+                    sent_count + possibly_sent_count + failed_count + existing_count
+                ),
                 "scanned": len(seen_urls),
             }
 
@@ -1252,6 +1284,7 @@ class LinkedInAutomation:
         automation_settings = self.settings.get_automation_settings()
         daily_limit = self._effective_daily_limit(campaign, automation_settings)
         sent_count = 0
+        possibly_sent_count = 0  # ambiguous sends that consumed a slot (issue #31)
         failed_count = 0
         existing_count = 0
 
@@ -1281,6 +1314,7 @@ class LinkedInAutomation:
             self.db_manager.update_campaign_stats(campaign.id)
             return {
                 "sent": 0,
+                "possibly_sent": 0,
                 "failed": 0,
                 "existing": 0,
                 "total_processed": 0,
@@ -1435,15 +1469,30 @@ class LinkedInAutomation:
                 )
                 if result.outcome in ("day_full", "limit_reached"):
                     break
-                if result.outcome == "sent":
-                    sent_count += 1
+                # "sent" and "possibly_sent" both consumed their reserved daily
+                # slot, so for cap accounting they are equivalent — an ambiguous
+                # send counts against the cap (no drift, no re-contact). Only the
+                # tally is split: confirmed sends bump ``sent``, ambiguous ones
+                # ``possibly_sent``, so neither is mis-reported as a retryable
+                # ``failed``.
+                if result.outcome in ("sent", "possibly_sent"):
+                    if result.outcome == "sent":
+                        sent_count += 1
+                    else:
+                        possibly_sent_count += 1
                     consecutive_failures = 0  # successful action resets backoff
-                    # Random delay between connections
+                    # A possibly_sent already refreshed the browser if it crashed;
+                    # the inter-connection delay is a wall-clock pause, so use
+                    # asyncio.sleep when the page may be mid-refresh and
+                    # page.wait_for_timeout otherwise (keeps existing behavior).
                     delay = random.randint(
                         automation_settings["connection_delay_min"],
                         automation_settings["connection_delay_max"],
                     )
-                    await self.page.wait_for_timeout(delay * 1000)
+                    if result.outcome == "sent":
+                        await self.page.wait_for_timeout(delay * 1000)
+                    else:
+                        await asyncio.sleep(delay)
                     # Check the persisted daily limit (cumulative across restarts).
                     if (
                         result.total_today is not None
@@ -1551,9 +1600,12 @@ class LinkedInAutomation:
 
         return {
             "sent": sent_count,
+            "possibly_sent": possibly_sent_count,
             "failed": failed_count,
             "existing": existing_count,
-            "total_processed": sent_count + failed_count + existing_count,
+            "total_processed": (
+                sent_count + possibly_sent_count + failed_count + existing_count
+            ),
         }
 
     async def _attempt_connect(
@@ -1573,9 +1625,16 @@ class LinkedInAutomation:
         ``finally`` still releases the reserved slot), so the caller's
         ``except asyncio.TimeoutError`` / ``except Exception`` arms catch them.
 
+        The send/finalize tail (issue #31) is split at the irreversible "Send"
+        click: a wedge BEFORE the click propagates out (slot released, safe to
+        retry); a wedge AFTER it is captured here as a conservative
+        ``possibly_sent`` (slot KEPT, contact recorded non-retryable) rather than
+        released as a plain ``failed`` — the invite may already be out.
+
         Returns a :class:`ConnectResult` whose ``outcome`` is one of "day_full",
         "email_required", "blocked", "modal_not_found", "send_failed",
-        "limit_reached", or "sent". ``total_today`` is only set on "sent".
+        "limit_reached", "sent", or "possibly_sent". ``total_today`` is set on
+        both "sent" and "possibly_sent" (each consumes its reserved slot).
         """
         today = date.today().isoformat()
         automation_settings = self.settings.get_automation_settings()
@@ -1751,30 +1810,147 @@ class LinkedInAutomation:
                     "LinkedIn Premium; sending without a note"
                 )
 
-            # NOTE: The send/finalize tail below (locate the send control,
-            # humanized move+click, weekly-limit check) is intentionally left
-            # UNBOUNDED — it is not wrapped in run_bounded like the read and
-            # click+modal units above. Bounding it under the per-item watchdog
-            # mis-accounts the irreversible send (a watchdog timeout after the
-            # click has already fired would skip the profile as "not sent"
-            # while LinkedIn actually delivered the invitation). Designing a
-            # resilient wrapper that is safe around the irreversible send is
-            # tracked separately in issue #31.
-            send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
-            send_exact = self.page.locator(sel.INVITE_SEND.css).first
-            send_target = send_no_note if await send_no_note.count() else send_exact
+            # === Resilient send/finalize tail (issue #31) ===
+            #
+            # The send tail is split at the irreversible "Send" click so a
+            # renderer wedge cannot hang the loop indefinitely AND a watchdog
+            # firing around the send cannot mis-account a real delivery:
+            #
+            #   1. PRE-CLICK (safe to bound): locating the send control is just
+            #      ``locator.count()`` reads — which a crashed renderer can wedge
+            #      forever (count() carries no timeout) — so it runs under
+            #      run_bounded. A timeout here fired BEFORE anything irreversible,
+            #      so it propagates out and the caller skips the profile and the
+            #      ``finally`` releases the reserved slot (safe to retry).
+            #
+            #   2. THE CLICK + POST-CLICK CHECKS (must NOT be naively bounded):
+            #      the click is irreversible, and the weekly-limit check after it
+            #      is again wedge-prone page work. ``send_click_attempted`` is set
+            #      the instant before the click, so any timeout/crash from the
+            #      click onward is resolved conservatively as "possibly_sent":
+            #      assume the invite went out, KEEP the reserved slot (no cap
+            #      drift), record the contact non-retryable (no re-contact), and
+            #      refresh the wedged browser — instead of releasing the slot and
+            #      marking a plain retryable ``failed``.
+            send_click_attempted = False
 
-            logger.info("Clicking 'Send without a note' button")
-            # Natural mouse move to the send button before clicking. The
-            # click keeps its own failure handling (records the contact and
-            # skips), so don't route it through move_to_and_click's JS
-            # fallback — only humanize the approach.
-            await self._throttle_action()
-            await move_to_element(self.page, send_target)
+            async def _locate_send_control():
+                send_no_note = self.page.locator(sel.INVITE_SEND_NO_NOTE.css).first
+                send_exact = self.page.locator(sel.INVITE_SEND.css).first
+                if await send_no_note.count():
+                    return send_no_note
+                return send_exact
+
+            # Pre-click: bound the control lookup. A wedge here is pre-send, so
+            # let TimeoutError propagate (caller skips, finally releases).
+            send_target = await run_bounded(
+                _locate_send_control(),
+                timeout_s=self.settings.get_navigation_settings()[
+                    "interaction_watchdog_s"
+                ],
+                recover=self._recover,
+                label=f"send-locate:{profile.name}",
+            )
+
             try:
-                await send_target.click(timeout=5000)
-            except Exception as send_error:
-                logger.warning(f"Send click failed for {profile.name}: {send_error}")
+                logger.info("Clicking 'Send without a note' button")
+                # Natural mouse move to the send button before clicking. The
+                # click keeps its own failure handling (records the contact and
+                # skips), so don't route it through move_to_and_click's JS
+                # fallback — only humanize the approach. The move is pre-click
+                # and reversible, so a failure here is still a clean
+                # ``send_failed`` (the slot is released by the finally).
+                await self._throttle_action()
+                await move_to_element(self.page, send_target)
+                try:
+                    # Mark the boundary: from here the action is irreversible, so
+                    # an exception out of the click (or anything after it) is
+                    # resolved as "possibly_sent", never released as a plain fail.
+                    send_click_attempted = True
+                    await send_target.click(timeout=5000)
+                except Exception as send_error:
+                    # The click itself raised. Playwright resolves the click
+                    # AFTER the element handled the action, so a raise here almost
+                    # always means the click never landed (target detached / not
+                    # actionable / its own 5s timeout) — treat it as a clean
+                    # pre-send ``send_failed`` and release the slot. A genuine
+                    # crash-shaped error is the ambiguous case: the renderer may
+                    # have died mid-dispatch, so fall through to "possibly_sent".
+                    if _is_crash_error(send_error):
+                        raise
+                    send_click_attempted = False
+                    logger.warning(
+                        f"Send click failed for {profile.name}: {send_error}"
+                    )
+                    contact_data = {
+                        "campaign_id": campaign.id,
+                        "name": profile.name,
+                        "profile_url": profile.profile_url,
+                        "headline": profile.headline,
+                        "location": profile.location,
+                        "company": profile.company,
+                        "status": "found",
+                        "notes": "Send button not clickable after clicking Connect",
+                    }
+                    self.db_manager.create_contact(contact_data)
+                    if progress_callback:
+                        progress_callback(
+                            f"❌ Send button not clickable for {profile.name}"
+                        )
+                    await random_wait(self.page, min_ms=1000, max_ms=2000)
+                    return ConnectResult("send_failed")
+
+                await random_wait(self.page, min_ms=2000, max_ms=3000)
+
+                # Post-click weekly-limit check — wedge-prone page work AFTER the
+                # irreversible click. Bound it so a crashed renderer can't hang
+                # the loop, but resolve a timeout as "possibly_sent" (handled by
+                # the except below), not as a released failure.
+                limit_reached = await run_bounded(
+                    self._handle_invitation_limit_modal(profile),
+                    timeout_s=self.settings.get_navigation_settings()[
+                        "interaction_watchdog_s"
+                    ],
+                    recover=self._recover,
+                    label=f"send-limit:{profile.name}",
+                )
+            except Exception as tail_error:
+                # A wedge/crash struck after the irreversible click. The invite
+                # may already be out, so assume sent on ambiguity: keep the
+                # reserved slot, record the contact non-retryable, and let the
+                # outer flow continue on the refreshed browser. run_bounded
+                # already refreshed on a TimeoutError; refresh here for a
+                # crash-shaped raise that escaped it so the page is live again.
+                if not send_click_attempted:
+                    # Pre-click failure that wasn't a plain send_failed (e.g. the
+                    # locate watchdog, or a crash before the click boundary):
+                    # nothing irreversible happened, so let it propagate and the
+                    # finally release the slot — the caller skips this profile.
+                    raise
+                logger.warning(
+                    "Send-tail wedge/crash for %s AFTER the send click "
+                    "(%s) — recording 'possibly sent' (slot kept)",
+                    profile.name,
+                    tail_error,
+                )
+                if not isinstance(tail_error, asyncio.TimeoutError) and _is_crash_error(
+                    tail_error
+                ):
+                    try:
+                        await self._refresh_context()
+                    except Exception as refresh_exc:
+                        logger.error(
+                            "Browser refresh after possibly-sent crash failed: %s",
+                            refresh_exc,
+                        )
+                # Keep the reserved slot BEFORE any further DB write: the
+                # irreversible click already fired, so the slot decision must not
+                # hinge on the contact-record write succeeding. If create_contact
+                # raised here (DB locked / disk full) AFTER slot_consumed was set,
+                # the finally would otherwise release a slot whose invite may
+                # already be out — exactly the mis-accounting #31 prevents.
+                slot_consumed = True
+                total_today = reserved_count
                 contact_data = {
                     "campaign_id": campaign.id,
                     "name": profile.name,
@@ -1782,24 +1958,45 @@ class LinkedInAutomation:
                     "headline": profile.headline,
                     "location": profile.location,
                     "company": profile.company,
-                    "status": "found",
-                    "notes": "Send button not clickable after clicking Connect",
+                    "status": "possibly_sent",
+                    "connection_sent_at": datetime.now(timezone.utc),
+                    "notes": (
+                        "Possibly sent: renderer wedged after the Send click; "
+                        "assuming sent to avoid re-contact and cap drift"
+                    ),
                 }
-                self.db_manager.create_contact(contact_data)
+                # Best-effort: a failed record write must not release the slot
+                # (already kept above). It only loses the non-retryable marker —
+                # the cap stays conservative, which is the priority on ambiguity.
+                try:
+                    self.db_manager.create_contact(contact_data)
+                except Exception as record_exc:
+                    logger.error(
+                        "Failed to record possibly_sent contact for %s "
+                        "(slot kept): %s", profile.name, record_exc,
+                    )
+                # Stamp the cooldown timestamp: we are treating this as a real
+                # send, so the inter-session cooldown should reflect it.
+                self.db_manager.mark_connection_sent(today)
                 if progress_callback:
-                    progress_callback(f"❌ Send button not clickable for {profile.name}")
-                await random_wait(self.page, min_ms=1000, max_ms=2000)
-                return ConnectResult("send_failed")
-            await random_wait(self.page, min_ms=2000, max_ms=3000)
+                    progress_callback(
+                        f"⚠️ Possibly sent to {profile.name} (renderer wedged "
+                        "after Send) — counted to avoid re-contact"
+                    )
+                return ConnectResult("possibly_sent", total_today=total_today)
 
-            # Check for the weekly invitation limit, distinguishing the real
-            # limit from the "near limit" warning.
-            if await self._handle_invitation_limit_modal(profile):
+            # Confirmed limit modal (no wedge): real weekly limit reached.
+            if limit_reached:
                 if progress_callback:
                     progress_callback("❌ LinkedIn weekly invitation limit reached!")
                 return ConnectResult("limit_reached")
 
-            # Success - connection sent
+            # Success - connection sent. Consume the slot BEFORE the record
+            # write: the send already happened, so a record-write failure must
+            # not release a slot whose invite is already out (same invariant as
+            # the possibly_sent path). reserved_count is the cumulative day total.
+            slot_consumed = True
+            total_today = reserved_count
             contact_data = {
                 "campaign_id": campaign.id,
                 "name": profile.name,
@@ -1810,12 +2007,13 @@ class LinkedInAutomation:
                 "status": "sent",
                 "connection_sent_at": datetime.now(timezone.utc),
             }
-            self.db_manager.create_contact(contact_data)
-            # The slot was reserved (and persisted) before the send, so the
-            # request is now confirmed and the reservation is consumed —
-            # don't release it. reserved_count is the cumulative day total.
-            slot_consumed = True
-            total_today = reserved_count
+            try:
+                self.db_manager.create_contact(contact_data)
+            except Exception as record_exc:
+                logger.error(
+                    "Failed to record sent contact for %s (slot kept): %s",
+                    profile.name, record_exc,
+                )
             # Stamp the cooldown timestamp now (only on a real send, not on
             # reservation), so a failed send never triggers a false cooldown.
             self.db_manager.mark_connection_sent(today)
@@ -1829,10 +2027,12 @@ class LinkedInAutomation:
 
             return ConnectResult("sent", total_today=total_today)
         finally:
-            # Give back a reserved slot that wasn't consumed by a confirmed
-            # send (email-required, blocked, modal-not-found, failed send,
-            # or any exception propagating out of the bounded click). Success
-            # sets slot_consumed, so this is a no-op there.
+            # Give back a reserved slot that wasn't consumed by a confirmed send
+            # (email-required, blocked, modal-not-found, failed send) or by a
+            # conservative "possibly_sent" (which sets slot_consumed). A wedge
+            # BEFORE the irreversible click propagates out here with
+            # slot_consumed still False, so its slot is released; a wedge AFTER
+            # the click is captured as possibly_sent above (slot kept).
             if not slot_consumed:
                 self.db_manager.release_daily_slot(today)
 
@@ -2411,8 +2611,14 @@ class LinkedInAutomation:
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
 
-        # Filter to only sent contacts and get their IDs
-        sent_contacts = [contact for contact in contacts if contact.status == "sent"]
+        # Filter to invites awaiting acceptance and get their IDs.
+        # "possibly_sent" (issue #31) is an assumed-sent invite, so poll it for
+        # acceptance like a "sent" one — otherwise a delivered ambiguous invite
+        # would stay stuck in possibly_sent and never update on acceptance.
+        sent_contacts = [
+            contact for contact in contacts
+            if contact.status in ("sent", "possibly_sent")
+        ]
         contact_ids = [contact.id for contact in sent_contacts]
 
         if not contact_ids:

@@ -1038,15 +1038,24 @@ class LinkedInCLI:
                 )
             elif status == "success":
                 sent = automation_result.get("sent", 0)
+                possibly_sent = automation_result.get("possibly_sent", 0)
                 failed = automation_result.get("failed", 0)
                 existing = automation_result.get("existing", 0)
                 profiles_found = automation_result.get("profiles", 0)
-                total = automation_result.get("total_processed", sent + failed + existing)
+                total = automation_result.get(
+                    "total_processed", sent + possibly_sent + failed + existing
+                )
                 summary_lines = [
                     "[bold]Automation summary[/bold]",
                     "",
                     f"Profiles scanned: {profiles_found}",
                     f"Requests sent: {sent}",
+                ]
+                # Only surface the conservative "possibly sent" line when it
+                # happened, so a clean run's summary stays uncluttered.
+                if possibly_sent:
+                    summary_lines.append(f"Possibly sent (renderer wedged): {possibly_sent}")
+                summary_lines += [
                     f"Already contacted: {existing}",
                     f"Failures: {failed}",
                     f"Total processed: {total}",
@@ -1341,7 +1350,12 @@ class LinkedInCLI:
             campaigns_with_pending = []
 
             for campaign in campaigns:
-                pending_count = len(self.db_manager.get_contacts_by_status(campaign.id, "sent"))
+                # "possibly_sent" (issue #31) is an assumed-sent invite awaiting
+                # acceptance, so it's pending alongside "sent".
+                pending_count = len(
+                    self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                    + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
+                )
                 if pending_count > 0:
                     campaigns_with_pending.append((campaign, pending_count))
 
@@ -1405,7 +1419,10 @@ class LinkedInCLI:
                                     campaign.id, progress_update
                                 )
                             else:  # direct
-                                pending_contacts = self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                                pending_contacts = (
+                                    self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                                    + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
+                                )
                                 stats = await automation.check_connection_status(
                                     pending_contacts, progress_update
                                 )
@@ -1421,7 +1438,10 @@ class LinkedInCLI:
                                 selected.id, progress_update
                             )
                         else:  # direct
-                            pending_contacts = self.db_manager.get_contacts_by_status(selected.id, "sent")
+                            pending_contacts = (
+                                self.db_manager.get_contacts_by_status(selected.id, "sent")
+                                + self.db_manager.get_contacts_by_status(selected.id, "possibly_sent")
+                            )
                             newly_accepted = await automation.check_connection_status(
                                 pending_contacts, progress_update
                             )
