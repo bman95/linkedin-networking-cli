@@ -98,12 +98,20 @@ async def test_navigate_to_campaigns_screen_renders_db_data(
 
 @pytest.mark.unit
 async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
-    """An empty DB renders the screen with zero rows and a friendly message."""
+    """An empty DB renders the screen with zero rows and a friendly message.
+
+    Drives the real menu navigation path (not a direct push_screen) so the
+    empty-DB branch is exercised exactly as a user would reach it.
+    """
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app.push_screen(CampaignsScreen(db_manager))
+        menu = app.screen.query_one("#main-menu", ListView)
+        menu.index = 0
+        await pilot.press("enter")
         await pilot.pause()
+
+        assert isinstance(app.screen, CampaignsScreen)
         table = app.screen.query_one("#campaigns-table", DataTable)
         status = app.screen.query_one("#campaigns-status", Static)
         for _ in range(50):

@@ -7,7 +7,10 @@ pattern without triggering any automation side effects or requiring credentials.
 
 ``DatabaseManager`` reads are synchronous and blocking (each opens its own
 short-lived SQLite session), so they are run in a threaded worker to keep the
-Textual event loop responsive.
+Textual event loop responsive. A threaded worker body cannot be interrupted
+mid-call, so a read contended by another writer on the same SQLite file (e.g.
+the classic CLI mid-campaign) holds the worker until the read returns; the read
+here is a single small query, so that window stays short.
 """
 
 from __future__ import annotations
@@ -79,6 +82,10 @@ class CampaignsScreen(Screen):
         self.app.call_from_thread(self._populate, campaigns, None)
 
     def _populate(self, campaigns: List[Campaign], error: Optional[str]) -> None:
+        # The worker body can't be interrupted, so it may still call this after
+        # the screen was popped (its widgets gone). Bail out if we're detached.
+        if not self.is_mounted:
+            return
         table = self.query_one("#campaigns-table", DataTable)
         table.clear()
         status = self.query_one("#campaigns-status", Static)
