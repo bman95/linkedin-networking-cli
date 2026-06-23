@@ -1976,9 +1976,27 @@ class LinkedInAutomation:
                 # crash-shaped raise that escaped it so the page is live again.
                 if not send_click_attempted:
                     # Pre-click failure that wasn't a plain send_failed (e.g. the
-                    # locate watchdog, or a crash before the click boundary):
-                    # nothing irreversible happened, so let it propagate and the
-                    # finally release the slot — the caller skips this profile.
+                    # locate watchdog, or a failure in the reversible
+                    # throttle/move window between the marker write and the click
+                    # boundary): nothing irreversible happened, so let it
+                    # propagate and the finally release the slot — the caller
+                    # skips this profile. Clear the durable pre-send marker (#39)
+                    # first: the invite was provably NOT sent, so leaving a
+                    # possibly_sent row would wrongly block a legitimate future
+                    # re-contact (the opposite harm to the one #39 fixes). This is
+                    # a no-op when the failure preceded the marker write (e.g. the
+                    # locate wedge); best-effort so it never masks the original
+                    # error. Symmetric with the weekly-limit clear below.
+                    try:
+                        self.db_manager.delete_contacts_by_profile(
+                            campaign.id, profile.profile_url
+                        )
+                    except Exception as clear_exc:
+                        logger.error(
+                            "Failed to clear pre-send marker for %s after a "
+                            "pre-click failure (profile may be skipped next "
+                            "run): %s", profile.name, clear_exc,
+                        )
                     raise
                 logger.warning(
                     "Send-tail wedge/crash for %s AFTER the send click "

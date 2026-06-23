@@ -133,13 +133,18 @@ class DatabaseManager:
     def upsert_contact(self, contact_data: Dict[str, Any]) -> Contact:
         """Create a contact, or update the existing one for this profile.
 
-        Keyed on ``(campaign_id, profile_url)`` — the same identity the connect
-        flow's dedup lookup uses to decide whether a profile was already
-        contacted. Lets the resilient send tail (#39) write a durable per-profile
-        skip marker BEFORE the irreversible Send click and then reconcile that
-        same row to its final status afterward, without ever creating a duplicate
-        row for one profile. On a fresh profile it behaves exactly like
-        ``create_contact``.
+        Keyed on ``(campaign_id, profile_url)``. Lets the resilient send tail
+        (#39) write a durable per-profile skip marker BEFORE the irreversible
+        Send click and then reconcile that same row to its final status
+        afterward, without ever creating a duplicate row for one profile. On a
+        fresh profile it behaves exactly like ``create_contact``.
+
+        Note: the connect flow's dedup that decides whether to skip a profile
+        looks up by ``profile_url`` ALONE (not scoped by campaign), so it always
+        finds this marker regardless of the campaign scoping here. The connect
+        path only reaches this write when no row exists for that ``profile_url``
+        in any campaign (the dedup skipped otherwise), so the scoped lookup
+        always creates fresh and never collides cross-campaign.
         """
         try:
             campaign_id = contact_data.get("campaign_id")

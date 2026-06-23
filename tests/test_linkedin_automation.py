@@ -1745,6 +1745,55 @@ class TestResilientSendTail:
         assert db.get_last_connection_at() is None
 
     @pytest.mark.asyncio
+    async def test_failure_after_marker_before_click_clears_marker(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39: a failure in the marker->click window leaves NO orphan marker.
+
+        The durable marker is written BEFORE the reversible throttle/move that
+        precede the irreversible click. If a failure (e.g. Ctrl-C cancelling the
+        throttle sleep) lands in that window, nothing was sent, so the marker
+        must be cleared as the error propagates — otherwise a never-contacted
+        profile would be permanently skipped (the opposite of the #39 harm).
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The throttle (which runs AFTER the marker write, BEFORE the click)
+        # raises — the marker is already persisted at this point.
+        mock_linkedin_automation._throttle_action = AsyncMock(
+            side_effect=RuntimeError("interrupted")
+        )
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            with pytest.raises(RuntimeError):
+                await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+
+        # The click never fired (failure was pre-click).
+        assert send_loc.click.await_count == 0
+        # The reserved slot is released (nothing irreversible happened).
+        assert db.get_daily_connection_count(today) == 0
+        # No orphaned marker survives — the profile stays re-contactable.
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert contact is None
+
+    @pytest.mark.asyncio
     async def test_weekly_limit_clears_pre_send_marker(
         self, mock_linkedin_automation, monkeypatch
     ):
