@@ -1532,9 +1532,9 @@ class TestResilientSendTail:
         """A failed possibly_sent record write must NOT release the slot.
 
         We are in the possibly_sent branch because the irreversible click fired,
-        so the slot decision must not hinge on the contact-record write. If
-        create_contact raises (DB locked / disk full), the slot stays consumed
-        (cap stays conservative) and the outcome is still possibly_sent.
+        so the slot decision must not hinge on the contact-record write. If the
+        post-send reconcile write raises (DB locked / disk full), the slot stays
+        consumed (cap stays conservative) and the outcome is still possibly_sent.
         """
         monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
         db = mock_linkedin_automation.db_manager
@@ -1543,13 +1543,22 @@ class TestResilientSendTail:
         profile = self._profile()
         connect_button = AsyncMock()
 
-        # The post-click limit check wedges (possibly_sent), AND the possibly_sent
-        # contact write then fails.
+        # The post-click limit check wedges (possibly_sent), AND the post-send
+        # reconcile write then fails. The pre-send marker write (#39) must
+        # succeed (it runs before the click), so only the SECOND upsert raises.
         fake = self._label_aware_run_bounded(
             mock_linkedin_automation, wedge_label="send-limit"
         )
-        original_create = db.create_contact
-        db.create_contact = MagicMock(side_effect=RuntimeError("db locked"))
+        original_upsert = db.upsert_contact
+        calls = {"n": 0}
+
+        def _upsert(data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return original_upsert(data)  # pre-send marker persists
+            raise RuntimeError("db locked")  # post-send reconcile fails
+
+        db.upsert_contact = MagicMock(side_effect=_upsert)
 
         today = date.today().isoformat()
         try:
@@ -1560,12 +1569,263 @@ class TestResilientSendTail:
                     campaign, profile, connect_button, progress_callback=None
                 )
         finally:
-            db.create_contact = original_create
+            db.upsert_contact = original_upsert
 
         assert send_loc.click.await_count == 1
         assert result.outcome == "possibly_sent"
         # The slot is KEPT despite the record-write failure (no cap drift).
         assert db.get_daily_connection_count(today) == 1
+
+    @pytest.mark.asyncio
+    async def test_possibly_sent_write_failure_leaves_durable_skip_marker(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39: a post-send write failure still leaves a durable skip marker.
+
+        The pre-send marker is persisted BEFORE the irreversible click, so even
+        when the post-send reconcile write fails (DB locked / disk full) a
+        durable per-profile row survives. A future run's dedup lookup finds it
+        and refuses to re-contact the profile.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-limit"
+        )
+        original_upsert = db.upsert_contact
+        calls = {"n": 0}
+
+        def _upsert(data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return original_upsert(data)  # pre-send marker persists
+            raise RuntimeError("disk full")  # post-send reconcile fails
+
+        db.upsert_contact = MagicMock(side_effect=_upsert)
+
+        try:
+            with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+                 patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+                 patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+                result = await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+        finally:
+            db.upsert_contact = original_upsert
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "possibly_sent"
+        # The post-send reconcile write was attempted and failed...
+        assert calls["n"] == 2
+        # ...yet a durable, non-retryable per-profile marker survives.
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert contact is not None
+        assert contact.status == "possibly_sent"
+
+    @pytest.mark.asyncio
+    async def test_subsequent_run_skips_profile_after_post_send_write_failure(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 regression: a post-send write failure, then a re-run, must skip.
+
+        Simulates the exact gap: the post-send contact write fails on the first
+        run, then runs send_connection_requests over the same profile again. The
+        durable pre-send marker makes the dedup lookup skip the profile, so it is
+        NOT re-contacted (counted as ``existing``, _attempt_connect never called).
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # --- Run 1: post-send wedge AND the reconcile write fails ---
+        fake = self._label_aware_run_bounded(
+            mock_linkedin_automation, wedge_label="send-limit"
+        )
+        original_upsert = db.upsert_contact
+        calls = {"n": 0}
+
+        def _upsert(data):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return original_upsert(data)  # pre-send marker persists
+            raise RuntimeError("db locked")  # post-send reconcile fails
+
+        db.upsert_contact = MagicMock(side_effect=_upsert)
+        try:
+            with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+                 patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+                 patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=fake)):
+                run1 = await mock_linkedin_automation._attempt_connect(
+                    campaign, profile, connect_button, progress_callback=None
+                )
+        finally:
+            db.upsert_contact = original_upsert
+        assert run1.outcome == "possibly_sent"
+
+        # --- Run 2: same profile via the full send loop. It must be skipped. ---
+        attempt_spy = AsyncMock(
+            return_value=ConnectResult("sent", total_today=1)
+        )
+        mock_linkedin_automation._attempt_connect = attempt_spy
+        mock_linkedin_automation._find_connect_control = AsyncMock(
+            return_value=(AsyncMock(), "connect")
+        )
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        with patch("automation.linkedin.navigate_guarded",
+                   new=AsyncMock(side_effect=lambda page, *a, **k: page)), \
+             patch("automation.linkedin.run_bounded",
+                   new=AsyncMock(side_effect=_passthrough)), \
+             patch("automation.linkedin.scroll_down", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha",
+                   new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, [profile], progress_callback=None
+            )
+
+        # The profile is recognised as already-contacted and skipped — NOT
+        # re-contacted, which is the harm #39 closes.
+        assert result["existing"] == 1
+        assert result["sent"] == 0
+        assert result["possibly_sent"] == 0
+        attempt_spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pre_send_marker_write_failure_aborts_before_click(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39: if the durable pre-send marker can't persist, do NOT click.
+
+        A send with no durable skip marker is exactly the gap #39 closes, so if
+        the pre-send marker write fails the flow aborts to a clean retryable
+        send_failed BEFORE the irreversible click and releases the slot.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # The pre-send marker write (the FIRST upsert) fails outright.
+        db.upsert_contact = MagicMock(side_effect=RuntimeError("db locked"))
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        # Aborted before the irreversible click — nothing was sent.
+        assert send_loc.click.await_count == 0
+        assert result.outcome == "send_failed"
+        # Retryable: the reserved slot is released (no cap drift).
+        assert db.get_daily_connection_count(today) == 0
+        assert db.get_last_connection_at() is None
+
+    @pytest.mark.asyncio
+    async def test_weekly_limit_clears_pre_send_marker(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39: the weekly-limit modal clears the pre-send marker.
+
+        The weekly-limit modal means LinkedIn refused the invite (provably NOT
+        sent). This outcome is retryable, so the durable pre-send marker must be
+        cleared, leaving no row — so a future run can legitimately re-contact.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # The post-click check finds a real weekly-limit modal.
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=True
+        )
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "limit_reached"
+        # Retryable outcome: slot released, and the pre-send marker is cleared so
+        # the profile stays re-contactable on a future run.
+        assert db.get_daily_connection_count(today) == 0
+        with db.get_session() as session:
+            from sqlmodel import select
+            contact = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).first()
+        assert contact is None
+
+    @pytest.mark.asyncio
+    async def test_confirmed_sent_reconciles_marker_to_sent_no_duplicate(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39: a confirmed send reconciles the marker to a single ``sent`` row.
+
+        The pre-send marker is reconciled (not duplicated): exactly one row for
+        the profile, status ``sent``.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert send_loc.click.await_count == 1
+        assert result.outcome == "sent"
+        assert db.get_daily_connection_count(today) == 1
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        # Exactly one row (marker reconciled, not duplicated), status sent.
+        assert len(rows) == 1
+        assert rows[0].status == "sent"
 
     @pytest.mark.asyncio
     async def test_non_crash_send_click_failure_is_plain_send_failed(

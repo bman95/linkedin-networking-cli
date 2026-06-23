@@ -130,6 +130,78 @@ class DatabaseManager:
             logger.error(f"Failed to create contact: {e}")
             raise
 
+    def upsert_contact(self, contact_data: Dict[str, Any]) -> Contact:
+        """Create a contact, or update the existing one for this profile.
+
+        Keyed on ``(campaign_id, profile_url)`` — the same identity the connect
+        flow's dedup lookup uses to decide whether a profile was already
+        contacted. Lets the resilient send tail (#39) write a durable per-profile
+        skip marker BEFORE the irreversible Send click and then reconcile that
+        same row to its final status afterward, without ever creating a duplicate
+        row for one profile. On a fresh profile it behaves exactly like
+        ``create_contact``.
+        """
+        try:
+            campaign_id = contact_data.get("campaign_id")
+            profile_url = contact_data.get("profile_url")
+            with self.get_session() as session:
+                existing = session.exec(
+                    select(Contact).where(
+                        Contact.campaign_id == campaign_id,
+                        Contact.profile_url == profile_url,
+                    )
+                ).first()
+                if existing is None:
+                    contact = Contact(**contact_data)
+                    session.add(contact)
+                    session.commit()
+                    session.refresh(contact)
+                    logger.debug(
+                        f"Created contact: {contact.name} "
+                        f"(ID: {contact.id}, Campaign: {contact.campaign_id})"
+                    )
+                    return contact
+                for key, value in contact_data.items():
+                    setattr(existing, key, value)
+                existing.updated_at = datetime.now()
+                session.commit()
+                session.refresh(existing)
+                logger.debug(
+                    f"Updated contact {existing.id} for {profile_url}: "
+                    f"status={existing.status}"
+                )
+                return existing
+        except Exception as e:
+            logger.error(f"Failed to upsert contact: {e}")
+            raise
+
+    def delete_contacts_by_profile(self, campaign_id: int, profile_url: str) -> int:
+        """Delete contact rows for a profile in a campaign; return the count.
+
+        Used by the send tail (#39) to clear a durable pre-send marker on a
+        genuinely-not-sent, retryable outcome (e.g. the LinkedIn weekly limit
+        modal), so a future run can legitimately re-contact that profile.
+        """
+        try:
+            with self.get_session() as session:
+                rows = session.exec(
+                    select(Contact).where(
+                        Contact.campaign_id == campaign_id,
+                        Contact.profile_url == profile_url,
+                    )
+                ).all()
+                for row in rows:
+                    session.delete(row)
+                session.commit()
+                if rows:
+                    logger.debug(
+                        f"Deleted {len(rows)} contact row(s) for {profile_url}"
+                    )
+                return len(rows)
+        except Exception as e:
+            logger.error(f"Failed to delete contacts for {profile_url}: {e}")
+            raise
+
     def get_contacts(self, campaign_id: Optional[int] = None) -> List[Contact]:
         """Get contacts, optionally filtered by campaign"""
         with self.get_session() as session:

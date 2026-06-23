@@ -322,6 +322,79 @@ class TestContactOperations:
         assert len(accepted_contacts) == 1
         assert accepted_contacts[0].status == "accepted"
 
+    def test_upsert_contact_creates_when_absent(self, db_manager):
+        """upsert_contact creates a fresh row, like create_contact."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        contact = db_manager.upsert_contact({
+            "campaign_id": campaign.id,
+            "name": "John Doe",
+            "profile_url": "https://linkedin.com/in/johndoe",
+            "status": "possibly_sent",
+        })
+        assert contact.id is not None
+        assert contact.status == "possibly_sent"
+        assert len(db_manager.get_contacts(campaign.id)) == 1
+
+    def test_upsert_contact_updates_existing_no_duplicate(self, db_manager):
+        """upsert_contact updates the existing row for the same profile."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        first = db_manager.upsert_contact({
+            "campaign_id": campaign.id,
+            "name": "John Doe",
+            "profile_url": url,
+            "status": "possibly_sent",
+            "notes": "pre-send marker",
+        })
+        second = db_manager.upsert_contact({
+            "campaign_id": campaign.id,
+            "name": "John Doe",
+            "profile_url": url,
+            "status": "sent",
+            "notes": None,
+        })
+        # Same row reconciled, not duplicated.
+        assert second.id == first.id
+        assert len(db_manager.get_contacts(campaign.id)) == 1
+        assert second.status == "sent"
+        assert second.notes is None
+
+    def test_upsert_contact_scoped_per_campaign(self, db_manager):
+        """The same profile_url in two campaigns yields two distinct rows."""
+        c1 = db_manager.create_campaign({"name": "C1"})
+        c2 = db_manager.create_campaign({"name": "C2"})
+        url = "https://linkedin.com/in/shared"
+        db_manager.upsert_contact({
+            "campaign_id": c1.id, "name": "Shared", "profile_url": url,
+            "status": "sent",
+        })
+        db_manager.upsert_contact({
+            "campaign_id": c2.id, "name": "Shared", "profile_url": url,
+            "status": "possibly_sent",
+        })
+        assert len(db_manager.get_contacts(c1.id)) == 1
+        assert len(db_manager.get_contacts(c2.id)) == 1
+
+    def test_delete_contacts_by_profile(self, db_manager):
+        """delete_contacts_by_profile removes the rows and returns the count."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "possibly_sent",
+        })
+        deleted = db_manager.delete_contacts_by_profile(campaign.id, url)
+        assert deleted == 1
+        assert db_manager.get_contacts(campaign.id) == []
+
+    def test_delete_contacts_by_profile_absent_is_noop(self, db_manager):
+        """Deleting a profile with no rows returns 0 and does not raise."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, "https://linkedin.com/in/nobody"
+        )
+        assert deleted == 0
+
 
 # ============================================================================
 # Analytics Operations Tests

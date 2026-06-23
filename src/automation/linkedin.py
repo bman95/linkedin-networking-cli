@@ -1852,6 +1852,53 @@ class LinkedInAutomation:
                 label=f"send-locate:{profile.name}",
             )
 
+            # Durable pre-send skip marker (issue #39). Persist a per-profile
+            # row BEFORE the irreversible click so the durable "don't re-contact"
+            # marker does NOT hinge on a post-send write succeeding. Without this,
+            # a post-send contact-write failure (DB locked / disk full) keeps the
+            # slot for THIS run but leaves no row for a FUTURE run to skip on, so
+            # it could re-contact someone already (possibly) invited — the exact
+            # harm #31 prevents, displaced to a later run. Written as
+            # ``possibly_sent`` (the conservative, non-retryable, no-re-contact
+            # status) because once we click it may already be out; the post-click
+            # handlers below reconcile it to its true final status (``sent``,
+            # downgraded to ``found`` on a clean send-failure, or deleted if the
+            # invite was provably NOT sent at the weekly limit). This write runs
+            # BEFORE the click boundary: if IT fails nothing irreversible has
+            # happened yet, so we abort to a clean retryable ``send_failed`` and
+            # the finally releases the slot — never click without a durable marker.
+            presend_marker = {
+                "campaign_id": campaign.id,
+                "name": profile.name,
+                "profile_url": profile.profile_url,
+                "headline": profile.headline,
+                "location": profile.location,
+                "company": profile.company,
+                "status": "possibly_sent",
+                "notes": (
+                    "Reserved before Send click (durable skip marker #39); "
+                    "reconciled after send"
+                ),
+            }
+            try:
+                self.db_manager.upsert_contact(presend_marker)
+            except Exception as marker_exc:
+                # Could not persist the durable marker. Nothing irreversible has
+                # happened, so do NOT click: a send with no durable skip marker is
+                # exactly the gap #39 closes. Abort to a clean retryable
+                # send_failed; the finally releases the reserved slot.
+                logger.error(
+                    "Could not persist pre-send marker for %s; skipping send to "
+                    "avoid an unrecorded invite: %s",
+                    profile.name,
+                    marker_exc,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"❌ Skipped {profile.name}: could not persist send marker"
+                    )
+                return ConnectResult("send_failed")
+
             try:
                 logger.info("Clicking 'Send without a note' button")
                 # Natural mouse move to the send button before clicking. The
@@ -1882,6 +1929,12 @@ class LinkedInAutomation:
                     logger.warning(
                         f"Send click failed for {profile.name}: {send_error}"
                     )
+                    # Clean pre-send failure (the click never landed). Downgrade
+                    # the durable pre-send marker (#39) from possibly_sent back to
+                    # ``found`` via upsert: nothing irreversible happened, so the
+                    # recorded status must stay the retryable ``found`` this path
+                    # has always used. Re-contact behaviour is unchanged — the row
+                    # itself was already the skip-key before #39.
                     contact_data = {
                         "campaign_id": campaign.id,
                         "name": profile.name,
@@ -1892,7 +1945,7 @@ class LinkedInAutomation:
                         "status": "found",
                         "notes": "Send button not clickable after clicking Connect",
                     }
-                    self.db_manager.create_contact(contact_data)
+                    self.db_manager.upsert_contact(contact_data)
                     if progress_callback:
                         progress_callback(
                             f"❌ Send button not clickable for {profile.name}"
@@ -1965,15 +2018,19 @@ class LinkedInAutomation:
                         "assuming sent to avoid re-contact and cap drift"
                     ),
                 }
-                # Best-effort: a failed record write must not release the slot
-                # (already kept above). It only loses the non-retryable marker —
-                # the cap stays conservative, which is the priority on ambiguity.
+                # Best-effort reconcile of the durable pre-send marker (#39) to
+                # its final possibly_sent note. The marker was already persisted
+                # before the click, so the non-retryable skip-key survives even if
+                # THIS write fails (DB locked / disk full): a future run still
+                # finds the row and refuses to re-contact. The slot is likewise
+                # already kept above, so the cap stays conservative regardless.
                 try:
-                    self.db_manager.create_contact(contact_data)
+                    self.db_manager.upsert_contact(contact_data)
                 except Exception as record_exc:
                     logger.error(
-                        "Failed to record possibly_sent contact for %s "
-                        "(slot kept): %s", profile.name, record_exc,
+                        "Failed to reconcile possibly_sent contact for %s "
+                        "(slot kept; durable pre-send marker stands): %s",
+                        profile.name, record_exc,
                     )
                 # Stamp the cooldown timestamp: we are treating this as a real
                 # send, so the inter-session cooldown should reflect it.
@@ -1987,6 +2044,23 @@ class LinkedInAutomation:
 
             # Confirmed limit modal (no wedge): real weekly limit reached.
             if limit_reached:
+                # The weekly-limit modal means LinkedIn refused the invite — it
+                # was provably NOT sent. This outcome is retryable (the finally
+                # releases the slot), so clear the durable pre-send marker (#39)
+                # so a future run, after the weekly limit resets, can legitimately
+                # re-contact this profile. Best-effort: if the delete fails the
+                # row stays possibly_sent, which is merely over-conservative
+                # (skips a still-contactable profile) — never a re-contact.
+                try:
+                    self.db_manager.delete_contacts_by_profile(
+                        campaign.id, profile.profile_url
+                    )
+                except Exception as clear_exc:
+                    logger.error(
+                        "Failed to clear pre-send marker for %s after weekly "
+                        "limit (profile may be skipped next run): %s",
+                        profile.name, clear_exc,
+                    )
                 if progress_callback:
                     progress_callback("❌ LinkedIn weekly invitation limit reached!")
                 return ConnectResult("limit_reached")
@@ -2006,12 +2080,20 @@ class LinkedInAutomation:
                 "company": profile.company,
                 "status": "sent",
                 "connection_sent_at": datetime.now(timezone.utc),
+                "notes": None,
             }
+            # Reconcile the durable pre-send marker (#39) to the confirmed sent
+            # status via upsert. Best-effort: the marker already persisted before
+            # the click, so even if this write fails the row stays possibly_sent —
+            # still non-retryable and counted as sent+pending, so no re-contact
+            # and the cap stays conservative (the worst case is the slightly less
+            # precise possibly_sent label instead of sent).
             try:
-                self.db_manager.create_contact(contact_data)
+                self.db_manager.upsert_contact(contact_data)
             except Exception as record_exc:
                 logger.error(
-                    "Failed to record sent contact for %s (slot kept): %s",
+                    "Failed to reconcile sent contact for %s "
+                    "(slot kept; durable pre-send marker stands): %s",
                     profile.name, record_exc,
                 )
             # Stamp the cooldown timestamp now (only on a real send, not on
