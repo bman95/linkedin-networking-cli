@@ -9,7 +9,10 @@ The DB is seeded through ``DatabaseManager.create_campaign`` (the real business
 logic) so the slice exercises the actual data-flow path, not a mock.
 """
 
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -253,3 +256,50 @@ async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
         assert "Database unavailable" in str(
             screen.query_one("#campaigns-status", Static).render()
         )
+
+
+@pytest.mark.unit
+def test_importing_package_does_not_eagerly_load_app():
+    """Importing the ``tui`` package must not eagerly import ``tui.app``.
+
+    Regression for the bootstrap-order bug: ``app`` calls ``get_logger`` at
+    module scope, which runs ``LoggerSetup.setup()`` with production defaults
+    (creating ``$HOME/.linkedin-networking-cli/logs``) the first time. The
+    entry points (``linkedin_tui.py`` / ``python -m tui``) deliberately
+    initialize logging *before* importing the app, so the package init must NOT
+    pull in ``app`` (which would defeat that order and crash on a read-only
+    home). Runs in a fresh subprocess so the import state and ``LoggerSetup``
+    guard are pristine; uses an isolated HOME so a real setup would be visible.
+    """
+    src = str(Path(__file__).parent.parent / "src")
+    probe = "\n".join(
+        [
+            "import os, sys",
+            "from pathlib import Path",
+            "import tui",
+            # Importing the package must not drag in the app module.
+            "assert 'tui.app' not in sys.modules, 'tui.app imported eagerly'",
+            # Default-setup side effect (log dir under HOME) must not happen.
+            "logdir = Path(os.environ['HOME']) / '.linkedin-networking-cli' / 'logs'",
+            "assert not logdir.exists(), 'LoggerSetup ran with defaults at import'",
+            # The public attribute resolves lazily, only now loading the app.
+            "assert tui.LinkedInTUI is not None",
+            "assert 'tui.app' in sys.modules, 'lazy access should load tui.app'",
+            "print('OK')",
+        ]
+    )
+    import os
+    import tempfile
+
+    fake_home = tempfile.mkdtemp(prefix="tui-import-probe-home-")
+    env = dict(os.environ, PYTHONPATH=src, HOME=fake_home)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"probe failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "OK" in result.stdout
