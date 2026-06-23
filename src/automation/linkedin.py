@@ -1042,7 +1042,11 @@ class LinkedInAutomation:
                             "Pending invitation already exists for %s (from card)",
                             profile.name,
                         )
-                        self.db_manager.create_contact({
+                        # upsert (not create): the UniqueConstraint (#39) makes a
+                        # plain insert raise if a concurrent same-profile run
+                        # already wrote a row; protect_finalized so this never
+                        # clobbers that run's confirmed send.
+                        self.db_manager.upsert_contact({
                             "campaign_id": campaign.id,
                             "name": profile.name,
                             "profile_url": url,
@@ -1051,7 +1055,7 @@ class LinkedInAutomation:
                             "company": profile.company,
                             "status": "pending",
                             "notes": "Already sent (found Pending button on card)",
-                        })
+                        }, protect_finalized=True)
                         existing_count += 1
                         if progress_callback:
                             progress_callback(f"⚠️ Already pending for {profile.name}")
@@ -1430,7 +1434,12 @@ class LinkedInAutomation:
                         "status": "pending",
                         "notes": "Already sent (found Pending button)",
                     }
-                    self.db_manager.create_contact(contact_data)
+                    # upsert + protect_finalized: the UniqueConstraint (#39) would
+                    # make a plain insert raise under a concurrent same-profile
+                    # run; never clobber that run's confirmed send.
+                    self.db_manager.upsert_contact(
+                        contact_data, protect_finalized=True
+                    )
                     existing_count += 1
                     if progress_callback:
                         progress_callback(f"⚠️ Already pending for {profile.name}")
@@ -1451,7 +1460,12 @@ class LinkedInAutomation:
                         "status": "found",
                         "notes": "No connect button available - likely already connected",
                     }
-                    self.db_manager.create_contact(contact_data)
+                    # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                    # IntegrityError under a concurrent same-profile run, and
+                    # never downgrade that run's confirmed send.
+                    self.db_manager.upsert_contact(
+                        contact_data, protect_finalized=True
+                    )
                     failed_count += 1
                     if progress_callback:
                         progress_callback(f"⚠️ No Connect button for {profile.name}")
@@ -1751,7 +1765,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Email required for connection",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"❌ Email required for {profile.name}")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -1776,7 +1795,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Invitation blocked (recently withdrawn / 3-week cooldown)",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"⚠️ Invitation blocked for {profile.name} (cooldown)")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -1794,7 +1818,12 @@ class LinkedInAutomation:
                     "status": "found",
                     "notes": "Invitation modal did not appear after clicking Connect",
                 }
-                self.db_manager.create_contact(contact_data)
+                # upsert + protect_finalized: avoid a UniqueConstraint (#39)
+                # IntegrityError under a concurrent same-profile run; never
+                # downgrade that run's confirmed send.
+                self.db_manager.upsert_contact(
+                    contact_data, protect_finalized=True
+                )
                 if progress_callback:
                     progress_callback(f"❌ Invitation modal not found for {profile.name}")
                 await random_wait(self.page, min_ms=1000, max_ms=2000)
@@ -2035,9 +2064,9 @@ class LinkedInAutomation:
                         )
                 # Keep the reserved slot BEFORE any further DB write: the
                 # irreversible click already fired, so the slot decision must not
-                # hinge on the contact-record write succeeding. If create_contact
-                # raised here (DB locked / disk full) AFTER slot_consumed was set,
-                # the finally would otherwise release a slot whose invite may
+                # hinge on the contact-record write succeeding. If the reconcile
+                # write raised here (DB locked / disk full) AFTER slot_consumed was
+                # set, the finally would otherwise release a slot whose invite may
                 # already be out — exactly the mis-accounting #31 prevents.
                 slot_consumed = True
                 total_today = reserved_count
@@ -2061,16 +2090,23 @@ class LinkedInAutomation:
                 # so a concurrent ``only_unfinalized`` cleanup can no longer erase
                 # it — finding 1). The marker was already persisted before the
                 # click, so the skip-key survives even if THIS write fails (DB
-                # locked / disk full): a future run still finds the (``reserved``)
-                # row and refuses to re-contact. The slot is likewise already kept
+                # locked / disk full). On failure, fall back to the minimal
+                # single-row promotion of the ``reserved`` marker to
+                # ``possibly_sent``: a reserved row left behind IS still
+                # deletable by a concurrent cleanup, so promoting it to a
+                # finalized status closes that residual re-contact window whenever
+                # the DB is writable at all. The slot is likewise already kept
                 # above, so the cap stays conservative regardless.
                 try:
                     self.db_manager.upsert_contact(contact_data)
                 except Exception as record_exc:
                     logger.error(
                         "Failed to reconcile possibly_sent contact for %s "
-                        "(slot kept; durable pre-send marker stands): %s",
+                        "(slot kept; promoting reserved marker as a fallback): %s",
                         profile.name, record_exc,
+                    )
+                    self.db_manager.promote_reserved_to_possibly_sent(
+                        campaign.id, profile.profile_url
                     )
                 # Stamp the cooldown timestamp: we are treating this as a real
                 # send, so the inter-session cooldown should reflect it.
@@ -2129,17 +2165,22 @@ class LinkedInAutomation:
             # confirmed ``sent`` status via upsert (no protect_finalized: this is
             # the authoritative post-click outcome and must win over the
             # reservation). Best-effort: the marker already persisted before the
-            # click, so even if this write fails the row stays ``reserved`` — still
-            # a durable skip-key (dedup is by profile_url alone), so no re-contact,
-            # and the slot is already kept so the cap stays conservative. The only
-            # loss on a failed write is the less precise label.
+            # click. On failure, fall back to promoting the ``reserved`` marker to
+            # ``possibly_sent`` (a reserved row left behind is still deletable by a
+            # concurrent cleanup; promoting it to a finalized status keeps it a
+            # protected skip-key — finding 1). The slot is already kept so the cap
+            # stays conservative; the only loss on a failed write is the less
+            # precise ``possibly_sent`` label instead of ``sent``.
             try:
                 self.db_manager.upsert_contact(contact_data)
             except Exception as record_exc:
                 logger.error(
                     "Failed to reconcile sent contact for %s "
-                    "(slot kept; durable pre-send marker stands): %s",
+                    "(slot kept; promoting reserved marker as a fallback): %s",
                     profile.name, record_exc,
+                )
+                self.db_manager.promote_reserved_to_possibly_sent(
+                    campaign.id, profile.profile_url
                 )
             # Stamp the cooldown timestamp now (only on a real send, not on
             # reservation), so a failed send never triggers a false cooldown.

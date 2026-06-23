@@ -504,6 +504,35 @@ class TestContactOperations:
         }, protect_finalized=True)
         assert result.status == "possibly_sent"
 
+    def test_promote_reserved_flips_marker_to_possibly_sent(self, db_manager):
+        """#39: the fallback promotes a reserved marker to a finalized status."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+        })
+        promoted = db_manager.promote_reserved_to_possibly_sent(campaign.id, url)
+        assert promoted == 1
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1
+        assert rows[0].status == "possibly_sent"
+        assert rows[0].connection_sent_at is not None
+
+    def test_promote_reserved_is_noop_when_already_finalized(self, db_manager):
+        """A row already reconciled to possibly_sent/sent is left untouched."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "sent",
+            "connection_sent_at": datetime.now(timezone.utc),
+        })
+        promoted = db_manager.promote_reserved_to_possibly_sent(campaign.id, url)
+        assert promoted == 0
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "sent"
+
 
 # ============================================================================
 # Contact uniqueness + atomic upsert (issue #39 finding 2)

@@ -353,6 +353,53 @@ class DatabaseManager:
             logger.error(f"Failed to delete contacts for {profile_url}: {e}")
             raise
 
+    def promote_reserved_to_possibly_sent(
+        self, campaign_id: int, profile_url: str
+    ) -> int:
+        """Flip a lingering ``reserved`` marker to ``possibly_sent``; return count.
+
+        Last-ditch reconcile for the send tail (#39): the post-click outcome is
+        an (assumed) send, so the durable marker MUST become non-deletable. When
+        the full reconcile upsert fails (DB locked / disk full) the row is left
+        ``reserved`` — which a concurrent ``only_unfinalized`` cleanup on the same
+        profile could still delete, re-opening re-contact of an invite that may
+        already be out. This minimal single-row UPDATE (much likelier to succeed
+        than the full upsert if the lock was transient) promotes only a
+        ``reserved`` row to a finalized ``possibly_sent`` with a stamped
+        ``connection_sent_at`` so the cleanup's ``_is_finalized_contact`` guard
+        protects it. A no-op when no ``reserved`` row remains (already reconciled
+        by a concurrent run). Best-effort: logged, not raised.
+        """
+        try:
+            with self.get_session() as session:
+                stmt = (
+                    update(Contact)
+                    .where(
+                        Contact.campaign_id == campaign_id,
+                        Contact.profile_url == profile_url,
+                        Contact.status == "reserved",
+                    )
+                    .values(
+                        status="possibly_sent",
+                        connection_sent_at=datetime.now(timezone.utc),
+                        updated_at=datetime.now(),
+                    )
+                )
+                result = session.exec(stmt)
+                session.commit()
+                promoted = result.rowcount or 0
+                if promoted:
+                    logger.debug(
+                        f"Promoted {promoted} reserved marker(s) to "
+                        f"possibly_sent for {profile_url}"
+                    )
+                return promoted
+        except Exception as e:
+            logger.error(
+                f"Failed to promote reserved marker for {profile_url}: {e}"
+            )
+            return 0
+
     def get_contacts(self, campaign_id: Optional[int] = None) -> List[Contact]:
         """Get contacts, optionally filtered by campaign"""
         with self.get_session() as session:
