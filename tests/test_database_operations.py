@@ -569,6 +569,118 @@ class TestContactOperations:
         rows = db_manager.get_contacts(campaign.id)
         assert len(rows) == 1 and rows[0].status == "found"
 
+    def test_delete_reserved_only_token_preserves_other_attempts_reservation(
+        self, db_manager
+    ):
+        """#39 finding 1: a token-scoped cleanup never deletes another attempt's
+        reservation (which that attempt may already have clicked Send on)."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-A",
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, reserved_only=True, reservation_token="attempt-B"
+        )
+        assert deleted == 0
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1
+        assert rows[0].status == "reserved"
+        assert rows[0].reservation_token == "attempt-A"
+
+    def test_delete_reserved_only_token_deletes_own_reservation(self, db_manager):
+        """A token-scoped cleanup deletes the reservation it owns."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-A",
+        })
+        deleted = db_manager.delete_contacts_by_profile(
+            campaign.id, url, reserved_only=True, reservation_token="attempt-A"
+        )
+        assert deleted == 1
+        assert db_manager.get_contacts(campaign.id) == []
+
+    def test_downgrade_own_reservation_only_touches_own(self, db_manager):
+        """#39 finding 2: the downgrade is scoped to the reservation we own."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-A",
+        })
+        # A foreign attempt's downgrade is a no-op (never clobbers A's live row).
+        n = db_manager.downgrade_own_reservation_to_found(
+            campaign.id, url, "attempt-B", notes="not mine"
+        )
+        assert n == 0
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "reserved"
+        assert rows[0].reservation_token == "attempt-A"
+        # The owning attempt's downgrade flips it to found and clears the token.
+        n = db_manager.downgrade_own_reservation_to_found(
+            campaign.id, url, "attempt-A", notes="clean send-failure"
+        )
+        assert n == 1
+        rows = db_manager.get_contacts(campaign.id)
+        assert len(rows) == 1 and rows[0].status == "found"
+        assert rows[0].reservation_token is None
+
+    def test_upsert_protect_other_reservation_does_not_steal_foreign(
+        self, db_manager
+    ):
+        """#39 finding 1/2: protect_other_reservation refuses to steal a foreign
+        live reservation, but still claims an un-owned (legacy) one."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-A",
+        })
+        # Attempt B tries to reserve the same profile — A's row must stand.
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-B",
+        }, protect_finalized=True, protect_other_reservation=True)
+        assert result.reservation_token == "attempt-A"
+        # An un-owned (null-token) reserved row IS claimable.
+        db_manager.delete_contacts_by_profile(campaign.id, url)
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",  # no token (legacy)
+        })
+        result = db_manager.upsert_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-C",
+        }, protect_finalized=True, protect_other_reservation=True)
+        assert result.reservation_token == "attempt-C"
+
+    def test_promote_reserved_with_token_scopes_to_owner(self, db_manager):
+        """The promote fallback only flips the reservation it owns."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        url = "https://linkedin.com/in/johndoe"
+        db_manager.create_contact({
+            "campaign_id": campaign.id, "name": "John Doe",
+            "profile_url": url, "status": "reserved",
+            "reservation_token": "attempt-A",
+        })
+        assert db_manager.promote_reserved_to_possibly_sent(
+            campaign.id, url, reservation_token="attempt-B"
+        ) == 0
+        assert db_manager.get_contacts(campaign.id)[0].status == "reserved"
+        assert db_manager.promote_reserved_to_possibly_sent(
+            campaign.id, url, reservation_token="attempt-A"
+        ) == 1
+        assert db_manager.get_contacts(campaign.id)[0].status == "possibly_sent"
+
 
 # ============================================================================
 # Contact uniqueness + atomic upsert (issue #39 finding 2)

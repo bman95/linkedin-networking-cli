@@ -2016,6 +2016,116 @@ class TestResilientSendTail:
         assert rows[0].status == "possibly_sent"
 
     @pytest.mark.asyncio
+    async def test_aborts_when_concurrent_attempt_holds_live_reservation(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 ownership: a foreign live ``reserved`` row aborts the send.
+
+        A concurrent attempt B reserved the profile first (and may already have
+        clicked Send). When this attempt reaches its pre-send marker write,
+        protect_other_reservation leaves B's row untouched, so the re-read shows a
+        foreign token → abort WITHOUT clicking, and B's reservation is preserved
+        intact (never stolen, downgraded, or deleted).
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # Make even the weekly-limit/cleanup path available, to prove we never
+        # reach it (the abort precedes the click).
+        mock_linkedin_automation._handle_invitation_limit_modal = AsyncMock(
+            return_value=True
+        )
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Concurrent attempt B's live reservation already on the shared row.
+        db.create_contact({
+            "campaign_id": campaign.id,
+            "name": profile.name,
+            "profile_url": profile.profile_url,
+            "status": "reserved",
+            "reservation_token": "attempt-B",
+        })
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        today = date.today().isoformat()
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        assert result.outcome == "existing"
+        assert send_loc.click.await_count == 0
+        assert db.get_daily_connection_count(today) == 0
+        # B's reservation survives intact — never stolen/deleted/downgraded.
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        assert len(rows) == 1
+        assert rows[0].status == "reserved"
+        assert rows[0].reservation_token == "attempt-B"
+
+    @pytest.mark.asyncio
+    async def test_clean_send_failure_does_not_clobber_foreign_reservation(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """#39 finding 2: a clean send-failure downgrade is token-scoped.
+
+        Even if this attempt's own clean send-failure fires, the downgrade to
+        ``found`` only touches the row WE own. Here a foreign attempt B holds the
+        live reservation, so this attempt aborts at the pre-send check before the
+        click — but we additionally assert (DB-layer) that the downgrade helper is
+        token-scoped so B's reservation can never become a retryable ``found``.
+        """
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Send Tail"})
+        send_loc = self._wire_send_tail(mock_linkedin_automation)
+        # This attempt's Send click would raise a clean (non-crash) error.
+        send_loc.click = AsyncMock(side_effect=ValueError("not actionable"))
+        profile = self._profile()
+        connect_button = AsyncMock()
+
+        # Foreign attempt B's live reservation on the shared row.
+        db.create_contact({
+            "campaign_id": campaign.id,
+            "name": profile.name,
+            "profile_url": profile.profile_url,
+            "status": "reserved",
+            "reservation_token": "attempt-B",
+        })
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.linkedin.move_to_element", new=AsyncMock()), \
+             patch("automation.linkedin.run_bounded", new=AsyncMock(side_effect=_passthrough)):
+            result = await mock_linkedin_automation._attempt_connect(
+                campaign, profile, connect_button, progress_callback=None
+            )
+
+        # Aborted at the pre-send foreign-reservation check (no click at all).
+        assert result.outcome == "existing"
+        assert send_loc.click.await_count == 0
+        # B's reservation is never downgraded to a retryable found.
+        with db.get_session() as session:
+            from sqlmodel import select
+            rows = session.exec(
+                select(Contact).where(Contact.profile_url == profile.profile_url)
+            ).all()
+        assert len(rows) == 1
+        assert rows[0].status == "reserved"
+        assert rows[0].reservation_token == "attempt-B"
+
+    @pytest.mark.asyncio
     async def test_pre_send_marker_is_reserved_status(
         self, mock_linkedin_automation, monkeypatch
     ):

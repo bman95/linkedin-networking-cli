@@ -1,6 +1,7 @@
 from datetime import datetime, date, timezone
 from typing import List, Optional, Dict, Any
 from sqlmodel import SQLModel, create_engine, Session, select, update
+from sqlalchemy import and_, or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from pathlib import Path
 import json
@@ -26,6 +27,11 @@ class DatabaseManager:
     def create_tables(self):
         """Create all database tables, migrating an existing DB if needed."""
         try:
+            # Add the reservation_token column to an existing contact table FIRST
+            # (#39 concurrency): the de-dup below selects Contact ORM objects,
+            # which reference reservation_token, so the column must exist before
+            # that read. A no-op on a fresh DB (no table) and on an up-to-date DB.
+            self._ensure_contact_reservation_token_column()
             # De-duplicate any existing (campaign_id, profile_url) rows BEFORE
             # the unique index is enforced. A new DB has no contact table yet, so
             # this is a no-op there; an existing DB may carry duplicates from the
@@ -40,6 +46,29 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to create database tables: {e}")
             raise
+
+    def _ensure_contact_reservation_token_column(self) -> None:
+        """Add the nullable ``reservation_token`` column if an existing DB lacks it.
+
+        Idempotent additive migration (#39 concurrency). ``create_all`` only
+        stamps the column onto a freshly created table; an existing contact table
+        needs an explicit ``ALTER TABLE ... ADD COLUMN``. SQLite has no
+        ``ADD COLUMN IF NOT EXISTS``, so check the existing columns first. A
+        no-op when the table is absent (fresh DB) or already has the column.
+        """
+        from sqlalchemy import inspect as sa_inspect, text
+
+        inspector = sa_inspect(self.engine)
+        if not inspector.has_table("contact"):
+            return
+        columns = {c["name"] for c in inspector.get_columns("contact")}
+        if "reservation_token" in columns:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("ALTER TABLE contact ADD COLUMN reservation_token VARCHAR")
+            )
+        logger.info("Added reservation_token column to contact table")
 
     def _dedupe_contacts_before_unique_index(self) -> int:
         """Collapse duplicate (campaign_id, profile_url) contact rows.
@@ -262,7 +291,10 @@ class DatabaseManager:
     )
 
     def upsert_contact(
-        self, contact_data: Dict[str, Any], protect_finalized: bool = False
+        self,
+        contact_data: Dict[str, Any],
+        protect_finalized: bool = False,
+        protect_other_reservation: bool = False,
     ) -> Contact:
         """Create a contact, or update the existing one for this profile.
 
@@ -283,6 +315,15 @@ class DatabaseManager:
         left unchanged — a retryable downgrade (e.g. a clean send-failure writing
         ``found``) must not overwrite a confirmed/ambiguous send a concurrent run
         may have just recorded.
+
+        With ``protect_other_reservation=True`` the guard ALSO refuses to write
+        when the existing row is a ``reserved`` marker owned by a DIFFERENT
+        attempt (its ``reservation_token`` is non-null and differs from the token
+        in ``contact_data``). This is how a second concurrent attempt on the same
+        profile avoids stealing a live reservation the first attempt may already
+        have clicked Send on (#39 concurrency). An un-owned (legacy/null-token)
+        ``reserved`` row, or one we already own, is still claimable. The caller
+        re-reads the returned row and compares tokens to decide proceed-vs-abort.
 
         Note: the connect flow's dedup that decides whether to skip a profile
         looks up by ``profile_url`` ALONE (not scoped by campaign), so it always
@@ -309,12 +350,30 @@ class DatabaseManager:
                     "index_elements": ["campaign_id", "profile_url"],
                     "set_": update_set,
                 }
+                guards = []
                 if protect_finalized:
                     # Make the update a no-op when the existing row is finalized,
                     # so a concurrent run's confirmed/ambiguous send is never
                     # downgraded to a reservation/retryable marker.
-                    on_conflict_kwargs["where"] = Contact.status.notin_(
-                        self._FINALIZED_CONTACT_STATUSES
+                    guards.append(
+                        Contact.status.notin_(self._FINALIZED_CONTACT_STATUSES)
+                    )
+                if protect_other_reservation:
+                    # Don't steal a live reservation owned by another attempt:
+                    # block the update when the existing row is reserved with a
+                    # non-null token that isn't ours. A null-token (legacy) or
+                    # our-own reserved row stays claimable.
+                    new_token = contact_data.get("reservation_token")
+                    guards.append(
+                        or_(
+                            Contact.status != "reserved",
+                            Contact.reservation_token.is_(None),
+                            Contact.reservation_token == new_token,
+                        )
+                    )
+                if guards:
+                    on_conflict_kwargs["where"] = (
+                        guards[0] if len(guards) == 1 else and_(*guards)
                     )
                 stmt = stmt.on_conflict_do_update(**on_conflict_kwargs)
                 session.exec(stmt)
@@ -340,6 +399,7 @@ class DatabaseManager:
         profile_url: str,
         only_unfinalized: bool = False,
         reserved_only: bool = False,
+        reservation_token: Optional[str] = None,
     ) -> int:
         """Delete contact rows for a profile in a campaign; return the count.
 
@@ -354,6 +414,12 @@ class DatabaseManager:
         required, no Connect button); deleting that would make the next run retry
         an already-classified non-contactable profile. This is the mode the send
         tail uses.
+
+        When ``reservation_token`` is also given, the delete is scoped to the
+        ``reserved`` row we OWN (its token matches): a concurrent attempt's live
+        reservation — which it may already have clicked Send on — is never
+        deleted (#39 concurrency, finding 1). A null token (general cleanup)
+        leaves the behaviour token-agnostic.
 
         ``only_unfinalized=True`` (kept for the general cleanup case) preserves
         rows that record a real outcome (see ``_is_finalized_contact``) but still
@@ -371,6 +437,13 @@ class DatabaseManager:
                 for row in rows:
                     if reserved_only and row.status != "reserved":
                         continue
+                    if (
+                        reservation_token is not None
+                        and row.status == "reserved"
+                        and row.reservation_token != reservation_token
+                    ):
+                        # A reservation owned by another attempt — never delete it.
+                        continue
                     if only_unfinalized and self._is_finalized_contact(row):
                         continue
                     session.delete(row)
@@ -385,8 +458,60 @@ class DatabaseManager:
             logger.error(f"Failed to delete contacts for {profile_url}: {e}")
             raise
 
+    def downgrade_own_reservation_to_found(
+        self,
+        campaign_id: int,
+        profile_url: str,
+        reservation_token: str,
+        notes: Optional[str] = None,
+    ) -> int:
+        """Flip a ``reserved`` row we OWN back to retryable ``found``; return count.
+
+        Clean pre-send failure (#39 concurrency, finding 2): only the attempt that
+        holds the reservation may downgrade it. The ``reservation_token`` WHERE
+        clause means a concurrent attempt's live reservation — which it may
+        already have clicked Send on — is never clobbered to a retryable
+        ``found`` (which a later dedup would treat as re-contactable). A no-op
+        (``rowcount == 0``) when our reservation was already reconciled or claimed
+        away; that is correct — there is nothing of ours to downgrade and the
+        other attempt's row must be left alone. Best-effort: logged, not raised.
+        """
+        try:
+            with self.get_session() as session:
+                stmt = (
+                    update(Contact)
+                    .where(
+                        Contact.campaign_id == campaign_id,
+                        Contact.profile_url == profile_url,
+                        Contact.status == "reserved",
+                        Contact.reservation_token == reservation_token,
+                    )
+                    .values(
+                        status="found",
+                        reservation_token=None,
+                        notes=notes,
+                        updated_at=datetime.now(),
+                    )
+                )
+                result = session.exec(stmt)
+                session.commit()
+                downgraded = result.rowcount or 0
+                if downgraded:
+                    logger.debug(
+                        f"Downgraded own reserved marker to found for {profile_url}"
+                    )
+                return downgraded
+        except Exception as e:
+            logger.error(
+                f"Failed to downgrade own reservation for {profile_url}: {e}"
+            )
+            return 0
+
     def promote_reserved_to_possibly_sent(
-        self, campaign_id: int, profile_url: str
+        self,
+        campaign_id: int,
+        profile_url: str,
+        reservation_token: Optional[str] = None,
     ) -> int:
         """Flip a lingering ``reserved`` marker to ``possibly_sent``; return count.
 
@@ -399,18 +524,25 @@ class DatabaseManager:
         than the full upsert if the lock was transient) promotes only a
         ``reserved`` row to a finalized ``possibly_sent`` with a stamped
         ``connection_sent_at`` so the cleanup's ``_is_finalized_contact`` guard
-        protects it. A no-op when no ``reserved`` row remains (already reconciled
-        by a concurrent run). Best-effort: logged, not raised.
+        protects it. When ``reservation_token`` is given the promotion is scoped
+        to the reservation we OWN, so it never flips a concurrent attempt's live
+        reservation. A no-op when no matching ``reserved`` row remains (already
+        reconciled by a concurrent run). Best-effort: logged, not raised.
         """
         try:
             with self.get_session() as session:
+                where_clauses = [
+                    Contact.campaign_id == campaign_id,
+                    Contact.profile_url == profile_url,
+                    Contact.status == "reserved",
+                ]
+                if reservation_token is not None:
+                    where_clauses.append(
+                        Contact.reservation_token == reservation_token
+                    )
                 stmt = (
                     update(Contact)
-                    .where(
-                        Contact.campaign_id == campaign_id,
-                        Contact.profile_url == profile_url,
-                        Contact.status == "reserved",
-                    )
+                    .where(*where_clauses)
                     .values(
                         status="possibly_sent",
                         connection_sent_at=datetime.now(timezone.utc),

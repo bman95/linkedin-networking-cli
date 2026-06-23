@@ -86,6 +86,14 @@ class Contact(SQLModel, table=True):
     connection_sent_at: Optional[datetime] = None
     connection_accepted_at: Optional[datetime] = None
 
+    # Per-attempt ownership token for the pre-send ``reserved`` marker (#39
+    # concurrency). Two overlapping attempts on one profile share a single
+    # canonical row (UniqueConstraint); this token records WHICH attempt's
+    # reservation is live, so a retryable cleanup/downgrade in one attempt can
+    # never erase or clobber a reservation the OTHER attempt may already have
+    # turned into a clicked send. Null on every non-reserved (and legacy) row.
+    reservation_token: Optional[str] = Field(default=None)
+
     # Additional data
     notes: Optional[str] = None
     contact_info: str = Field(default="{}")  # JSON string for email, phone, etc.

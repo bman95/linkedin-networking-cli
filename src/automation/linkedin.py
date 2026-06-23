@@ -4,6 +4,7 @@ import subprocess
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections import namedtuple
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -1684,6 +1685,12 @@ class LinkedInAutomation:
         # Tracks whether this attempt has consumed (vs. merely reserved) its
         # slot; the finally gives back any slot a non-send outcome left reserved.
         slot_consumed = False
+        # Per-attempt ownership token for the pre-send ``reserved`` marker (#39
+        # concurrency). Stamped on this attempt's reservation so a retryable
+        # cleanup/downgrade in a concurrent attempt on the same profile can never
+        # erase/clobber a reservation THIS attempt may already have clicked Send
+        # on (and vice versa).
+        reservation_token = uuid.uuid4().hex
         try:
             # Click Connect and wait for the invitation modal — under the
             # SAME per-item watchdog as the read unit. ``move_to_and_click``,
@@ -1924,6 +1931,7 @@ class LinkedInAutomation:
                 "location": profile.location,
                 "company": profile.company,
                 "status": "reserved",
+                "reservation_token": reservation_token,
                 "notes": (
                     "Reserved before Send click (durable skip marker #39); "
                     "reconciled after send"
@@ -1933,8 +1941,12 @@ class LinkedInAutomation:
                 # protect_finalized: if a concurrent run on this same profile
                 # already recorded a real outcome, don't downgrade it to a
                 # reservation marker — the existing durable row stands.
+                # protect_other_reservation: don't steal a live reservation a
+                # concurrent attempt already holds (it may have clicked Send).
                 marker_row = self.db_manager.upsert_contact(
-                    presend_marker, protect_finalized=True
+                    presend_marker,
+                    protect_finalized=True,
+                    protect_other_reservation=True,
                 )
             except Exception as marker_exc:
                 # Could not persist the durable marker. Nothing irreversible has
@@ -1976,6 +1988,28 @@ class LinkedInAutomation:
                     )
                 return ConnectResult("existing")
 
+            # A concurrent attempt may instead hold a LIVE ``reserved`` marker
+            # (it reserved first and may already have clicked Send). In that case
+            # protect_other_reservation left ITS row untouched, so the returned
+            # row carries a different token. Don't click — that would duplicate a
+            # send the other attempt is mid-flight on; abort to ``existing`` (the
+            # finally releases our slot). When WE own the reservation the tokens
+            # match and we fall through to the click.
+            if (
+                marker_row is not None
+                and marker_row.status == "reserved"
+                and marker_row.reservation_token != reservation_token
+            ):
+                logger.info(
+                    "Profile %s is reserved by a concurrent attempt; skipping "
+                    "the send to avoid a double-contact", profile.name,
+                )
+                if progress_callback:
+                    progress_callback(
+                        f"⚠️ Skipped {profile.name}: reserved by a concurrent run"
+                    )
+                return ConnectResult("existing")
+
             try:
                 logger.info("Clicking 'Send without a note' button")
                 # Natural mouse move to the send button before clicking. The
@@ -2008,24 +2042,18 @@ class LinkedInAutomation:
                     )
                     # Clean pre-send failure (the click never landed). Downgrade
                     # the durable pre-send marker (#39) from ``reserved`` back to
-                    # ``found`` via upsert: nothing irreversible happened, so the
-                    # recorded status must stay the retryable ``found`` this path
-                    # has always used. Re-contact behaviour is unchanged — the row
-                    # itself was already the skip-key before #39.
-                    contact_data = {
-                        "campaign_id": campaign.id,
-                        "name": profile.name,
-                        "profile_url": profile.profile_url,
-                        "headline": profile.headline,
-                        "location": profile.location,
-                        "company": profile.company,
-                        "status": "found",
-                        "notes": "Send button not clickable after clicking Connect",
-                    }
-                    # protect_finalized: never downgrade a confirmed send a
-                    # concurrent run on this profile may have just recorded.
-                    self.db_manager.upsert_contact(
-                        contact_data, protect_finalized=True
+                    # ``found``: nothing irreversible happened, so the recorded
+                    # status must stay the retryable ``found`` this path has always
+                    # used. Scoped to OUR reservation token, so it can never
+                    # clobber a concurrent attempt's live reservation (which that
+                    # attempt may already have clicked Send on) into a retryable
+                    # ``found`` that a later run would re-contact (finding 2). A
+                    # no-op if our reservation was already reconciled/claimed away.
+                    self.db_manager.downgrade_own_reservation_to_found(
+                        campaign.id,
+                        profile.profile_url,
+                        reservation_token,
+                        notes="Send button not clickable after clicking Connect",
                     )
                     if progress_callback:
                         progress_callback(
@@ -2075,6 +2103,7 @@ class LinkedInAutomation:
                         self.db_manager.delete_contacts_by_profile(
                             campaign.id, profile.profile_url,
                             reserved_only=True,
+                            reservation_token=reservation_token,
                         )
                     except Exception as clear_exc:
                         logger.error(
@@ -2116,6 +2145,9 @@ class LinkedInAutomation:
                     "company": profile.company,
                     "status": "possibly_sent",
                     "connection_sent_at": datetime.now(timezone.utc),
+                    # Authoritative post-click outcome: clear the reservation
+                    # token so the finalized row carries no stale owner.
+                    "reservation_token": None,
                     "notes": (
                         "Possibly sent: renderer wedged after the Send click; "
                         "assuming sent to avoid re-contact and cap drift"
@@ -2143,7 +2175,8 @@ class LinkedInAutomation:
                         profile.name, record_exc,
                     )
                     self.db_manager.promote_reserved_to_possibly_sent(
-                        campaign.id, profile.profile_url
+                        campaign.id, profile.profile_url,
+                        reservation_token=reservation_token,
                     )
                 # Stamp the cooldown timestamp: we are treating this as a real
                 # send, so the inter-session cooldown should reflect it.
@@ -2169,7 +2202,8 @@ class LinkedInAutomation:
                 # still-contactable profile) — never a re-contact.
                 try:
                     self.db_manager.delete_contacts_by_profile(
-                        campaign.id, profile.profile_url, reserved_only=True
+                        campaign.id, profile.profile_url, reserved_only=True,
+                        reservation_token=reservation_token,
                     )
                 except Exception as clear_exc:
                     logger.error(
@@ -2196,6 +2230,9 @@ class LinkedInAutomation:
                 "company": profile.company,
                 "status": "sent",
                 "connection_sent_at": datetime.now(timezone.utc),
+                # Authoritative post-click outcome: clear the reservation token so
+                # the finalized row carries no stale owner.
+                "reservation_token": None,
                 "notes": None,
             }
             # Reconcile the durable pre-send marker (#39) from ``reserved`` to the
@@ -2217,7 +2254,8 @@ class LinkedInAutomation:
                     profile.name, record_exc,
                 )
                 self.db_manager.promote_reserved_to_possibly_sent(
-                    campaign.id, profile.profile_url
+                    campaign.id, profile.profile_url,
+                    reservation_token=reservation_token,
                 )
             # Stamp the cooldown timestamp now (only on a real send, not on
             # reservation), so a failed send never triggers a false cooldown.
