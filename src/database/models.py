@@ -62,7 +62,9 @@ class Contact(SQLModel, table=True):
     company: Optional[str] = None
 
     # Connection status
-    status: str = Field(default="found")  # found, sent, accepted, declined, failed
+    # possibly_sent: a renderer wedge struck after the irreversible Send click,
+    # so we assume sent (non-retryable) rather than re-contact (issue #31).
+    status: str = Field(default="found")  # found, sent, possibly_sent, accepted, declined, failed
     connection_sent_at: Optional[datetime] = None
     connection_accepted_at: Optional[datetime] = None
 
