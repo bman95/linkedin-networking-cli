@@ -26,6 +26,9 @@ from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView
 from config.settings import AppSettings
 from database.models import Campaign
 from database.operations import DatabaseManager
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _acceptance_rate(campaign: Campaign) -> float:
@@ -157,6 +160,12 @@ class MainMenuScreen(Screen):
                 )
         yield Footer()
 
+    def on_mount(self) -> None:
+        # Focus the menu so the highlighted first item responds to Enter on the
+        # very first launch (without it, a keyboard user pressing Enter sees
+        # nothing happen).
+        self.query_one("#main-menu", ListView).focus()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id or ""
         if item_id == "menu-campaigns":
@@ -196,8 +205,16 @@ class LinkedInTUI(App):
     def __init__(self, db_manager: Optional[DatabaseManager] = None) -> None:
         super().__init__()
         if db_manager is None:
-            settings = AppSettings()
-            db_manager = DatabaseManager(str(settings.db_path))
+            # Build the default manager, but degrade gracefully on a startup
+            # failure (e.g. read-only home, bad DB path) the same way the classic
+            # CLI does, rather than crashing before any screen is shown. A None
+            # manager surfaces "Database unavailable." in the Campaigns screen.
+            try:
+                settings = AppSettings()
+                db_manager = DatabaseManager(str(settings.db_path))
+            except Exception:
+                logger.exception("Failed to initialize database; running degraded")
+                db_manager = None
         self.db_manager = db_manager
 
     def on_mount(self) -> None:

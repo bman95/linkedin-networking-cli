@@ -54,6 +54,10 @@ async def test_main_menu_mounts(db_manager: DatabaseManager):
         item_ids = [item.id for item in menu.query("ListItem")]
         assert "menu-campaigns" in item_ids
         assert "menu-quit" in item_ids
+        # First item is highlighted and the menu is focused, so Enter works on
+        # first launch with no manual selection.
+        assert menu.index == 0
+        assert menu.has_focus
 
 
 @pytest.mark.unit
@@ -64,9 +68,8 @@ async def test_navigate_to_campaigns_screen_renders_db_data(
     app = LinkedInTUI(db_manager=seeded_db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        # Select the first menu item ("Campaigns") and activate it.
-        menu = app.screen.query_one("#main-menu", ListView)
-        menu.index = 0
+        # The first item ("Campaigns") is highlighted and the menu is focused on
+        # mount, so Enter activates it with no manual selection.
         await pilot.press("enter")
         await pilot.pause()
 
@@ -108,8 +111,6 @@ async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        menu = app.screen.query_one("#main-menu", ListView)
-        menu.index = 0
         await pilot.press("enter")
         await pilot.pause()
 
@@ -143,8 +144,6 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
     app = LinkedInTUI(db_manager=_SlowDB())
     async with app.run_test() as pilot:
         await pilot.pause()
-        menu = app.screen.query_one("#main-menu", ListView)
-        menu.index = 0
         await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, CampaignsScreen)
@@ -158,3 +157,28 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
     assert not app.is_running
     screen._marshal_populate(app, [], None)  # must be a silent no-op now
     release.set()
+
+
+@pytest.mark.unit
+async def test_campaigns_screen_handles_missing_db_manager(db_manager: DatabaseManager):
+    """A degraded app (no DB) renders 'Database unavailable.' instead of crashing.
+
+    Mirrors the classic CLI's demo-mode fallback when DB/settings init fails.
+    """
+    # Inject a temp manager (avoids touching the real home dir), then drop it to
+    # simulate the degraded startup state.
+    app = LinkedInTUI(db_manager=db_manager)
+    app.db_manager = None
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, CampaignsScreen)
+        status = app.screen.query_one("#campaigns-status", Static)
+        table = app.screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if "Database unavailable" in str(status.render()):
+                break
+            await pilot.pause()
+        assert table.row_count == 0
+        assert "Database unavailable" in str(status.render())
