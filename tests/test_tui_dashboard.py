@@ -187,7 +187,13 @@ async def test_dashboard_renders_stats(seeded_db_manager: DatabaseManager):
 
 @pytest.mark.unit
 async def test_dashboard_recent_campaigns_table(seeded_db_manager: DatabaseManager):
-    """The recent-campaigns mini-table renders DB-backed rows."""
+    """The mini-table renders DB-backed rows whose stats come from live contacts.
+
+    The seeded campaigns have their stats only on the *contacts* (created via
+    create_contact), not the denormalized Campaign.total_sent columns. The recent
+    table must compute sent/accepted/rate from the same live source as the cards,
+    so it shows Tech Professionals as 5 sent / 4 accepted / 80.0%, never 0/0.
+    """
     app = LinkedInTUI(db_manager=seeded_db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -196,11 +202,21 @@ async def test_dashboard_recent_campaigns_table(seeded_db_manager: DatabaseManag
         await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
         table = screen.query_one("#dashboard-recent", DataTable)
         assert table.row_count == 2
-        rendered = "\n".join(
-            " ".join(str(c) for c in table.get_row_at(i)) for i in range(table.row_count)
-        )
-        assert "Tech Professionals" in rendered
-        assert "Marketing Leads" in rendered
+
+        rows = {
+            str(table.get_row_at(i)[0]): [str(c) for c in table.get_row_at(i)]
+            for i in range(table.row_count)
+        }
+        assert "Tech Professionals" in rows
+        assert "Marketing Leads" in rows
+        # Live-contact stats, consistent with the cards (not the stale 0 columns).
+        tech = rows["Tech Professionals"]
+        assert tech[2] == "5"  # sent
+        assert tech[3] == "4"  # accepted
+        assert tech[4] == "80.0%"  # rate
+        # A campaign with no contacts reads 0/0/0.0%, not a crash.
+        assert rows["Marketing Leads"][2] == "0"
+        assert rows["Marketing Leads"][4] == "0.0%"
 
 
 @pytest.mark.unit

@@ -29,12 +29,17 @@ from database.operations import DatabaseManager
 from utils.logging import get_logger
 
 from .base import BaseScreen
-from .campaigns import acceptance_rate
 
 logger = get_logger(__name__)
 
 # How many campaigns the recent-campaigns mini-table shows.
 RECENT_LIMIT = 5
+
+# Contact statuses that count as "sent" / "accepted", mirroring
+# DatabaseManager.update_campaign_stats and get_dashboard_stats so the recent
+# table is computed from the same live source as the stat cards (a denormalized
+# Campaign.total_sent can lag behind the actual contacts).
+_SENT_STATUSES = ("sent", "possibly_sent", "accepted", "declined")
 
 
 @dataclass(frozen=True)
@@ -115,12 +120,13 @@ class DashboardScreen(BaseScreen):
         try:
             stats = self._db_manager.get_dashboard_stats()
             campaigns = self._db_manager.get_campaigns(active_only=False)
+            contacts = self._db_manager.get_contacts()
             used_today, daily_limit = self._load_quota()
         except Exception as exc:  # surface in-place, never crash the UI
             self._marshal_populate(app, generation, None, f"Error loading dashboard: {exc}")
             return
 
-        recent = self._recent_rows(campaigns)
+        recent = self._recent_rows(campaigns, contacts)
         data = DashboardData(
             stats=stats, recent=recent, used_today=used_today, daily_limit=daily_limit
         )
@@ -147,8 +153,13 @@ class DashboardScreen(BaseScreen):
             return None, None
 
     @staticmethod
-    def _recent_rows(campaigns) -> List[Tuple]:
-        """Top-N campaigns, most recently active first, as table-ready rows."""
+    def _recent_rows(campaigns, contacts) -> List[Tuple]:
+        """Top-N campaigns, most recently active first, as table-ready rows.
+
+        Sent/accepted/rate are computed from live ``contacts`` — the same source
+        the stat cards use — so the table can't contradict the cards when the
+        denormalized ``Campaign`` aggregates are stale.
+        """
 
         def _key(c):
             # Newest activity first: last_run, else created_at. Both are
@@ -157,18 +168,32 @@ class DashboardScreen(BaseScreen):
             # date would raise).
             return (c.last_run or c.created_at) or datetime.min
 
+        # Per-campaign live tallies from the contacts table.
+        sent: dict = {}
+        accepted: dict = {}
+        for contact in contacts:
+            if contact.status in _SENT_STATUSES:
+                sent[contact.campaign_id] = sent.get(contact.campaign_id, 0) + 1
+            if contact.status == "accepted":
+                accepted[contact.campaign_id] = accepted.get(contact.campaign_id, 0) + 1
+
         ordered = sorted(campaigns, key=_key, reverse=True)[:RECENT_LIMIT]
-        return [
-            (
-                # User-controlled — render literally (see CampaignsScreen).
-                Text(c.name),
-                "Active" if c.active else "Inactive",
-                str(c.total_sent),
-                str(c.total_accepted),
-                f"{acceptance_rate(c):.1f}%",
+        rows = []
+        for c in ordered:
+            c_sent = sent.get(c.id, 0)
+            c_accepted = accepted.get(c.id, 0)
+            rate = (c_accepted / c_sent * 100) if c_sent > 0 else 0.0
+            rows.append(
+                (
+                    # User-controlled — render literally (see CampaignsScreen).
+                    Text(c.name),
+                    "Active" if c.active else "Inactive",
+                    str(c_sent),
+                    str(c_accepted),
+                    f"{rate:.1f}%",
+                )
             )
-            for c in ordered
-        ]
+        return rows
 
     def _marshal_populate(
         self, app: App, generation: int, data: Optional[DashboardData], error: Optional[str]
