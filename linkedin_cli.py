@@ -1350,7 +1350,12 @@ class LinkedInCLI:
             campaigns_with_pending = []
 
             for campaign in campaigns:
-                pending_count = len(self.db_manager.get_contacts_by_status(campaign.id, "sent"))
+                # "possibly_sent" (issue #31) is an assumed-sent invite awaiting
+                # acceptance, so it's pending alongside "sent".
+                pending_count = len(
+                    self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                    + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
+                )
                 if pending_count > 0:
                     campaigns_with_pending.append((campaign, pending_count))
 
@@ -1414,7 +1419,10 @@ class LinkedInCLI:
                                     campaign.id, progress_update
                                 )
                             else:  # direct
-                                pending_contacts = self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                                pending_contacts = (
+                                    self.db_manager.get_contacts_by_status(campaign.id, "sent")
+                                    + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
+                                )
                                 stats = await automation.check_connection_status(
                                     pending_contacts, progress_update
                                 )
@@ -1430,7 +1438,10 @@ class LinkedInCLI:
                                 selected.id, progress_update
                             )
                         else:  # direct
-                            pending_contacts = self.db_manager.get_contacts_by_status(selected.id, "sent")
+                            pending_contacts = (
+                                self.db_manager.get_contacts_by_status(selected.id, "sent")
+                                + self.db_manager.get_contacts_by_status(selected.id, "possibly_sent")
+                            )
                             newly_accepted = await automation.check_connection_status(
                                 pending_contacts, progress_update
                             )
