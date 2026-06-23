@@ -160,6 +160,44 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
 
 
 @pytest.mark.unit
+async def test_app_ref_captured_on_ui_thread_at_schedule_time(
+    db_manager: DatabaseManager,
+):
+    """The App ref must be captured on the UI thread when the load is scheduled.
+
+    Regression for the deferred-worker race: ``@work(thread=True)`` runs the
+    worker body later on a worker thread, so resolving ``self.app`` inside it
+    would raise if the screen was popped/quit first (before the shutdown guards
+    can run). ``load_campaigns`` must therefore capture ``self.app`` on the UI
+    thread and hand it to the worker. Assert the scheduled worker receives the
+    live app instance as its first argument.
+    """
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, CampaignsScreen)
+
+        captured = {}
+
+        def _spy(passed_app, generation):
+            captured["app"] = passed_app
+            captured["generation"] = generation
+
+        # Replace the worker with a synchronous spy so we observe exactly what
+        # ``load_campaigns`` passes at schedule time (no deferred thread body).
+        screen._run_load = _spy
+        screen.load_campaigns()
+
+        # The app handed to the worker is the live app, resolved on the UI thread
+        # — not looked up lazily inside the (deferred) worker body.
+        assert captured["app"] is app
+        assert captured["generation"] == screen._load_generation
+
+
+@pytest.mark.unit
 async def test_campaigns_screen_handles_missing_db_manager(db_manager: DatabaseManager):
     """A degraded app (no DB) renders 'Database unavailable.' instead of crashing.
 

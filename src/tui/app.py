@@ -79,15 +79,16 @@ class CampaignsScreen(Screen):
     def load_campaigns(self) -> None:
         """Start a fresh load, invalidating any in-flight (slower) one."""
         self._load_generation += 1
-        self._run_load(self._load_generation)
+        # Capture the app reference here, on the UI thread while the screen is
+        # still attached. ``@work(thread=True)`` defers the worker body, so
+        # resolving ``self.app`` inside it would run later on a worker thread —
+        # and if the user popped/quit the screen first, that lookup would raise
+        # before the shutdown guards in ``_marshal_populate`` get a chance to run.
+        self._run_load(self.app, self._load_generation)
 
     @work(thread=True, exclusive=True)
-    def _run_load(self, generation: int) -> None:
+    def _run_load(self, app: App, generation: int) -> None:
         """Fetch campaigns off the event loop, then populate the table."""
-        # Capture the app reference now, while the screen is still attached. The
-        # worker can't be interrupted, so by the time it finishes the screen may
-        # be detached and ``self.app`` would no longer resolve.
-        app = self.app
         if self._db_manager is None:
             self._marshal_populate(app, generation, [], "Database unavailable.")
             return
