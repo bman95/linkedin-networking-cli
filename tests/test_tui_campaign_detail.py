@@ -143,6 +143,32 @@ async def test_edit_prefills_and_saves(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_detail_export_csv(db_manager: DatabaseManager, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))  # export writes under ~/.linkedin-networking-cli
+    c = make_campaign(db_manager)
+    db_manager.create_contact({
+        "campaign_id": c.id,
+        "name": "Jane Doe",
+        "profile_url": "https://www.linkedin.com/in/jane",
+        "status": "sent",
+    })
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "Read-only")
+        await pilot.press("x")
+        text = await wait_text(pilot, "#detail-status", "Exported")
+        assert "Exported" in text
+
+    files = list((tmp_path / ".linkedin-networking-cli" / "exports").glob("*.csv"))
+    assert len(files) == 1
+    content = files[0].read_text()
+    assert "profile_url" in content  # header row
+    assert "Jane Doe" in content
+
+
+@pytest.mark.unit
 async def test_detail_degraded_without_db(db_manager: DatabaseManager):
     c = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)

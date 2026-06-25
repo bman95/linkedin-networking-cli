@@ -59,7 +59,7 @@ side effects); write and automation flows follow.
 | --- | --- | --- | --- | --- |
 | Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_daily_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count` | none (read-only) | **done (this PR)** |
-| Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign` | DB write (toggle/edit/delete) | **done** (view/edit/toggle/delete; export-CSV deferred) |
+| Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**; online location search + custom geoUrn deferred |
 | Execute Campaign | `ExecuteCampaignScreen` | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (user-initiated run) |
 | Check Connections | `CheckConnectionsScreen` | `smart_connection_checker` / `check_connection_status` | browser, network | **done** (user-initiated run) |
@@ -104,8 +104,10 @@ side effects); write and automation flows follow.
    offered — the automation methods take no cancel token — so the screen says
    "keep this open until it finishes"; `esc` after completion returns.
 4. **Cutover.** Once every flow has a TUI equivalent at parity, drop InquirerPy.
-   Remaining gaps before cutover: campaign **export-to-CSV**, and the deferred
-   **online location search** / **custom geoUrn** entry (both browser-bound).
+   Every classic main-menu flow now has a TUI equivalent. The only deferred
+   parity items are the browser-bound **online location search** / **custom
+   geoUrn** entry in Create/Edit; cutover itself (removing InquirerPy and
+   `linkedin_cli.py`) is gated on the owner's per-flow sign-off.
 
 Rationale: de-risk by deferring side-effecting flows. Each stage builds on the
 proven conventions of the previous one, so the experience stays coherent as the

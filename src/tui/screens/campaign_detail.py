@@ -14,7 +14,10 @@ irreversible action gets an explicit y/n gate, never a single-keystroke wipe.
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from textual import work
@@ -29,6 +32,47 @@ from utils.logging import get_logger
 from .base import BaseScreen
 
 logger = get_logger(__name__)
+
+# CSV columns, matching the classic CLI's export_contacts for parity.
+_CSV_FIELDS = (
+    "name",
+    "profile_url",
+    "headline",
+    "location",
+    "company",
+    "status",
+    "connection_sent_at",
+    "connection_accepted_at",
+    "notes",
+)
+
+
+def _csv_value(value) -> str:
+    """Normalize a value for CSV output (mirrors the classic ``_csv_value``)."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def export_contacts_csv(campaign_name: str, contacts) -> Path:
+    """Write a campaign's contacts to a timestamped CSV under the exports dir."""
+    safe = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_" for c in campaign_name
+    ).strip("_") or "campaign"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_dir = Path.home() / ".linkedin-networking-cli" / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    path = export_dir / f"{safe}_contacts_{timestamp}.csv"
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(_CSV_FIELDS))
+        writer.writeheader()
+        for contact in contacts:
+            writer.writerow(
+                {field: _csv_value(getattr(contact, field, None)) for field in _CSV_FIELDS}
+            )
+    return path
 
 
 @dataclass(frozen=True)
@@ -56,6 +100,7 @@ class CampaignDetailScreen(BaseScreen):
         ("r", "refresh", "Refresh"),
         Binding("e", "edit", "Edit"),
         Binding("a", "toggle_active", "Toggle active"),
+        Binding("x", "export", "Export CSV"),
         Binding("d", "delete", "Delete"),
         ("q", "app.quit", "Quit"),
     ]
@@ -65,6 +110,7 @@ class CampaignDetailScreen(BaseScreen):
     HINTS = (
         ("e", "edit"),
         ("a", "active"),
+        ("x", "export"),
         ("d", "delete"),
         ("esc", "back"),
         ("q", "quit"),
@@ -192,7 +238,7 @@ class CampaignDetailScreen(BaseScreen):
         self.query_one("#detail-body-targeting", Static).update(detail.targeting)
         self.query_one("#detail-body-message", Static).update(detail.message)
         self.query_one("#detail-body-performance", Static).update(detail.performance)
-        self._set_status("Read-only view.  e edit · a toggle active · d delete")
+        self._set_status("Read-only view.  e edit · a toggle active · x export · d delete")
 
     # ── actions ───────────────────────────────────────────────────────────
 
@@ -212,6 +258,14 @@ class CampaignDetailScreen(BaseScreen):
         new_state = not self._active
         self._set_status("Activating…" if new_state else "Deactivating…")
         self._run_update(self.app, {"active": new_state})
+
+    def action_export(self) -> None:
+        self._confirming_delete = False
+        if self._db_manager is None or self._busy:
+            return
+        self._busy = True
+        self._set_status("Exporting contacts…")
+        self._run_export(self.app)
 
     def action_delete(self) -> None:
         if self._db_manager is None or self._busy:
@@ -236,6 +290,42 @@ class CampaignDetailScreen(BaseScreen):
             self._marshal_action(app, f"Error updating campaign: {exc}", reload=False)
             return
         self._marshal_action(app, None, reload=True)
+
+    @work(thread=True, exclusive=True, group="export")
+    def _run_export(self, app: App) -> None:
+        assert self._db_manager is not None  # guarded in action_export
+        try:
+            campaign = self._db_manager.get_campaign(self._campaign_id)
+            contacts = self._db_manager.get_contacts(self._campaign_id)
+        except Exception as exc:
+            self._marshal_export(app, f"Error loading contacts: {exc}", "error")
+            return
+        if campaign is None:
+            self._marshal_export(app, "Campaign not found.", "error")
+            return
+        if not contacts:
+            self._marshal_export(app, "No contacts to export yet.", "warn")
+            return
+        try:
+            path = export_contacts_csv(campaign.name, contacts)
+        except Exception as exc:
+            self._marshal_export(app, f"Error writing CSV: {exc}", "error")
+            return
+        self._marshal_export(app, f"✓ Exported {len(contacts)} contacts to {path}", "good")
+
+    def _marshal_export(self, app: App, message: str, kind: str) -> None:
+        if not app.is_running:
+            return
+        try:
+            app.call_from_thread(self._after_export, message, kind)
+        except RuntimeError:
+            return
+
+    def _after_export(self, message: str, kind: str) -> None:
+        if not self.is_mounted:
+            return
+        self._busy = False
+        self._set_status(message, kind)
 
     @work(thread=True, exclusive=True)
     def _run_delete(self, app: App) -> None:
