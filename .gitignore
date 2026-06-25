@@ -24,3 +24,6 @@ nul
 .coverage
 coverage.xml
 htmlcov/
+
+# Claude Code ephemeral worktrees (linked git worktrees, not project content)
+.claude/worktrees/
