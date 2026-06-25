@@ -1,7 +1,7 @@
 import asyncio
+import os
+import platform
 import random
-import subprocess
-import time
 import unicodedata
 import urllib.parse
 import uuid
@@ -101,27 +101,97 @@ WEBDRIVER_MASK_SCRIPT = (
 )
 
 
-def force_close_chrome() -> None:
-    """Close Chrome processes forcefully before launching Playwright."""
+# Chrome's single-instance lock artifacts inside a persistent profile. On
+# POSIX these are symlinks Chrome leaves behind when it dies without a clean
+# shutdown; a stale one makes the next launch_persistent_context abort with
+# "Failed to create a ProcessSingleton for your profile directory" — the browser
+# opens and immediately closes (exit code 21). Windows guards the profile with a
+# kernel object instead and writes no such files, so clearing them is a POSIX-
+# only concern and a harmless no-op elsewhere.
+_SINGLETON_LOCK_FILES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+
+
+def _chrome_procs_using_profile(user_data_dir: str) -> List[psutil.Process]:
+    """Return live Chrome/Chromium processes bound to *this* profile.
+
+    Matched by the ``--user-data-dir`` flag on each process' command line so a
+    user's everyday Chrome windows — which run on a different profile — are never
+    in the set. Cross-platform: relies only on psutil, not on any OS-specific
+    kill utility, so the same code path works on Windows and Linux.
+    """
+    target = os.path.normcase(os.path.abspath(user_data_dir))
+    matches: List[psutil.Process] = []
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            if "chrome" not in name and "chromium" not in name:
+                continue
+            for arg in proc.info.get("cmdline") or []:
+                if arg.startswith("--user-data-dir="):
+                    value = arg.split("=", 1)[1]
+                    if os.path.normcase(os.path.abspath(value)) == target:
+                        matches.append(proc)
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return matches
+
+
+def _clear_stale_singleton_locks(user_data_dir: Path) -> None:
+    """Delete leftover single-instance lock files from a persistent profile.
+
+    Only safe once no live Chrome is using the profile (callers kill those
+    first). The locks are symlinks, so ``unlink`` removes the link itself; a
+    missing one is fine — on Windows none exist, so every call is a no-op.
+    """
+    for name in _SINGLETON_LOCK_FILES:
+        lock = user_data_dir / name
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("Could not remove stale lock %s: %s", lock, exc)
+
+
+def force_close_chrome(user_data_dir: Optional[str] = None) -> None:
+    """Clear whatever would block a clean persistent-profile launch.
+
+    The OS dictates *how*. On every platform we first kill any leftover Chrome
+    still holding this exact profile (scoped via psutil so the user's other
+    windows survive); then, on POSIX only, we delete the stale ``Singleton*``
+    lock files a hard-killed Chrome leaves behind — the actual trigger of the
+    "ProcessSingleton" launch abort that opens and instantly closes the browser.
+    On Windows that second step is skipped: the profile lock is a kernel object
+    released when the process dies, and no lock files exist to remove.
+
+    With no ``user_data_dir`` (the transient launch path) there is no dedicated
+    profile to clean, so this returns immediately rather than touching any
+    Chrome the user happens to have open.
+    """
+    if not user_data_dir:
+        return
+
     try:
-        # Windows: Kill chrome.exe processes
-        subprocess.run(
-            ["taskkill", "/f", "/im", "chrome.exe"], capture_output=True, check=False
-        )
-
-        # Also kill any remaining Chrome processes
-        for proc in psutil.process_iter(["pid", "name"]):
-            if proc.info.get("name", "").lower().startswith("chrome"):
-                try:
-                    proc.kill()
-                    logger.debug("Killed Chrome process %d", proc.pid)
-                except psutil.NoSuchProcess:
-                    pass
+        leftovers = _chrome_procs_using_profile(user_data_dir)
     except Exception as exc:
-        logger.warning("Error killing Chrome processes: %s", exc)
+        logger.warning("Error inspecting Chrome processes: %s", exc)
+        leftovers = []
 
-    # Wait for processes to close
-    time.sleep(2)
+    for proc in leftovers:
+        try:
+            proc.kill()
+            logger.debug("Killed leftover Chrome process %d on our profile", proc.pid)
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as exc:
+            logger.warning("Error killing Chrome process %d: %s", proc.pid, exc)
+
+    if leftovers:
+        # Wait (bounded) for the OS to release the profile's file handles before
+        # we clear its locks, instead of a blind fixed sleep.
+        psutil.wait_procs(leftovers, timeout=3)
+
+    if platform.system() != "Windows":
+        _clear_stale_singleton_locks(Path(user_data_dir))
 
 
 @dataclass
@@ -273,9 +343,6 @@ class LinkedInAutomation:
         so a later transient run can resume the session a persistent run
         established.
         """
-        # Force close any existing Chrome processes
-        force_close_chrome()
-
         self.playwright = await async_playwright().start()
         browser_settings = self.settings.get_browser_settings()
 
@@ -335,6 +402,10 @@ class LinkedInAutomation:
             persistent_kwargs = launch_kwargs.copy()
             persistent_kwargs.update(context_options)
             logger.info("Using persistent context with user data dir %s", user_data_dir)
+            # Free the profile before launching: kill any Chrome still holding it
+            # and (on POSIX) drop stale single-instance locks, so the launch
+            # below can't abort with "ProcessSingleton" and bounce the browser.
+            force_close_chrome(user_data_dir)
             try:
                 logger.info("Launching persistent Chrome…")
                 self.context = await self.playwright.chromium.launch_persistent_context(

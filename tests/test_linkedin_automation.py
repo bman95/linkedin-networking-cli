@@ -659,7 +659,9 @@ class TestBrowserHardening:
         monkeypatch.setattr(
             linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
         )
-        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+        monkeypatch.setattr(
+            linkedin_module, "force_close_chrome", lambda *a, **k: None
+        )
         return playwright, browser, context
 
     @pytest.mark.asyncio
@@ -782,7 +784,9 @@ class TestBrowserHardening:
         monkeypatch.setattr(
             linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
         )
-        monkeypatch.setattr(linkedin_module, "force_close_chrome", lambda: None)
+        monkeypatch.setattr(
+            linkedin_module, "force_close_chrome", lambda *a, **k: None
+        )
 
         automation = LinkedInAutomation(db_manager, app_settings)
         await automation.start_browser()
@@ -942,6 +946,98 @@ class TestFingerprintConsistency:
         assert "storage_state" not in fallback_kwargs
         assert fallback_kwargs["timezone_id"] == "Europe/Madrid"
         assert "locale" in fallback_kwargs
+
+
+@pytest.mark.unit
+class TestForceCloseChrome:
+    """OS-aware profile cleanup that frees a clean persistent-profile launch.
+
+    Regression for the "browser opens and immediately closes" crash: a stale
+    ``SingletonLock`` left by a hard-killed Chrome made the next
+    ``launch_persistent_context`` abort with "ProcessSingleton". The cleanup
+    detects the OS and acts accordingly — drop the POSIX lock files, leave
+    Windows (kernel-locked) alone — while never killing Chrome on other
+    profiles.
+    """
+
+    class _FakeProc:
+        def __init__(self, name, cmdline, pid=123):
+            self.info = {"name": name, "cmdline": cmdline}
+            self.pid = pid
+            self.kill = Mock()
+
+    @staticmethod
+    def _make_profile(tmp_path):
+        profile = tmp_path / "browser_data"
+        profile.mkdir()
+        from automation.linkedin import _SINGLETON_LOCK_FILES
+
+        for name in _SINGLETON_LOCK_FILES:
+            (profile / name).write_text("lock")
+        return profile
+
+    def test_clears_stale_singleton_locks_on_posix(self, tmp_path, monkeypatch):
+        """On Linux the stale Singleton* lock files are removed."""
+        from automation import linkedin as linkedin_module
+
+        profile = self._make_profile(tmp_path)
+        monkeypatch.setattr(linkedin_module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(linkedin_module.psutil, "process_iter", lambda *a: [])
+
+        linkedin_module.force_close_chrome(str(profile))
+
+        for name in linkedin_module._SINGLETON_LOCK_FILES:
+            assert not (profile / name).exists(), f"{name} should be removed"
+
+    def test_keeps_locks_on_windows(self, tmp_path, monkeypatch):
+        """On Windows the lock files are left untouched (kernel-managed lock)."""
+        from automation import linkedin as linkedin_module
+
+        profile = self._make_profile(tmp_path)
+        monkeypatch.setattr(linkedin_module.platform, "system", lambda: "Windows")
+        monkeypatch.setattr(linkedin_module.psutil, "process_iter", lambda *a: [])
+
+        linkedin_module.force_close_chrome(str(profile))
+
+        for name in linkedin_module._SINGLETON_LOCK_FILES:
+            assert (profile / name).exists(), f"{name} must survive on Windows"
+
+    def test_only_kills_chrome_on_our_profile(self, tmp_path, monkeypatch):
+        """Leftover Chrome is killed only when bound to *our* profile."""
+        from automation import linkedin as linkedin_module
+
+        profile = tmp_path / "browser_data"
+        profile.mkdir()
+        ours = self._FakeProc("chrome", [f"--user-data-dir={profile}"], pid=1)
+        other = self._FakeProc(
+            "chrome", ["--user-data-dir=/somewhere/else"], pid=2
+        )
+        unrelated = self._FakeProc("code", ["--foo"], pid=3)
+
+        monkeypatch.setattr(linkedin_module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            linkedin_module.psutil,
+            "process_iter",
+            lambda *a: [ours, other, unrelated],
+        )
+        monkeypatch.setattr(linkedin_module.psutil, "wait_procs", lambda *a, **k: None)
+
+        linkedin_module.force_close_chrome(str(profile))
+
+        ours.kill.assert_called_once()
+        other.kill.assert_not_called()
+        unrelated.kill.assert_not_called()
+
+    def test_noop_without_user_data_dir(self, monkeypatch):
+        """The transient path (no profile) inspects/kills nothing."""
+        from automation import linkedin as linkedin_module
+
+        sentinel = Mock(side_effect=AssertionError("must not scan processes"))
+        monkeypatch.setattr(linkedin_module.psutil, "process_iter", sentinel)
+
+        linkedin_module.force_close_chrome(None)
+
+        sentinel.assert_not_called()
 
 
 # ============================================================================
