@@ -60,7 +60,7 @@ side effects); write and automation flows follow.
 | Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_daily_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count` | none (read-only) | **done (this PR)** |
 | Manage Campaigns | `CampaignsScreen` | `get_campaigns` | none (read-only) | done (#37); detail/edit later |
-| Create Campaign | campaign form screen | `create_campaign` | DB write | later — first *write* flow |
+| Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**; online location search + custom geoUrn deferred |
 | Execute Campaign | automation/progress screen | `LinkedInAutomation`, Playwright | browser, network, sends | later — highest risk |
 | Check Connections | automation/progress screen | `LinkedInAutomation` | browser, network | later |
 | Extract Profile Data | automation/progress screen | `LinkedInAutomation` | browser, network | later |
@@ -74,10 +74,16 @@ side effects); write and automation flows follow.
    Campaigns slice. Read-only first means we lock the look, the navigation
    model, and the threaded-worker data-flow conventions with **zero** risk of
    side effects.
-2. **Write flow: Create Campaign.** The first screen that mutates state.
+2. **Write flow: Create Campaign (done).** The first screen that mutates state.
    Introduces the form/validation patterns (inputs, selects, confirmation) and
    the "instant in-place feedback after a write" interaction. Lower risk than
-   automation because there's no browser.
+   automation because there's no browser — which is exactly why the classic
+   flow's "🔎 Search location online (requires login)" option (and the
+   custom-geoUrn entry it falls back to) is **deferred**: both drive Playwright +
+   a LinkedIn login, so they belong with the automation slice. The static
+   location list, network degree, and industry are at full parity; `Any`
+   location/industry persist as `None`, and the same validation rules apply
+   (non-empty name, daily limit 1–100, `{name}` required in the message).
 3. **Automation flows: Execute / Check Connections / Extract Profile Data.**
    The hardest slice: long-running async Playwright work with live in-place
    progress, cancellation, and credential gating. These are deferred until the
@@ -201,7 +207,7 @@ toward a calm, modern terminal surface.
   count / today's quota / readiness), and a focused nav list of rich rows
   (title + description) whose selection is a `❯` pointer and an accent-recoloured
   title — not a loud full-width bar. Navigation is fast: `↑`/`↓` + `enter`, and
-  the number keys **`1`–`3` jump** straight to a destination. Textual's command
+  the number keys **`1`–`4` jump** straight to a destination. Textual's command
   palette (`ctrl+p`), extended with a `NavCommands` provider, offers the same
   destinations from anywhere; `COMMANDS` *extends* the built-in providers, so the
   default system commands (theme switch, quit, …) remain.

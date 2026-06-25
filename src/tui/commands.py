@@ -25,6 +25,7 @@ class NavCommands(Provider):
         imports (preserving the package's lazy-import bootstrap discipline).
         """
         from .screens.campaigns import CampaignsScreen
+        from .screens.create_campaign import CreateCampaignScreen
         from .screens.dashboard import DashboardScreen
         from .screens.settings_view import SettingsScreen
 
@@ -35,6 +36,8 @@ class NavCommands(Provider):
              lambda: app.push_screen(DashboardScreen(db))),
             ("Campaigns", "List campaigns",
              lambda: app.push_screen(CampaignsScreen(db))),
+            ("Create Campaign", "Set up a new outreach campaign",
+             lambda: app.push_screen(CreateCampaignScreen(db))),
             ("Settings", "View configuration",
              lambda: app.push_screen(SettingsScreen(db))),
             ("Quit", "Exit the application", app.exit),

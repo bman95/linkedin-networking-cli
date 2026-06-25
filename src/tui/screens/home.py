@@ -7,7 +7,7 @@ idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
 background bar or border.
 
-Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys ``1``–``3`` jump
+Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys ``1``–``4`` jump
 straight to a destination, and the command palette (ctrl+p) reaches the same
 screens from anywhere.
 
@@ -37,6 +37,7 @@ from utils.logging import get_logger
 
 from .base import hint_markup
 from .campaigns import CampaignsScreen
+from .create_campaign import CreateCampaignScreen
 from .dashboard import DashboardScreen
 from .settings_view import SettingsScreen
 
@@ -75,7 +76,7 @@ MASCOT_PLAN_B = (
 )
 
 HINTS = (
-    ("1-3 ↑↓", "navigate"),
+    ("1-4 ↑↓", "navigate"),
     ("enter", "open"),
     ("q", "quit"),
     ("ctrl+p", "more"),
@@ -90,7 +91,8 @@ class HomeScreen(Screen):
         # Number keys jump straight to a destination (1-indexed over NAV_ITEMS).
         Binding("1", "open(0)", "Dashboard", show=False),
         Binding("2", "open(1)", "Campaigns", show=False),
-        Binding("3", "open(2)", "Settings", show=False),
+        Binding("3", "open(2)", "Create Campaign", show=False),
+        Binding("4", "open(3)", "Settings", show=False),
     ]
 
     # (key, title, description). The key doubles as the nav item id suffix and
@@ -98,6 +100,7 @@ class HomeScreen(Screen):
     NAV_ITEMS = (
         ("dashboard", "Dashboard", "Campaign overview, connection stats, recent activity"),
         ("campaigns", "Campaigns", "Browse and review your outreach campaigns"),
+        ("create", "Create Campaign", "Set up a new outreach campaign"),
         ("settings", "Settings", "Credentials, browser, rate limits, data locations"),
     )
 
@@ -164,6 +167,8 @@ class HomeScreen(Screen):
             self.app.push_screen(DashboardScreen(db))
         elif key == "campaigns":
             self.app.push_screen(CampaignsScreen(db))
+        elif key == "create":
+            self.app.push_screen(CreateCampaignScreen(db))
         elif key == "settings":
             self.app.push_screen(SettingsScreen(db))
 

@@ -88,14 +88,14 @@ def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
 
 @pytest.mark.unit
 async def test_home_has_all_entries(db_manager: DatabaseManager):
-    """The home exposes Dashboard, Campaigns and Settings, focused and ordered."""
+    """The home exposes Dashboard, Campaigns, Create Campaign and Settings, ordered."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
         menu = app.screen.query_one("#home-nav", ListView)
         item_ids = [item.id for item in menu.query("ListItem")]
-        assert item_ids == ["nav-dashboard", "nav-campaigns", "nav-settings"]
+        assert item_ids == ["nav-dashboard", "nav-campaigns", "nav-create", "nav-settings"]
         assert menu.has_focus and menu.index == 0
 
 
@@ -141,7 +141,7 @@ async def test_command_palette_navigates(db_manager: DatabaseManager):
         provider = NavCommands(app.screen)
         discovered = [hit async for hit in provider.discover()]
         names = [str(hit.display) for hit in discovered]
-        assert names == ["Dashboard", "Campaigns", "Settings", "Quit"]
+        assert names == ["Dashboard", "Campaigns", "Create Campaign", "Settings", "Quit"]
 
         # Fuzzy search narrows to Dashboard.
         searched = [hit async for hit in provider.search("dash")]

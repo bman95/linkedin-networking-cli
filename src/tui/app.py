@@ -26,6 +26,7 @@ from utils.logging import get_logger
 
 from .commands import NavCommands
 from .screens.campaigns import CampaignsScreen
+from .screens.create_campaign import CreateCampaignScreen
 from .screens.dashboard import DashboardScreen
 from .screens.home import HomeScreen
 from .screens.settings_view import SettingsScreen
@@ -37,6 +38,7 @@ __all__ = [
     "LinkedInTUI",
     "HomeScreen",
     "CampaignsScreen",
+    "CreateCampaignScreen",
     "DashboardScreen",
     "SettingsScreen",
     "run",
