@@ -59,11 +59,11 @@ side effects); write and automation flows follow.
 | --- | --- | --- | --- | --- |
 | Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_daily_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count` | none (read-only) | **done (this PR)** |
-| Manage Campaigns | `CampaignsScreen` | `get_campaigns` | none (read-only) | done (#37); detail/edit later |
+| Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign` | DB write (toggle/edit/delete) | **done** (view/edit/toggle/delete; export-CSV deferred) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**; online location search + custom geoUrn deferred |
-| Execute Campaign | automation/progress screen | `LinkedInAutomation`, Playwright | browser, network, sends | later — highest risk |
-| Check Connections | automation/progress screen | `LinkedInAutomation` | browser, network | later |
-| Extract Profile Data | automation/progress screen | `LinkedInAutomation` | browser, network | later |
+| Execute Campaign | `ExecuteCampaignScreen` | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (user-initiated run) |
+| Check Connections | `CheckConnectionsScreen` | `smart_connection_checker` / `check_connection_status` | browser, network | **done** (user-initiated run) |
+| Extract Profile Data | `ExtractProfilesScreen` | `extract_detailed_profile` | browser, network | **done** (user-initiated run) |
 | Exit | key binding (`q`) / command palette | — | — | done |
 
 ## 4. Flow-by-flow migration order, with rationale
@@ -84,13 +84,28 @@ side effects); write and automation flows follow.
    location list, network degree, and industry are at full parity; `Any`
    location/industry persist as `None`, and the same validation rules apply
    (non-empty name, daily limit 1–100, `{name}` required in the message).
-3. **Automation flows: Execute / Check Connections / Extract Profile Data.**
+3. **Automation flows: Execute / Check Connections / Extract Profile Data (done).**
    The hardest slice: long-running async Playwright work with live in-place
-   progress, cancellation, and credential gating. These are deferred until the
-   shell, theme, and data-flow conventions are proven, and until a dedicated
-   progress/worker design exists. They also require a coherent story for
-   surfacing CAPTCHA/login prompts inside the TUI.
+   progress and credential gating. A shared `AutomationRunScreen` base
+   (`automation_run.py`) encodes one shape — **gate → select → confirm → run
+   (streaming log) → summary / error** — so the three screens differ only in
+   their selection widgets, the async automation body, and the summary. The run
+   drives `asyncio.run` inside a `@work(thread=True)` worker (mirroring the
+   classic `asyncio.run(run_automation())`), and the automation's
+   `progress_callback` streams lines into a `RichLog` via `call_from_thread`.
+   Typed automation exceptions (CAPTCHA / rate-limit / auth / landing / selector)
+   map to the same actionable stop messages as the classic
+   `_report_automation_failure`, via `automation_errors.describe_automation_error`,
+   plus the saved evidence path. The browser run is **user-initiated**: nothing
+   runs until a campaign/mode is selected and confirmed with a *second* `ctrl+r`.
+   `run_body` is the single seam tests override to exercise the
+   run/log/summary/error pipeline without a browser; the live run itself is
+   validated manually (it sends real invites). Cancellation mid-run is not
+   offered — the automation methods take no cancel token — so the screen says
+   "keep this open until it finishes"; `esc` after completion returns.
 4. **Cutover.** Once every flow has a TUI equivalent at parity, drop InquirerPy.
+   Remaining gaps before cutover: campaign **export-to-CSV**, and the deferred
+   **online location search** / **custom geoUrn** entry (both browser-bound).
 
 Rationale: de-risk by deferring side-effecting flows. Each stage builds on the
 proven conventions of the previous one, so the experience stays coherent as the
@@ -269,9 +284,14 @@ capture) get dedicated deterministic tests, mirroring the #37 approach. See
 - **Threaded-worker races.** Capture `self.app` on the UI thread; guard
   `app.is_running` + `RuntimeError`, `self.is_mounted`, and stale generations.
   Each has a regression test.
-- **Method-name clashes with Textual internals.** Widget/Screen subclasses must
-  not shadow framework methods (e.g. `_render` is a Textual internal). Use
-  distinct private names.
+- **Method/attribute clashes with Textual internals.** Widget/Screen subclasses
+  must not shadow framework members. Methods: e.g. `_render` is a Textual
+  internal. **Attributes too:** `AutomationRunScreen` first used `self._running`
+  for "a run is in flight" — but `MessagePump._running` is a Textual attribute
+  that is `True` for every mounted node, so the start guard `if self._running:
+  return` became a permanent no-op and `ctrl+r` did nothing. The run-state flags
+  are now namespaced (`_run_active` / `_run_done` / `_run_confirming` /
+  `_run_can_start`). Use distinct private names for state, not just methods.
 - **Packaging.** `app.tcss` lives next to `app.py` so `CSS_PATH` resolves, and
   the wheel's `only-include = ["src", …]` ships non-`.py` files — verified by
   inspecting the built wheel for `tui/app.tcss`.

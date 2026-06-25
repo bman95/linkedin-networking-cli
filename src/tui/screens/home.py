@@ -7,7 +7,7 @@ idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
 background bar or border.
 
-Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys ``1``–``4`` jump
+Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys ``1``–``7`` jump
 straight to a destination, and the command palette (ctrl+p) reaches the same
 screens from anywhere.
 
@@ -37,8 +37,11 @@ from utils.logging import get_logger
 
 from .base import hint_markup
 from .campaigns import CampaignsScreen
+from .check_connections import CheckConnectionsScreen
 from .create_campaign import CreateCampaignScreen
 from .dashboard import DashboardScreen
+from .execute_campaign import ExecuteCampaignScreen
+from .extract_profiles import ExtractProfilesScreen
 from .settings_view import SettingsScreen
 
 logger = get_logger(__name__)
@@ -76,7 +79,7 @@ MASCOT_PLAN_B = (
 )
 
 HINTS = (
-    ("1-4 ↑↓", "navigate"),
+    ("1-7 ↑↓", "navigate"),
     ("enter", "open"),
     ("q", "quit"),
     ("ctrl+p", "more"),
@@ -92,15 +95,21 @@ class HomeScreen(Screen):
         Binding("1", "open(0)", "Dashboard", show=False),
         Binding("2", "open(1)", "Campaigns", show=False),
         Binding("3", "open(2)", "Create Campaign", show=False),
-        Binding("4", "open(3)", "Settings", show=False),
+        Binding("4", "open(3)", "Execute Campaign", show=False),
+        Binding("5", "open(4)", "Check Connections", show=False),
+        Binding("6", "open(5)", "Extract Profile Data", show=False),
+        Binding("7", "open(6)", "Settings", show=False),
     ]
 
     # (key, title, description). The key doubles as the nav item id suffix and
     # selects the destination screen on activation.
     NAV_ITEMS = (
         ("dashboard", "Dashboard", "Campaign overview, connection stats, recent activity"),
-        ("campaigns", "Campaigns", "Browse and review your outreach campaigns"),
+        ("campaigns", "Campaigns", "Browse, open and manage your outreach campaigns"),
         ("create", "Create Campaign", "Set up a new outreach campaign"),
+        ("execute", "Execute Campaign", "Run automation: search and send connection requests"),
+        ("check", "Check Connections", "Reconcile which pending invites were accepted"),
+        ("extract", "Extract Profile Data", "Pull detailed public data from profiles"),
         ("settings", "Settings", "Credentials, browser, rate limits, data locations"),
     )
 
@@ -169,6 +178,12 @@ class HomeScreen(Screen):
             self.app.push_screen(CampaignsScreen(db))
         elif key == "create":
             self.app.push_screen(CreateCampaignScreen(db))
+        elif key == "execute":
+            self.app.push_screen(ExecuteCampaignScreen(db, self.app.settings))
+        elif key == "check":
+            self.app.push_screen(CheckConnectionsScreen(db, self.app.settings))
+        elif key == "extract":
+            self.app.push_screen(ExtractProfilesScreen(db, self.app.settings))
         elif key == "settings":
             self.app.push_screen(SettingsScreen(db))
 

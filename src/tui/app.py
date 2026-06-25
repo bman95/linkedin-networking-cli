@@ -28,8 +28,11 @@ from .commands import NavCommands
 from .screens.campaign_detail import CampaignDetailScreen
 from .screens.campaign_edit import CampaignEditScreen
 from .screens.campaigns import CampaignsScreen
+from .screens.check_connections import CheckConnectionsScreen
 from .screens.create_campaign import CreateCampaignScreen
 from .screens.dashboard import DashboardScreen
+from .screens.execute_campaign import ExecuteCampaignScreen
+from .screens.extract_profiles import ExtractProfilesScreen
 from .screens.home import HomeScreen
 from .screens.settings_view import SettingsScreen
 from .theme import LINKEDIN_THEME
@@ -43,6 +46,9 @@ __all__ = [
     "CampaignDetailScreen",
     "CampaignEditScreen",
     "CreateCampaignScreen",
+    "ExecuteCampaignScreen",
+    "CheckConnectionsScreen",
+    "ExtractProfilesScreen",
     "DashboardScreen",
     "SettingsScreen",
     "run",
