@@ -273,9 +273,9 @@ DataTable > .datatable--even-row {
     margin-bottom: 1;
 }
 
-/* ── Create Campaign screen (first write flow) ────────────────────────── */
+/* ── Campaign form (Create + Edit share #form-body) ───────────────────── */
 
-#create-body {
+#form-body {
     height: 1fr;
     overflow-y: auto;
     padding: 0 4;
@@ -292,27 +292,41 @@ DataTable > .datatable--even-row {
  * rather than stretching edge-to-edge on a wide terminal. A quiet round border
  * (calmer than Textual's default heavy `tall` edge) tints to the brand blue on
  * focus, the one place the identity colour earns its keep. */
-#create-body Input,
-#create-body Select {
+#form-body Input,
+#form-body Select {
     width: 76;
     border: round $panel-lighten-2;
     background: $surface;
 }
-#create-body Input:focus,
-#create-body Select:focus {
+#form-body Input:focus,
+#form-body Select:focus {
     border: round $primary;
 }
-#create-body Select SelectCurrent {
+#form-body Select SelectCurrent {
     border: none;
 }
-#create-body Select SelectOverlay {
+#form-body Select SelectOverlay {
     background: $panel;
 }
 
-/* The status line carries validation / write feedback in the semantic colour. */
-#create-status.-good {
+/* ── Campaign detail screen ───────────────────────────────────────────── */
+
+#detail-body {
+    height: 1fr;
+    overflow-y: auto;
+    padding: 0 4;
+}
+
+/* ── Shared status-line semantics (forms, detail, automation) ─────────── */
+
+/* The status line carries validation / write / progress feedback in the
+ * semantic colour; reused by every screen that reports an outcome inline. */
+.status-line.-good {
     color: $success;
 }
-#create-status.-error {
+.status-line.-warn {
+    color: $warning;
+}
+.status-line.-error {
     color: $error;
 }

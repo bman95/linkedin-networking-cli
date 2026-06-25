@@ -25,6 +25,8 @@ from database.operations import DatabaseManager
 from utils.logging import get_logger
 
 from .commands import NavCommands
+from .screens.campaign_detail import CampaignDetailScreen
+from .screens.campaign_edit import CampaignEditScreen
 from .screens.campaigns import CampaignsScreen
 from .screens.create_campaign import CreateCampaignScreen
 from .screens.dashboard import DashboardScreen
@@ -38,6 +40,8 @@ __all__ = [
     "LinkedInTUI",
     "HomeScreen",
     "CampaignsScreen",
+    "CampaignDetailScreen",
+    "CampaignEditScreen",
     "CreateCampaignScreen",
     "DashboardScreen",
     "SettingsScreen",
@@ -58,19 +62,32 @@ class LinkedInTUI(App):
     # than replacing them, so theme/quit/etc. stay available.
     COMMANDS = App.COMMANDS | {NavCommands}
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None) -> None:
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        settings: Optional[AppSettings] = None,
+    ) -> None:
         super().__init__()
-        if db_manager is None:
-            # Build the default manager, but degrade gracefully on a startup
-            # failure (e.g. read-only home, bad DB path) the same way the classic
-            # CLI does, rather than crashing before any screen is shown. A None
-            # manager surfaces "Database unavailable." in the data screens.
+        # AppSettings() touches the filesystem (it creates the app dir) and the
+        # automation flows need it (LinkedInAutomation(db_manager, settings)), so
+        # build and keep it here. Degrade to None on failure so the app still
+        # runs and screens render an "unavailable" state instead of crashing.
+        if settings is None:
             try:
                 settings = AppSettings()
+            except Exception:
+                logger.exception("Failed to initialize settings; running degraded")
+                settings = None
+        if db_manager is None and settings is not None:
+            # Build the default manager, but degrade gracefully on a startup
+            # failure (e.g. read-only home, bad DB path) the same way the classic
+            # CLI does. A None manager surfaces "Database unavailable." in screens.
+            try:
                 db_manager = DatabaseManager(str(settings.db_path))
             except Exception:
                 logger.exception("Failed to initialize database; running degraded")
                 db_manager = None
+        self.settings = settings
         self.db_manager = db_manager
 
     def on_mount(self) -> None:

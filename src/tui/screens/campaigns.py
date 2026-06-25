@@ -23,6 +23,7 @@ from database.operations import DatabaseManager
 from utils.logging import get_logger
 
 from .base import BaseScreen
+from .campaign_detail import CampaignDetailScreen
 
 logger = get_logger(__name__)
 
@@ -49,6 +50,14 @@ class CampaignsScreen(BaseScreen):
 
     SCREEN_TITLE = "Campaigns"
 
+    HINTS = (
+        ("enter", "open"),
+        ("esc", "back"),
+        ("r", "refresh"),
+        ("q", "quit"),
+        ("ctrl+p", "commands"),
+    )
+
     COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate", "Daily Limit")
 
     def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
@@ -69,6 +78,25 @@ class CampaignsScreen(BaseScreen):
         table.add_columns(*self.COLUMNS)
         self.query_one("#campaigns-status", Static).update("Loading campaigns…")
         self.load_campaigns()
+
+    def on_screen_resume(self) -> None:
+        # Returning from a campaign's detail (it may have been edited, toggled or
+        # deleted): reload so the list reflects the change.
+        if self.is_mounted:
+            self.load_campaigns()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Activating a row opens that campaign's detail screen."""
+        if self._db_manager is None:
+            return
+        key = event.row_key.value if event.row_key is not None else None
+        if key is None:
+            return
+        try:
+            campaign_id = int(key)
+        except (TypeError, ValueError):
+            return
+        self.app.push_screen(CampaignDetailScreen(self._db_manager, campaign_id))
 
     def action_refresh(self) -> None:
         self.query_one("#campaigns-status", Static).update("Refreshing…")
@@ -144,6 +172,8 @@ class CampaignsScreen(BaseScreen):
                 str(campaign.total_accepted),
                 f"{acceptance_rate(campaign):.1f}%",
                 str(campaign.daily_limit),
+                # Row key carries the id so activating a row opens its detail.
+                key=str(campaign.id),
             )
         if campaigns:
             status.update(f"{len(campaigns)} campaign(s).")
