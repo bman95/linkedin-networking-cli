@@ -1,82 +1,204 @@
 /* LinkedIn Networking CLI — Textual TUI layout (issue #24).
  *
- * Single source of *structure* truth: spacing, borders, focus styling, grids.
- * Colour comes from the registered "linkedin" Theme (src/tui/theme.py) via
- * semantic tokens ($primary, $panel, $text-muted …) — never raw hex here, so
- * the palette stays in exactly one place.
+ * Single source of *structure* truth: spacing, elevation, focus, grids. Colour
+ * comes from the registered "linkedin" Theme (src/tui/theme.py) via semantic
+ * tokens ($primary, $panel, $text-muted, $surface-2 …) — never raw hex here.
  *
- * The whole point of the migration is full-screen, in-place rendering with no
- * scroll-behind: every Screen fills the viewport and pins its Header/Footer,
- * scrolling only the inner content region where needed.
+ * Design language (modern terminal, 2025/2026): separation comes from
+ * *elevation* (surface → panel) and *whitespace*, not boxed borders. Every
+ * screen opens with the same brand masthead (the `in` badge) and closes with
+ * the same dim hint bar, all on a shared left margin, so the app reads as one
+ * piece. The brand blue is the identity (solid fills, focus); a brighter blue
+ * carries text accents. SCREEN_GUTTER (the 4-column side margin) is applied
+ * consistently to the masthead, bodies, and hint bar.
  */
 
 Screen {
     background: $surface;
+    /* Thin, muted scrollbars — a quiet thumb that brightens to the accent on
+     * interaction, instead of Textual's bright default. */
+    scrollbar-size-vertical: 1;
+    scrollbar-size-horizontal: 1;
+    scrollbar-background: $surface;
+    scrollbar-background-hover: $surface;
+    scrollbar-background-active: $surface;
+    scrollbar-color: $text-disabled;
+    scrollbar-color-hover: $primary;
+    scrollbar-color-active: $secondary;
 }
 
-/* ── Shared screen chrome ─────────────────────────────────────────────── */
+/* ── Shared frame ─────────────────────────────────────────────────────── */
 
-/* Per-screen context title, consistent across every screen. */
-.screen-title {
+/* The brand masthead at the top of every sub-screen: `in  LinkedIn  ·  Title`,
+ * on the shared gutter, with breathing room before the body. */
+.masthead {
+    height: auto;
+    padding: 1 4 0 4;
+    margin: 0 0 1 0;
+}
+
+/* Eyebrow: a small, dim, upper-case label that introduces a region (matches the
+ * home's NAVIGATE label). */
+.eyebrow {
+    color: $text-disabled;
     text-style: bold;
-    color: $primary;
-    padding: 1 2 0 2;
-}
-
-/* Muted caption directly under a screen title (e.g. the dashboard's
- * "LinkedIn Networking Dashboard" parity header). */
-.screen-subtitle {
-    color: $text-muted;
-    padding: 0 2 1 2;
+    margin: 1 0 0 0;
 }
 
 /* The status line every data screen uses for loading / empty / error /
  * degraded messages — designed states, never a raw traceback. */
 .status-line {
     color: $text-muted;
-    padding: 0 2 1 2;
+    padding: 0 4;
 }
 
-/* Consistent focus affordance everywhere: a brand-blue round border. */
-*:focus {
-    border: round $primary;
+/* Dim hint bar at the foot — Claude-Code-style `key action · …`, recessed. */
+.hint-bar {
+    height: 1;
+    padding: 0 4;
+    margin: 1 0 0 0;
 }
 
-/* ── Main menu ────────────────────────────────────────────────────────── */
-
-#menu-title {
-    text-style: bold;
-    color: $primary;
-    padding: 1 0;
+/* Modern table: no wrapping box — the bright cursor row carries focus, a quiet
+ * muted header carries structure, and a barely-there zebra (surface vs the
+ * one-step panel) replaces the harsh stripe. */
+DataTable {
+    background: $surface;
+    border: none;
 }
-
-#menu-tagline {
+DataTable > .datatable--header {
+    background: $surface;
     color: $text-muted;
-    padding: 0 0 1 0;
+    text-style: bold;
 }
 
-#main-menu {
-    width: 44;
-    height: auto;
-    border: round $primary;
-    padding: 0 1;
+/* Muted selection (Claude Code uses a desaturated selection blue, not a bright
+ * brand bar): a low-alpha brand tint keeps the row calm but clearly current. */
+DataTable > .datatable--cursor {
+    background: $primary 30%;
+    color: $foreground;
+    text-style: bold;
+}
+
+DataTable > .datatable--hover {
+    background: $surface-lighten-1;
+}
+
+DataTable > .datatable--even-row {
     background: $panel;
 }
 
-#main-menu > ListItem {
-    padding: 0 1;
+/* ── Home launcher ────────────────────────────────────────────────────── */
+
+#home {
+    height: 1fr;
+    padding: 2 4;
 }
 
-#main-menu > ListItem.--highlight {
-    background: $primary;
-    color: $text;
+/* Hero: the mascot beside the wordmark / tagline / summary. */
+#home-hero {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#home-mascot {
+    width: auto;
     text-style: bold;
+    padding: 0 3 0 0;
+}
+
+#home-heading {
+    width: 1fr;
+    height: auto;
+    /* Nudge the text block down so it sits centred against the 6-row mascot. */
+    padding: 1 0 0 0;
+}
+
+#home-wordmark {
+    text-style: bold;
+}
+
+#home-tagline {
+    color: $text-muted;
+}
+
+/* Live one-line workspace summary in the hero (worker-populated). */
+#home-status {
+    color: $text-muted;
+    margin: 1 0 0 0;
+}
+
+#home-nav {
+    width: 1fr;
+    max-width: 76;
+    height: auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+#home-nav:focus {
+    border: none;
+}
+
+/* Selection is a `❯` pointer + recoloured title (Claude Code's idiom): no
+ * background bar, no border. The override is ID-scoped so it beats Textual's
+ * block-cursor default (`ListView:focus > ListItem.-highlight`). */
+#home-nav > ListItem {
+    height: auto;
+    padding: 0 0 1 0;
+    background: transparent;
+    color: $foreground;
+}
+
+#home-nav > ListItem.-highlight,
+#home-nav:focus > ListItem.-highlight {
+    background: transparent;
+    color: $foreground;
+    text-style: none;
+}
+
+.nav-row {
+    height: auto;
+}
+
+/* The pointer is reserved on every row (width 2) but coloured like the surface
+ * so it's invisible until the row is highlighted. */
+.nav-caret {
+    width: 2;
+    color: $surface;
+    text-style: bold;
+}
+
+.nav-title {
+    text-style: bold;
+    color: $foreground;
+}
+
+/* Description sits under the title, indented past the reserved pointer column. */
+.nav-desc {
+    color: $text-muted;
+    padding: 0 0 0 2;
+}
+
+#home-nav > ListItem.-highlight .nav-caret {
+    color: $secondary;
+}
+
+#home-nav > ListItem.-highlight .nav-title {
+    color: $secondary;
+}
+
+/* Mouse affordance: hovering a row hints the pointer without stealing the
+ * keyboard highlight's stronger accent. */
+#home-nav > ListItem.-hovered .nav-caret {
+    color: $text-muted;
 }
 
 /* ── Campaigns screen ─────────────────────────────────────────────────── */
 
 #campaigns-table {
-    margin: 1 2;
+    margin: 1 4;
     height: 1fr;
 }
 
@@ -85,37 +207,33 @@ Screen {
 #dashboard-body {
     height: 1fr;
     overflow-y: auto;
-    padding: 0 2;
+    padding: 0 4;
 }
 
-/* Two rows of three stat cards. */
+/* Two rows of three borderless stat tiles, separated by gutters over the
+ * screen surface — elevation, not outlines. */
 #stat-grid {
     grid-size: 3;
     grid-gutter: 1 2;
     grid-rows: 5;
     height: auto;
-    margin-bottom: 1;
+    /* The OVERVIEW eyebrow above provides the top gap. */
+    margin: 0 0 1 0;
 }
 
 .stat-card {
-    border: round $panel;
     background: $panel;
     height: 5;
-    padding: 0 1;
-}
-
-.stat-card.-accent {
-    border: round $primary;
+    padding: 1 2;
 }
 
 .stat-label {
     color: $text-muted;
-    text-style: none;
 }
 
 .stat-value {
     text-style: bold;
-    color: $text;
+    color: $foreground;
 }
 
 .stat-value.-good {
@@ -126,17 +244,11 @@ Screen {
     color: $warning;
 }
 
-/* Section heading above the recent-campaigns table. */
-.section-title {
-    text-style: bold;
-    color: $primary;
-    margin-top: 1;
-}
-
 #dashboard-recent {
     height: auto;
-    max-height: 12;
-    margin-top: 1;
+    max-height: 14;
+    /* The RECENT CAMPAIGNS eyebrow above provides the top gap. */
+    margin-top: 0;
 }
 
 /* ── Settings screen ──────────────────────────────────────────────────── */
@@ -144,11 +256,11 @@ Screen {
 #settings-body {
     height: 1fr;
     overflow-y: auto;
-    padding: 0 2;
+    padding: 0 4;
 }
 
+/* Elevated panels, no outline — elevation + the bold title do the framing. */
 .settings-section {
-    border: round $panel;
     background: $panel;
     height: auto;
     padding: 1 2;
@@ -157,6 +269,6 @@ Screen {
 
 .settings-section-title {
     text-style: bold;
-    color: $primary;
+    color: $foreground;
     margin-bottom: 1;
 }

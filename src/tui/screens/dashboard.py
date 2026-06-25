@@ -82,15 +82,14 @@ class DashboardScreen(BaseScreen):
         self._load_generation = 0
 
     def compose_body(self) -> ComposeResult:
-        yield Static("LinkedIn Networking Dashboard", classes="screen-subtitle")
         with Container(id="dashboard-body"):
+            yield Static("OVERVIEW", classes="eyebrow")
             with Grid(id="stat-grid"):
                 for card_id, label in self.CARDS:
-                    accent = " -accent" if card_id == "success-rate" else ""
-                    with Container(classes=f"stat-card{accent}", id=f"card-{card_id}"):
+                    with Container(classes="stat-card", id=f"card-{card_id}"):
                         yield Static(label, classes="stat-label")
                         yield Static("—", classes="stat-value", id=f"value-{card_id}")
-            yield Static("Recent Campaigns", classes="section-title")
+            yield Static("RECENT CAMPAIGNS", classes="eyebrow")
             yield DataTable(
                 id="dashboard-recent", zebra_stripes=True, cursor_type="row"
             )
@@ -102,6 +101,7 @@ class DashboardScreen(BaseScreen):
         self.load_dashboard()
 
     def action_refresh(self) -> None:
+        self.query_one("#dashboard-status", Static).update("Refreshing…")
         self.load_dashboard()
 
     def load_dashboard(self) -> None:
@@ -227,7 +227,7 @@ class DashboardScreen(BaseScreen):
         if data.stats.get("total_campaigns", 0) == 0:
             status.update("No campaigns yet. Create one in the classic CLI (linkedin-cli).")
         else:
-            status.update("Updated. Press r to refresh, Esc to go back.")
+            status.update("Updated.")
 
     # ── rendering helpers ─────────────────────────────────────────────────
 

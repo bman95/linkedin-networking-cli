@@ -71,6 +71,7 @@ class CampaignsScreen(BaseScreen):
         self.load_campaigns()
 
     def action_refresh(self) -> None:
+        self.query_one("#campaigns-status", Static).update("Refreshing…")
         self.load_campaigns()
 
     def load_campaigns(self) -> None:
@@ -145,6 +146,6 @@ class CampaignsScreen(BaseScreen):
                 str(campaign.daily_limit),
             )
         if campaigns:
-            status.update(f"{len(campaigns)} campaign(s). Press Esc to go back, r to refresh.")
+            status.update(f"{len(campaigns)} campaign(s).")
         else:
             status.update("No campaigns yet. Create one in the classic CLI (linkedin-cli).")

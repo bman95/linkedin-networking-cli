@@ -9,8 +9,14 @@ The TUI's look is split deliberately:
 - **``app.tcss``** owns *layout*: spacing, borders, focus styling, grids. It
   reads the tokens defined here.
 
-The palette is anchored on LinkedIn's brand blue so the new presentation layer
-stays visually coherent with the classic CLI (which uses the same constant).
+**Palette direction.** Anchored on LinkedIn's brand blue (kept identical to the
+classic CLI for cross-surface coherence), but built out into a calm, modern
+terminal palette in the spirit of the dark schemes that define 2025/2026
+terminal aesthetics (Tokyo Night, Catppuccin): a deep, slightly *cool* neutral
+base layered by elevation, soft pastel-leaning accents used with restraint, and
+desaturated semantic colours that harmonise rather than shout. The brand blue
+stays the identity (solid fills, focus, active); a brighter blue carries text
+accents where the deep brand blue would read low-contrast on dark.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from textual.theme import Theme
 
 # LinkedIn brand blue — the same constant the classic InquirerPy CLI brands with
 # (``BRAND_BLUE`` in ``linkedin_cli.py``). Kept identical for cross-surface
-# coherence as the migration proceeds.
+# coherence, and pinned by ``test_brand_theme_is_active``.
 BRAND_BLUE = "#0A66C2"
 
 # One calm, dark theme. A light variant is an explicit later decision (see
@@ -27,20 +33,23 @@ BRAND_BLUE = "#0A66C2"
 # theming machinery.
 LINKEDIN_THEME = Theme(
     name="linkedin",
-    primary=BRAND_BLUE,        # brand accent: borders, focus, headings
-    secondary="#378FE9",       # lighter blue: highlighted rows, secondary accents
-    accent=BRAND_BLUE,         # aligned with primary for brand consistency
-    success="#057642",         # LinkedIn green: healthy/active states, good rates
-    warning="#B24020",         # quota approaching, caution states
-    error="#CC1016",           # error / degraded states
-    foreground="#E8E8E8",      # body text
-    background="#1B1F23",      # app background — deep, calm
-    surface="#22272E",         # screen surface
-    panel="#2D333B",           # cards / panels
+    primary=BRAND_BLUE,        # brand identity: solid fills, focus, active state
+    secondary="#4D9FFF",       # brighter blue: text accents/links on dark
+    accent="#4D9FFF",          # bright accent for headings/marks (legible on dark)
+    success="#4FB477",         # calm green: healthy/active states, good rates
+    warning="#E0A65B",         # amber: quota approaching, caution states
+    error="#E5615B",           # soft red: error / degraded states
+    foreground="#E4E9F0",      # body text — a touch cool, not stark white
+    background="#11151A",      # app background — deep, cool, calm
+    surface="#161B22",         # screen surface (one step up from background)
+    panel="#1C222B",           # elevated cards / panels (one more step up)
     dark=True,
     variables={
-        # Muted captions and status lines (the ``$text-muted`` token).
-        "text-muted": "#9AA5B1",
+        # Muted captions and status lines (the ``$text-muted`` token). The
+        # dimmest tier (eyebrows) uses Textual's built-in ``$text-disabled``, and
+        # raised hover surfaces use the auto-generated ``$surface-lighten-1`` —
+        # both resolvable at first CSS parse, unlike brand-new custom variables.
+        "text-muted": "#8A95A6",
         "block-cursor-foreground": "#FFFFFF",
     },
 )

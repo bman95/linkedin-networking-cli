@@ -10,8 +10,8 @@ path and ``DatabaseManager`` for reads. Every shipped screen is read-only, so th
 TUI needs no LinkedIn credentials and no browser, and stays driveable in the
 Textual headless harness.
 
-``MainMenuScreen`` and ``CampaignsScreen`` are re-exported here for backwards
-compatibility with importers (and tests) that predate the screens split.
+``HomeScreen`` (the launcher) and ``CampaignsScreen`` are re-exported here so
+importers (and tests) have a single stable entry point.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from utils.logging import get_logger
 from .commands import NavCommands
 from .screens.campaigns import CampaignsScreen
 from .screens.dashboard import DashboardScreen
-from .screens.main_menu import MainMenuScreen
+from .screens.home import HomeScreen
 from .screens.settings_view import SettingsScreen
 from .theme import LINKEDIN_THEME
 
@@ -35,7 +35,7 @@ logger = get_logger(__name__)
 
 __all__ = [
     "LinkedInTUI",
-    "MainMenuScreen",
+    "HomeScreen",
     "CampaignsScreen",
     "DashboardScreen",
     "SettingsScreen",
@@ -76,7 +76,7 @@ class LinkedInTUI(App):
         # mounts so every screen renders against the brand palette.
         self.register_theme(LINKEDIN_THEME)
         self.theme = "linkedin"
-        self.push_screen(MainMenuScreen())
+        self.push_screen(HomeScreen())
 
 
 def run() -> None:

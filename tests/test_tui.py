@@ -19,19 +19,19 @@ import pytest
 from textual.widgets import DataTable, ListView, Static
 
 from database.operations import DatabaseManager
-from tui.app import CampaignsScreen, LinkedInTUI, MainMenuScreen
+from tui.app import CampaignsScreen, HomeScreen, LinkedInTUI
 
 
 async def open_menu_item(pilot, item_id: str) -> None:
-    """Drive the real main-menu navigation to a specific entry.
+    """Drive the real keyboard-first home navigation to a specific entry.
 
-    The menu is keyboard-first and focused on mount; this walks the highlight to
-    the target item and activates it, exercising the same path a user takes
-    (rather than calling ``push_screen`` directly).
+    The home is a focused nav list; this walks the highlight to the target row
+    and activates it, exercising the same path a user takes (rather than calling
+    ``push_screen`` directly).
     """
-    menu = pilot.app.screen.query_one("#main-menu", ListView)
+    menu = pilot.app.screen.query_one("#home-nav", ListView)
     item_ids = [item.id for item in menu.query("ListItem")]
-    target = item_ids.index(f"menu-{item_id}")
+    target = item_ids.index(f"nav-{item_id}")
     while menu.index != target:
         await pilot.press("down")
     await pilot.press("enter")
@@ -63,17 +63,17 @@ def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
 
 
 @pytest.mark.unit
-async def test_main_menu_mounts(db_manager: DatabaseManager):
-    """The app boots into the full-screen main menu with selectable items."""
+async def test_home_mounts(db_manager: DatabaseManager):
+    """The app boots into the focused home launcher with selectable items."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        assert isinstance(app.screen, MainMenuScreen)
-        menu = app.screen.query_one("#main-menu", ListView)
+        assert isinstance(app.screen, HomeScreen)
+        menu = app.screen.query_one("#home-nav", ListView)
         item_ids = [item.id for item in menu.query("ListItem")]
-        assert "menu-campaigns" in item_ids
-        assert "menu-quit" in item_ids
-        # First item is highlighted and the menu is focused, so Enter works on
+        assert "nav-campaigns" in item_ids
+        assert "nav-dashboard" in item_ids
+        # First item is highlighted and the nav is focused, so Enter works on
         # first launch with no manual selection.
         assert menu.index == 0
         assert menu.has_focus

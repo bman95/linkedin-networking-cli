@@ -94,6 +94,7 @@ class SettingsScreen(BaseScreen):
         self.load_settings()
 
     def action_refresh(self) -> None:
+        self.query_one("#settings-status", Static).update("Refreshing…")
         self.load_settings()
 
     def load_settings(self) -> None:
@@ -179,7 +180,7 @@ class SettingsScreen(BaseScreen):
 
         assert data is not None
         self._render_sections(data)
-        status.update("Read-only view. Press r to refresh, Esc to go back.")
+        status.update("Read-only view.")
 
     def _render_sections(self, data: SettingsData) -> None:
         self.query_one("#body-credentials", Static).update(
