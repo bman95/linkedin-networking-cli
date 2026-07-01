@@ -22,11 +22,7 @@ All ``Selector`` methods that touch a page are async and operate on an async
 Playwright ``Page``.
 """
 
-import sys
-from pathlib import Path
 from typing import List, Optional, Sequence
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from automation.diagnostics import capture_error_context
 from utils.logging import get_logger

@@ -19,11 +19,7 @@ from playwright.async_api import (
 )
 from dataclasses import dataclass
 
-import sys
-from pathlib import Path
 import psutil
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from database.models import Campaign, Contact
 from database.operations import DatabaseManager

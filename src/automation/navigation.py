@@ -64,13 +64,9 @@ All functions are async and operate on an async Playwright ``Page``.
 """
 
 import asyncio
-import sys
 import time
 import urllib.parse
-from pathlib import Path
 from typing import Awaitable, Callable, Dict, Optional, Tuple
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError

@@ -17,7 +17,6 @@ from pathlib import Path
 import asyncio
 import csv
 import os
-import sys
 
 # LinkedIn brand blue, used across the welcome banner
 BRAND_BLUE = "#0A66C2"
@@ -56,9 +55,6 @@ def _app_version() -> str:
         return _pkg_version("linkedin-networking-cli")
     except PackageNotFoundError:
         return "0.1.0"
-
-# Add src directory to path for imports
-sys.path.append(str(Path(__file__).parent / "src"))
 
 # Initialize logging system first
 from utils.logging import LoggerSetup, get_logger

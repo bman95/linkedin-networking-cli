@@ -5,9 +5,6 @@ from sqlalchemy import and_, or_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from pathlib import Path
 import json
-import sys
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
 from .models import Campaign, Contact, Analytics, Settings, DailyConnectionCount

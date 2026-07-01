@@ -7,12 +7,8 @@ All functions operate on an async Playwright ``Page`` and must be awaited.
 import asyncio
 import math
 import random
-import sys
 import time
 from collections import deque
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from automation import selectors as sel
 from utils.logging import get_logger

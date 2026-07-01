@@ -5,12 +5,8 @@ All functions operate on an async Playwright ``Page`` and must be awaited.
 """
 
 import re
-import sys
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
 

@@ -22,12 +22,9 @@ import asyncio
 import logging
 import os
 import re
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
 

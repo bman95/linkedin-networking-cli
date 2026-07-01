@@ -2,9 +2,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from zoneinfo import available_timezones, TZPATH
 import os
-import sys
-
-sys.path.append(str(Path(__file__).parent.parent))
 
 from utils.logging import get_logger
 
