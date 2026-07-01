@@ -1,71 +1,71 @@
 # LinkedIn Networking CLI - TODOs
 
-Este archivo contiene la lista de features, mejoras y detalles pendientes para futuras versiones.
+This file contains the list of features, improvements, and pending details for future versions.
 
 ---
 
-## 🚀 Próximas Features
+## 🚀 Upcoming Features
 
-### Filtros Avanzados de Búsqueda
+### Advanced Search Filters
 
 #### 1. Current Company Filter
-**Prioridad:** Alta
-**Descripción:** Permitir buscar personas que trabajan en empresas específicas.
+**Priority:** High
+**Description:** Allow searching for people who work at specific companies.
 
-**Implementación pendiente:**
-- Agregar campo `current_company_ids` al modelo Campaign
-- Crear UI para búsqueda de empresas
-- Opciones de implementación:
-  - **A) Input manual:** Usuario busca en LinkedIn y copia el ID de empresa del URL
-  - **B) Búsqueda integrada:** Usar typeahead API de LinkedIn para buscar empresas
-  - **C) Archivo de configuración:** Mantener lista de empresas comunes pre-configuradas
+**Pending implementation:**
+- Add `current_company_ids` field to the Campaign model
+- Build a UI for company search
+- Implementation options:
+  - **A) Manual input:** User searches on LinkedIn and copies the company ID from the URL
+  - **B) Integrated search:** Use LinkedIn's typeahead API to search companies
+  - **C) Configuration file:** Keep a pre-configured list of common companies
 
-**Formato URL:** `currentCompany=["1441","1586","1035"]` (múltiples IDs)
+**URL format:** `currentCompany=["1441","1586","1035"]` (multiple IDs)
 
-**Ejemplo de uso:**
-- Buscar empleados de Google, Meta, Apple
+**Usage example:**
+- Search for employees of Google, Meta, Apple
 - IDs: Google="1441", Meta="1586", Apple="162479"
 
 ---
 
 #### 2. School/University Filter
-**Prioridad:** Media
-**Descripción:** Filtrar por alumni de universidades específicas.
+**Priority:** Medium
+**Description:** Filter by alumni of specific universities.
 
-**Implementación pendiente:**
-- Agregar campo `school_ids` al modelo Campaign
-- Crear UI para selección de universidades
-- Formato: `schoolFilter=["166622","1792","12297"]`
+**Pending implementation:**
+- Add `school_ids` field to the Campaign model
+- Build a UI for university selection
+- Format: `schoolFilter=["166622","1792","12297"]`
 
 **Use cases:**
-- Recruiting de alumni de Stanford, MIT, Harvard
-- Networking con personas de misma universidad
+- Recruiting alumni from Stanford, MIT, Harvard
+- Networking with people from the same university
 
 ---
 
 #### 3. Past Company Filter
-**Prioridad:** Media
-**Descripción:** Buscar personas que trabajaron anteriormente en ciertas empresas.
+**Priority:** Medium
+**Description:** Search for people who previously worked at certain companies.
 
-**Implementación pendiente:**
-- Agregar campo `past_company_ids` al modelo Campaign
-- Similar a current_company pero para empleos anteriores
-- Formato: `pastCompany=["1035","1441","1586"]`
+**Pending implementation:**
+- Add `past_company_ids` field to the Campaign model
+- Similar to current_company but for previous jobs
+- Format: `pastCompany=["1035","1441","1586"]`
 
 **Use cases:**
-- Ex-empleados de FAANG companies
-- Alumni de startups específicas
+- Ex-employees of FAANG companies
+- Alumni of specific startups
 
 ---
 
 #### 4. Profile Language Filter
-**Prioridad:** Baja
-**Descripción:** Filtrar perfiles por idioma.
+**Priority:** Low
+**Description:** Filter profiles by language.
 
-**Implementación pendiente:**
-- Agregar campo `profile_language` al modelo Campaign
+**Pending implementation:**
+- Add `profile_language` field to the Campaign model
 - Simple dropdown: English, Spanish, French, German, etc.
-- Formato: `profileLanguage=["en"]`
+- Format: `profileLanguage=["en"]`
 
 **Mapping:**
 ```python
@@ -83,73 +83,73 @@ LANGUAGE_OPTIONS = {
 ---
 
 #### 5. Service Category Filter
-**Prioridad:** Baja
-**Descripción:** Filtrar por categorías de servicio (para freelancers/consultores).
+**Priority:** Low
+**Description:** Filter by service categories (for freelancers/consultants).
 
-**Implementación pendiente:**
-- Agregar campo `service_category_ids` al modelo Campaign
-- Formato: `serviceCategory=["220"]`
-- Investigar IDs de categorías disponibles
+**Pending implementation:**
+- Add `service_category_ids` field to the Campaign model
+- Format: `serviceCategory=["220"]`
+- Research the available category IDs
 
 ---
 
 #### 6. Follower Of Filter
-**Prioridad:** Baja
-**Descripción:** Buscar seguidores de un perfil específico.
+**Priority:** Low
+**Description:** Search for followers of a specific profile.
 
-**Implementación pendiente:**
-- Agregar campo `follower_of_urn` al modelo Campaign
-- Formato: `followerOf=["ACoAACAX-bAB9B1BSm-SWFPe6HY5wzjtcMO06gE"]`
-- Necesita URN del perfil objetivo
+**Pending implementation:**
+- Add `follower_of_urn` field to the Campaign model
+- Format: `followerOf=["ACoAACAX-bAB9B1BSm-SWFPe6HY5wzjtcMO06gE"]`
+- Requires the URN of the target profile
 
 ---
 
-## 🔍 Investigación Necesaria
+## 🔍 Research Needed
 
 ### LinkedIn Location IDs (geoUrn)
 
-**Status:** ✅ IMPLEMENTADO - Solución Híbrida
+**Status:** ✅ IMPLEMENTED - Hybrid Solution
 
-**Implementación actual:**
-- ✅ Lista curada con ~75+ ciudades importantes de todo el mundo
-- ✅ Opción "Other" para ingresar códigos personalizados manualmente
-- ✅ Función `LinkedInAutomation.search_location()` para búsqueda dinámica (backend)
+**Current implementation:**
+- ✅ Curated list with ~75+ major cities worldwide
+- ✅ "Other" option to enter custom codes manually
+- ✅ `LinkedInAutomation.search_location()` function for dynamic search (backend)
 
-**Códigos verificados:**
+**Verified codes:**
 - San Francisco Bay Area: `90000084` ✅
 - Greater Boston Area: `105646813` ✅
 - United States: `103644278` ✅
 
-**Códigos en lista (pendientes de verificación manual):**
-- ~75 ciudades importantes en US, Canadá, Europa, Asia-Pacífico, Latinoamérica
-- Ver lista completa en `src/automation/linkedin_mappings.py`
+**Codes in the list (pending manual verification):**
+- ~75 major cities across the US, Canada, Europe, Asia-Pacific, Latin America
+- See the full list in `src/automation/linkedin_mappings.py`
 
-**Cómo usar:**
-1. **Opción A - Lista curada**: Seleccionar de la lista expandida en UI
-2. **Opción B - Manual**: Seleccionar "Other" e ingresar geoUrn personalizado
-3. **Opción C - Dinámica (futuro)**: Búsqueda en tiempo real via Voyager API
+**How to use:**
+1. **Option A - Curated list**: Select from the expanded list in the UI
+2. **Option B - Manual**: Select "Other" and enter a custom geoUrn
+3. **Option C - Dynamic (future)**: Real-time search via the Voyager API
 
 ---
 
-### 🔮 Búsqueda Dinámica de Ubicaciones (Fase Futura)
+### 🔮 Dynamic Location Search (Future Phase)
 
-**Status:** Backend implementado, UI pendiente
-**Prioridad:** Media
+**Status:** Backend implemented, UI pending
+**Priority:** Medium
 
-**Backend ya disponible:**
+**Backend already available:**
 ```python
-# En src/automation/linkedin.py
+# In src/automation/linkedin.py
 async def search_location(query: str) -> List[Dict[str, str]]:
-    """Búsqueda dinámica usando Voyager API"""
+    """Dynamic search using the Voyager API"""
     # Returns: [{"name": "San Francisco Bay Area", "geoUrn": "90000084"}]
 ```
 
-**Implementación pendiente:**
-- Hacer la UI de creación de campaña async
-- Agregar búsqueda con autocompletado en tiempo real
-- Requerir autenticación previa antes de crear campaña
+**Pending implementation:**
+- Make the campaign-creation UI async
+- Add real-time autocomplete search
+- Require prior authentication before creating a campaign
 
-**API Endpoint usado:**
+**API endpoint used:**
 ```
 GET /voyager/api/typeahead/hitsV2?
     keywords={query}&
@@ -159,50 +159,50 @@ GET /voyager/api/typeahead/hitsV2?
     type=GEO
 ```
 
-**Ventajas:**
-- Acceso a TODAS las ubicaciones de LinkedIn (no solo lista curada)
-- Datos siempre actualizados
-- Búsqueda typo-tolerant
+**Advantages:**
+- Access to ALL LinkedIn locations (not just the curated list)
+- Always up-to-date data
+- Typo-tolerant search
 
-**Desventajas:**
-- Requiere sesión autenticada
-- UI más compleja
-- Latencia de red
+**Disadvantages:**
+- Requires an authenticated session
+- More complex UI
+- Network latency
 
-**Decisión de implementación futura:** Agregar como modo avanzado opcional
+**Future implementation decision:** Add as an optional advanced mode
 
 ---
 
 ### LinkedIn Industry IDs
 
-**Status:** Investigación inicial
-**Códigos parciales:**
+**Status:** Initial research
+**Partial codes:**
 - Computer Software: `1594` ✅
 - Internet: `6` ✅
 - Technology: `4` ❓
 
-**Pendiente:**
-- Obtener lista completa de IDs de industrias
-- Verificar cada código con búsquedas reales
-- Recursos: LinkedIn API docs, reverse engineering de búsquedas
+**Pending:**
+- Obtain the full list of industry IDs
+- Verify each code against real searches
+- Resources: LinkedIn API docs, reverse engineering of searches
 
 ---
 
 ### LinkedIn Company/School IDs
 
-**Status:** Sin implementar
+**Status:** Not implemented
 
-**Cómo obtener IDs:**
+**How to obtain IDs:**
 1. **Manual:**
-   - Buscar empresa/universidad en LinkedIn
-   - Ver URL del perfil: `/company/1441/` → ID es `1441`
+   - Search for the company/university on LinkedIn
+   - Look at the profile URL: `/company/1441/` → ID is `1441`
 
-2. **Programático:**
+2. **Programmatic:**
    - LinkedIn Typeahead API: `/voyager/api/typeahead/...`
-   - Requiere autenticación
-   - Implementar helper function
+   - Requires authentication
+   - Implement a helper function
 
-**Empresas comunes a pre-configurar:**
+**Common companies to pre-configure:**
 ```
 Google: 1441
 Meta: 1586
@@ -215,55 +215,55 @@ Tesla: 15564
 
 ---
 
-## 🎨 UX/UI Mejoras
+## 🎨 UX/UI Improvements
 
 ### Campaign Creation Flow
 
-**Opción 1: Flow lineal (actual)**
-- Simple, paso a paso
-- ✅ Fácil de entender
-- ❌ Puede ser largo con filtros avanzados
+**Option 1: Linear flow (current)**
+- Simple, step by step
+- ✅ Easy to understand
+- ❌ Can be long with advanced filters
 
-**Opción 2: Flow con secciones**
+**Option 2: Sectioned flow**
 ```
 1. Basic Info (name, description)
 2. Core Filters (keywords, location, industry, network)
 3. Advanced Filters? (Yes/No)
-   └─ Si Yes → mostrar filtros avanzados
+   └─ If Yes → show advanced filters
 4. Settings (daily limit, message)
 5. Review & Create
 ```
 
-**Opción 3: Interactive form**
-- Un solo formulario con todas las opciones
-- Filtros avanzados colapsados
-- Más rápido pero más complejo
+**Option 3: Interactive form**
+- A single form with all options
+- Advanced filters collapsed
+- Faster but more complex
 
-**Decisión pendiente:** Feedback del usuario
+**Pending decision:** User feedback
 
 ---
 
 ### Campaign Editing
 
-**Status:** ✅ IMPLEMENTADO (CRUD básico)
-**Prioridad:** Alta
+**Status:** ✅ IMPLEMENTED (basic CRUD)
+**Priority:** High
 
-Implementado en "Manage Campaigns" (cableado a SQLite vía `DatabaseManager`):
-- ✅ Editar nombre, descripción, daily limit y message template
-- ✅ Pausar/reanudar campañas (toggle active/inactive)
-- ✅ Eliminar campaña y sus contactos asociados
+Implemented in "Manage Campaigns" (wired to SQLite via `DatabaseManager`):
+- ✅ Edit name, description, daily limit, and message template
+- ✅ Pause/resume campaigns (toggle active/inactive)
+- ✅ Delete a campaign and its associated contacts
 
-**Pendiente (futuro):**
-- Editar filtros de targeting (keywords/location/industry) sin recrear la campaña
+**Pending (future):**
+- Edit targeting filters (keywords/location/industry) without recreating the campaign
 
 ---
 
 ### Campaign Templates
 
 **Status:** Idea
-**Prioridad:** Media
+**Priority:** Medium
 
-Guardar configuraciones comunes como templates:
+Save common configurations as templates:
 - "FAANG Recruiters"
 - "Local Startup Founders"
 - "Remote Developers"
@@ -271,58 +271,58 @@ Guardar configuraciones comunes como templates:
 
 ---
 
-## 🐛 Bugs Conocidos
+## 🐛 Known Bugs
 
-### 1. Location Filter No Funciona
-**Status:** ✅ RESUELTO en Fase 1
-**Problema:** Enviaba texto en lugar de geoUrn numérico
-**Solución:** Implementado mapeo de ubicaciones
+### 1. Location Filter Not Working
+**Status:** ✅ RESOLVED in Phase 1
+**Problem:** Sent text instead of the numeric geoUrn
+**Solution:** Implemented location mapping
 
 ---
 
-### 2. Search URL Incorrecto
-**Status:** ✅ RESUELTO en Fase 1
-**Problema:** Usaba `/search/people/` en lugar de `/search/results/people/`
-**Solución:** Corregido en linkedin.py
+### 2. Incorrect Search URL
+**Status:** ✅ RESOLVED in Phase 1
+**Problem:** Used `/search/people/` instead of `/search/results/people/`
+**Solution:** Fixed in linkedin.py
 
 ---
 
 ## 📊 Analytics & Reporting
 
-### Dashboard Mejorado
-- Gráficos de acceptance rate por campaña
-- Timeline de conexiones enviadas
-- Heatmap de mejores días/horas
-- A/B testing de message templates
+### Improved Dashboard
+- Acceptance-rate charts per campaign
+- Timeline of sent connections
+- Heatmap of best days/hours
+- A/B testing of message templates
 
 ### Export Features
-- Exportar contactos a CSV
-- Integración con CRM (HubSpot, Salesforce)
+- Export contacts to CSV
+- CRM integration (HubSpot, Salesforce)
 - Webhook notifications
 
 ---
 
-## 🔒 Seguridad & Rate Limiting
+## 🔒 Security & Rate Limiting
 
 ### LinkedIn Detection Avoidance
-- Random delays entre acciones (✅ ya implementado)
-- Respetar daily limits (✅ ya implementado)
+- Random delays between actions (✅ already implemented)
+- Respect daily limits (✅ already implemented)
 - Human-like browsing patterns
-- Session management (✅ ya implementado)
+- Session management (✅ already implemented)
 
-### Mejoras pendientes:
-- Detectar CAPTCHAs y pausar
-- Notificaciones si cuenta está restringida
-- Backoff automático si hay errores
+### Pending improvements:
+- Detect CAPTCHAs and pause
+- Notifications if the account is restricted
+- Automatic backoff on errors
 
 ---
 
 ## 🧪 Testing
 
 ### Unit Tests
-- Tests para URL builder
-- Tests para mappings
-- Tests para database operations
+- Tests for the URL builder
+- Tests for mappings
+- Tests for database operations
 
 ### Integration Tests
 - End-to-end campaign flow
@@ -330,47 +330,47 @@ Guardar configuraciones comunes como templates:
 - Error handling
 
 ### Manual Testing Checklist
-- [ ] Crear campaña con todos los filtros
-- [ ] Verificar URL generada
-- [ ] Ejecutar búsqueda real en LinkedIn
-- [ ] Verificar resultados match con filtros
-- [ ] Probar con diferentes combinaciones
+- [ ] Create a campaign with all filters
+- [ ] Verify the generated URL
+- [ ] Run a real search on LinkedIn
+- [ ] Verify results match the filters
+- [ ] Test with different combinations
 
 ---
 
-## 📝 Documentación
+## 📝 Documentation
 
 ### User Guide
-- Guía de inicio rápido
-- Cómo encontrar geoUrn codes
-- Cómo encontrar company/school IDs
-- Best practices para mensajes
-- Tips para evitar restricciones
+- Quick-start guide
+- How to find geoUrn codes
+- How to find company/school IDs
+- Best practices for messages
+- Tips to avoid restrictions
 
 ### Developer Guide
-- Arquitectura del proyecto
-- Cómo agregar nuevos filtros
-- Cómo extender mappings
-- API de LinkedIn (no oficial)
+- Project architecture
+- How to add new filters
+- How to extend mappings
+- LinkedIn API (unofficial)
 
 ---
 
-## 🌐 Internacionalización
+## 🌐 Internationalization
 
 ### Multi-language Support
-- UI en español
-- UI en otros idiomas
-- Message templates localizados
+- UI in Spanish
+- UI in other languages
+- Localized message templates
 
 ---
 
 ## 🚀 Performance
 
-### Optimizaciones
-- Caché de búsquedas
-- Batch processing de conexiones
-- Async operations (✅ ya implementado)
-- Database indexing (✅ ya implementado)
+### Optimizations
+- Search caching
+- Batch processing of connections
+- Async operations (✅ already implemented)
+- Database indexing (✅ already implemented)
 
 ---
 
@@ -379,7 +379,7 @@ Guardar configuraciones comunes como templates:
 ### Packaging
 - PyPI package
 - Docker container
-- Executables standalone (PyInstaller)
+- Standalone executables (PyInstaller)
 
 ### Distribution
 - Homebrew formula (macOS)
@@ -388,50 +388,50 @@ Guardar configuraciones comunes como templates:
 
 ---
 
-**Última actualización:** 2026-06-10
-**Versión actual:** 0.1.0
-**Próxima versión planeada:** 0.2.0 (Fase 1 completada)
+**Last updated:** 2026-06-10
+**Current version:** 0.1.0
+**Next planned version:** 0.2.0 (Phase 1 completed)
 
 ---
 
-## ✅ Completado en esta iteración
+## ✅ Completed in this iteration
 
-- Cableado de "Manage Campaigns" a la base de datos: toggle activar/desactivar, editar y eliminar
-  campaña — antes eran stubs que solo imprimían "In real app: Would...".
-- `edit_campaign` ahora también edita los **filtros de targeting** (keywords, ubicación,
-  industria, grado de conexión), no solo nombre/límite/plantilla.
-- Nuevo **export de contactos a CSV** por campaña (Manage Campaigns → "Export contacts to CSV").
-- Nueva utilidad **"Look up location code (online)"** en Settings: usa la Voyager API
-  (`search_location`) para encontrar geoUrn de cualquier ubicación, autenticando la sesión.
-- **Conversión async crítica:** `interactions.py` y `scraping.py` estaban escritos en estilo
-  síncrono sobre una página async, así que la detección de CAPTCHA/límites y la extracción de
-  perfiles/contactos nunca funcionaban. Convertidos a async/await y actualizados los call sites
-  en `linkedin.py` y `checker.py`.
-- Corregido `record_daily_analytics`: `DetachedInstanceError` al actualizar (faltaba `refresh`).
-- Corregidos IDs duplicados en mappings: `LOCATION_CHOICES` (Atlanta/Phoenix) e `INDUSTRY_CHOICES`
+- Wired "Manage Campaigns" to the database: toggle activate/deactivate, edit, and delete
+  a campaign — previously these were stubs that only printed "In real app: Would...".
+- `edit_campaign` now also edits the **targeting filters** (keywords, location,
+  industry, connection degree), not just name/limit/template.
+- New **contact export to CSV** per campaign (Manage Campaigns → "Export contacts to CSV").
+- New **"Look up location code (online)"** utility in Settings: uses the Voyager API
+  (`search_location`) to find the geoUrn of any location, authenticating the session.
+- **Critical async conversion:** `interactions.py` and `scraping.py` were written in a
+  synchronous style over an async page, so CAPTCHA/limit detection and profile/contact
+  extraction never worked. Converted to async/await and updated the call sites in
+  `linkedin.py` and `checker.py`.
+- Fixed `record_daily_analytics`: `DetachedInstanceError` on update (missing `refresh`).
+- Fixed duplicate IDs in mappings: `LOCATION_CHOICES` (Atlanta/Phoenix) and `INDUSTRY_CHOICES`
   (Design).
-- Actualizados los tests de login al esquema de detección por URL.
-- Añadidos tests para `interactions` y `scraping` (cobertura de esos módulos 15%/0% → 46%/31%).
-- Añadidos **CI** (GitHub Actions: `uv sync` + `pytest`), **Dockerfile** y `.dockerignore`.
-- README reescrito (sin mojibake, con disclaimer de ToS, export CSV, Docker, testing).
-- Eliminado el "File Editor Demo" (andamiaje ajeno al producto).
-- Suite de tests en verde: **269 passed**.
+- Updated the login tests to the URL-based detection scheme.
+- Added tests for `interactions` and `scraping` (coverage of those modules 15%/0% → 46%/31%).
+- Added **CI** (GitHub Actions: `uv sync` + `pytest`), a **Dockerfile**, and `.dockerignore`.
+- Rewrote the README (no mojibake, with a ToS disclaimer, CSV export, Docker, testing).
+- Removed the "File Editor Demo" (scaffolding unrelated to the product).
+- Test suite green: **269 passed**.
 
-### Completado (segunda tanda de pendientes)
-- **Búsqueda dinámica de ubicaciones integrada en el flujo de creación Y edición** de campañas
-  (opción "🔎 Search location online"), además de la utilidad en Settings. Helper compartido
+### Completed (second batch of pending items)
+- **Dynamic location search integrated into the campaign creation AND editing flow**
+  ("🔎 Search location online" option), in addition to the utility in Settings. Shared helper
   `_run_location_search` / `_search_location_online`.
-- **Backoff exponencial ante cuenta restringida** en `send_connection_requests`: se detiene ante
-  CAPTCHA o límite semanal de invitaciones y aplica backoff exponencial (5s→…→300s) tras fallos
-  consecutivos.
-- **Cobertura subida**: `session.py` 0%→97%, `checker.py` 0%→41% (tests nuevos). Total 49%→58%,
+- **Exponential backoff on a restricted account** in `send_connection_requests`: it stops on a
+  CAPTCHA or the weekly invitation limit and applies exponential backoff (5s→…→300s) after
+  consecutive failures.
+- **Coverage raised**: `session.py` 0%→97%, `checker.py` 0%→41% (new tests). Total 49%→58%,
   **294 tests**.
-- **Packaging a PyPI**: añadido `[build-system]` (hatchling) + metadata (license, classifiers,
-  keywords, urls); `uv build` genera wheel/sdist y el wheel instala e importa correctamente en un
-  entorno Python 3.13 limpio (entry point `linkedin-cli` funcional).
+- **Packaging to PyPI**: added `[build-system]` (hatchling) + metadata (license, classifiers,
+  keywords, urls); `uv build` generates the wheel/sdist and the wheel installs and imports
+  correctly in a clean Python 3.13 environment (the `linkedin-cli` entry point works).
 
-### Pendiente real (requiere cuenta de LinkedIn / fuera de este entorno)
-- Verificar los geoUrn/industry IDs marcados con `❓` contra búsquedas reales (mitigado: usar el
-  lookup online integrado o geoUrn custom; los `❓` están claramente marcados como no verificados).
-- Tests de integración end-to-end contra LinkedIn real (login, search, send) — requieren credenciales
-  y navegador; el resto de la lógica ya está cubierta con mocks.
+### Actually pending (requires a LinkedIn account / outside this environment)
+- Verify the geoUrn/industry IDs marked with `❓` against real searches (mitigated: use the
+  integrated online lookup or a custom geoUrn; the `❓` ones are clearly marked as unverified).
+- End-to-end integration tests against the real LinkedIn (login, search, send) — these require
+  credentials and a browser; the rest of the logic is already covered with mocks.
