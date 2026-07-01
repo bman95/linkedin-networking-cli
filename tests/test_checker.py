@@ -43,6 +43,26 @@ def _automation(authenticated=True, pending=None, contact=None, is_connected=Tru
     return automation
 
 
+def _profile_el(href):
+    """A connection card's inner profile element exposing an href."""
+    profile = AsyncMock()
+    profile.get_attribute = AsyncMock(return_value=href)
+    return profile
+
+
+def _connection_el(href):
+    """A single connections-list element wrapping a profile with `href`."""
+    conn = AsyncMock()
+    conn.query_selector = AsyncMock(return_value=_profile_el(href))
+    return conn
+
+
+def _set_limit(automation, limit):
+    """Wire `_get_connection_limit`'s session query to return `limit`."""
+    session = automation.db_manager.get_session.return_value.__enter__.return_value
+    session.exec.return_value.first.return_value = limit
+
+
 @pytest.mark.unit
 class TestCleanProfileUrl:
     def test_strips_query_and_fragment(self):
@@ -157,3 +177,184 @@ class TestMonitor:
         # No pending connections -> stops after the first iteration.
         assert result["iterations"] == 1
         assert result["total_newly_accepted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_handles_campaign_error(self, monkeypatch):
+        """A per-campaign failure is caught; the run continues, then stops."""
+        automation = _automation(pending=[])
+        monkeypatch.setattr(
+            "automation.checker.smart_connection_checker",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        )
+        result = await monitor_pending_connections(
+            automation, [1], check_interval_minutes=0, max_iterations=2,
+            progress_callback=lambda m: None,
+        )
+        # The error leaves checked at 0, so monitoring stops after iteration 1.
+        assert result["iterations"] == 1
+
+    @pytest.mark.asyncio
+    async def test_waits_between_iterations(self, monkeypatch):
+        """With acceptances still flowing, it waits between iterations."""
+        automation = _automation(pending=[])
+        monkeypatch.setattr(
+            "automation.checker.smart_connection_checker",
+            AsyncMock(return_value={"checked": 1, "newly_accepted": 0, "updated": 0}),
+        )
+        result = await monitor_pending_connections(
+            automation, [1], check_interval_minutes=0, max_iterations=2
+        )
+        assert result["iterations"] == 2
+        # It waited between iteration 1 and 2 (the last iteration doesn't wait).
+        automation.page.wait_for_timeout.assert_awaited()
+
+
+@pytest.mark.unit
+class TestCleanProfileUrlFragmentOnly:
+    def test_strips_fragment_without_query(self):
+        # No "?" in the URL, so the fragment ("#") branch runs.
+        assert _clean_profile_url(
+            "https://www.linkedin.com/in/jane#about"
+        ) == "https://www.linkedin.com/in/jane/"
+
+
+@pytest.mark.unit
+class TestSmartCheckerWalk:
+    @pytest.fixture(autouse=True)
+    def _fast_random(self, monkeypatch):
+        # Keep the humanized scroll/keyboard loops tiny and deterministic.
+        monkeypatch.setattr("automation.checker.random.randint", lambda a, b: a)
+
+    @pytest.mark.asyncio
+    async def test_walk_with_no_connection_cards_returns_zeros(self):
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(return_value=[])
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=lambda m: None
+        )
+        assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
+        automation.page.goto.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_walk_marks_accepted_and_enriches_contact(self, monkeypatch):
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(id=7, name="Jane", status="sent", profile_url=url)
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        # A "Recently added" element to focus, then one matching connection card
+        # whose href carries tracking params (must be normalized to match).
+        recent = AsyncMock()
+        automation.page.query_selector = AsyncMock(return_value=recent)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url + "?trk=foo")]
+        )
+        automation.context.new_page = AsyncMock(return_value=AsyncMock())
+        monkeypatch.setattr(
+            "automation.checker.get_contact_info",
+            AsyncMock(return_value={
+                "email": "j@x.com", "phone": "555", "address": "NYC",
+            }),
+        )
+        result = await smart_connection_checker(automation, 1)
+        assert result == {"checked": 1, "newly_accepted": 1, "updated": 1}
+        recent.focus.assert_awaited()
+        contact_id, update = automation.db_manager.update_contact.call_args[0]
+        assert contact_id == 7
+        assert update["status"] == "accepted"
+        assert update["email"] == "j@x.com"
+        assert update["phone"] == "555"
+        assert "NYC" in update["notes"]
+
+    @pytest.mark.asyncio
+    async def test_walk_stops_at_connection_limit(self):
+        limit_url = "https://www.linkedin.com/in/bob/"
+        limit = SimpleNamespace(name="Bob", profile_url=limit_url)
+        pending = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[pending])
+        _set_limit(automation, limit)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        # The limit marker appears in the list; the walk must stop at it.
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(limit_url)]
+        )
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=lambda m: None
+        )
+        # Bob is the stop marker, not a pending contact -> nothing accepted.
+        assert result["checked"] == 0
+        assert result["newly_accepted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_walk_handles_navigation_error(self):
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        automation.page.goto = AsyncMock(side_effect=RuntimeError("nav boom"))
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=lambda m: None
+        )
+        assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
+
+    @pytest.mark.asyncio
+    async def test_update_swallows_enrichment_error(self):
+        """A failure while enriching the accepted contact is caught, not raised."""
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(
+            id=9, name="Jane", status="possibly_sent", profile_url=url,
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url)]
+        )
+        automation.context.new_page = AsyncMock(side_effect=RuntimeError("no page"))
+        result = await smart_connection_checker(automation, 1)
+        # The card matched (counted) but enrichment failed, so no DB update.
+        assert result["checked"] == 1
+        automation.db_manager.update_contact.assert_not_called()
+
+
+@pytest.mark.unit
+class TestCheckSpecificContactsRich:
+    @pytest.mark.asyncio
+    async def test_collects_contact_info_and_reports(self, monkeypatch):
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/",
+        )
+        automation = _automation(contact=contact, is_connected=True)
+        monkeypatch.setattr(
+            "automation.checker.get_contact_info",
+            AsyncMock(return_value={"email": "j@x.com", "phone": "555"}),
+        )
+        messages = []
+        stats = await check_specific_contacts(
+            automation, [1], progress_callback=messages.append
+        )
+        assert stats["newly_accepted"] == 1
+        update = automation.db_manager.update_contact.call_args[0][1]
+        assert update["email"] == "j@x.com"
+        assert update["phone"] == "555"
+        assert any("accepted" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_navigation_error_counts_as_failed(self):
+        contact = SimpleNamespace(
+            id=2, name="Bob", status="sent", profile_url="https://x/in/bob/",
+        )
+        automation = _automation(contact=contact)
+        automation.page.goto = AsyncMock(side_effect=RuntimeError("boom"))
+        stats = await check_specific_contacts(automation, [2])
+        assert stats["failed"] == 1
+        assert stats["checked"] == 0
