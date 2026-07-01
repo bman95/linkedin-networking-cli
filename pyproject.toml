@@ -67,6 +67,7 @@ addopts = [
     "-v",
     "--strict-markers",
     "--cov=src",
+    "--cov=linkedin_cli",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
@@ -78,7 +79,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src"]
+source = ["src", "linkedin_cli"]
 omit = [
     "*/tests/*",
     "*/__init__.py",

@@ -67,6 +67,7 @@ from database.models import Campaign
 from config.settings import AppSettings
 from automation.linkedin import LinkedInAutomation
 from automation.diagnostics import _artifacts_dir
+from cli.helpers import campaign_get_field, csv_value, mask_email
 from exceptions import (
     LinkedInAutomationError,
     CaptchaDetectedException,
@@ -108,10 +109,12 @@ class LinkedInCLI:
 
     @staticmethod
     def _campaign_get_field(campaign, attr, default=None):
-        """Read campaign attribute regardless of backing type"""
-        if isinstance(campaign, dict):
-            return campaign.get(attr, default)
-        return getattr(campaign, attr, default)
+        """Read campaign attribute regardless of backing type.
+
+        Delegates to :func:`cli.helpers.campaign_get_field`; kept as a static
+        method so existing call sites and the class surface are unchanged.
+        """
+        return campaign_get_field(campaign, attr, default)
 
     @staticmethod
     def _format_evidence_reference(exc=None):
@@ -870,12 +873,11 @@ class LinkedInCLI:
 
     @staticmethod
     def _csv_value(value):
-        """Normalize a value for CSV output."""
-        if value is None:
-            return ""
-        if isinstance(value, datetime):
-            return value.isoformat()
-        return str(value)
+        """Normalize a value for CSV output.
+
+        Delegates to :func:`cli.helpers.csv_value`.
+        """
+        return csv_value(value)
 
     def view_campaign_details(self, campaign):
         """View detailed campaign information"""
@@ -1100,14 +1102,11 @@ class LinkedInCLI:
 
     @staticmethod
     def _mask_email(email):
-        """Mask an email for display, e.g. 'joh***@example.com'."""
-        if not email:
-            return "Not set"
-        if "@" in email:
-            local, domain = email.split("@", 1)
-            prefix = local[:3] if len(local) >= 3 else local
-            return f"{prefix}***@{domain}"
-        return f"{email[:3]}***"
+        """Mask an email for display, e.g. 'joh***@example.com'.
+
+        Delegates to :func:`cli.helpers.mask_email`.
+        """
+        return mask_email(email)
 
     def show_credentials_settings(self):
         """Show real LinkedIn credential status from the environment."""
