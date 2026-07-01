@@ -103,14 +103,16 @@ DataTable > .datatable--even-row {
 
 #home-mascot {
     width: auto;
-    text-style: bold;
+    /* No bold: synthetic-bold doubles the block glyphs (offset + subpixel-AA
+     * colour fringing). The sprite's solid fills need no weight. */
+    text-style: none;
     padding: 0 3 0 0;
 }
 
 #home-heading {
     width: 1fr;
     height: auto;
-    /* Nudge the text block down so it sits centred against the 6-row mascot. */
+    /* Nudge the heading down so it sits a touch below the mascot's top edge. */
     padding: 1 0 0 0;
 }
 

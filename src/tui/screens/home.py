@@ -35,6 +35,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from utils.logging import get_logger
 
+from ._mascot import MASCOT
 from .base import hint_markup
 from .campaigns import CampaignsScreen
 from .check_connections import CheckConnectionsScreen
@@ -50,33 +51,15 @@ logger = get_logger(__name__)
 # and revealed in the accent colour on the highlighted one.
 POINTER = "❯"
 
-# The mascot: "Bit", a pixel robot that carries both identities — a head with
-# binary 0/1 eyes (the app is a LinkedIn *bot* given a digital "bit" identity)
-# over a torso whose chest says "in" (the LinkedIn mark). Brand-blue body, accent
-# antenna / eyes / "in". Drawn with half-block characters; coloured via theme
-# tokens (markup is static, no injection risk). The compact `in 01` chip in the
-# sub-screen breadcrumb echoes the same in + 0/1 motif.
-MASCOT = (
-    "[$secondary]    ▟▙[/]\n"
-    "[$primary]  ▟█████▙[/]\n"
-    "[$primary]  █ [/][$secondary]0[/][$primary] [/][$secondary]1[/][$primary] █[/]\n"
-    "[$primary]  █  ◡  █[/]\n"
-    "[$primary]  ▟█████▙[/]\n"
-    "[$primary]  █ [/][$secondary]in[/][$primary]  █[/]\n"
-    "[$primary]  ▜█████▛[/]\n"
-    "[$primary]   ▝   ▝[/]"
-)
-
-# Plan B: the head-only variant (0/1 eyes + antenna, no "in" torso). Kept as the
-# documented fallback — to switch, render this instead of MASCOT in compose().
-MASCOT_PLAN_B = (
-    "[$secondary]    ▟▙[/]\n"
-    "[$primary]  ▟█████▙[/]\n"
-    "[$primary]  █ [/][$secondary]0[/][$primary] [/][$secondary]1[/][$primary] █[/]\n"
-    "[$primary]  █  ◡  █[/]\n"
-    "[$primary]  ▜█████▛[/]\n"
-    "[$primary]   ▝   ▝[/]"
-)
+# The mascot — "Bit", the LinkedIn-blue robot — is a faithful half-block
+# rendering of the reference sprite, generated into ``_mascot.py`` (see its
+# docstring). Imported rather than inlined to keep this module readable.
+#
+# (Real inline-image rendering — painting the bitmap via the Kitty/Sixel graphics
+# protocol for true image sharpness — was investigated and rejected: Warp, the
+# target terminal, does not implement the Unicode-placeholder placement a Textual
+# TUI needs, so it renders placeholder garbage instead of the image. Half-block
+# art is therefore the sharpest portable option.)
 
 HINTS = (
     ("1-7 ↑↓", "navigate"),

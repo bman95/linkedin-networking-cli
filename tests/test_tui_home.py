@@ -69,14 +69,14 @@ async def test_home_summary_degraded_without_db(
 
 @pytest.mark.unit
 async def test_home_shows_mascot(db_manager: DatabaseManager):
-    """The home hero renders the 'Bit' mascot carrying both brand identities."""
+    """The home hero renders the image-based 'Bit' mascot (half-block art)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         mascot = str(app.screen.query_one("#home-mascot", Static).render())
-        # Binary eyes (0/1) and the LinkedIn 'in' are both present in the art.
-        assert "0" in mascot and "1" in mascot
-        assert "in" in mascot
+        # Filled cells are the universal Block-Elements half blocks ``▀`` / ``█``.
+        assert any(ch in mascot for ch in "▀█")
+        assert mascot.strip()
 
 
 @pytest.mark.unit
