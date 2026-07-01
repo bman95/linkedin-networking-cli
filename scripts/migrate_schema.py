@@ -3,6 +3,8 @@
 Database Schema Migration - Add new columns to Campaign table
 ==============================================================
 
+One-off migration kept for reference; relocated from the repo root to scripts/.
+
 This script adds the new columns (geo_urn, location_display, industry_ids, etc.)
 to the existing Campaign table without losing data.
 

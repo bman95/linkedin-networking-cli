@@ -3,6 +3,8 @@
 Database Migration Script
 =========================
 
+One-off migration kept for reference; relocated from the repo root to scripts/.
+
 This script migrates existing campaigns from the old schema to the new schema.
 
 OLD SCHEMA:

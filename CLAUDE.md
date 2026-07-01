@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a LinkedIn networking automation CLI built with Python. The application uses Playwright for web automation, InquirerPy for the TUI interface, SQLModel for database operations, and includes both a main InquirerPy-based CLI and an experimental interactive CLI using prompt-toolkit.
+This is a LinkedIn networking automation CLI built with Python. The application uses Playwright for web automation, SQLModel for database operations, and ships two coexisting user interfaces: the main InquirerPy-based CLI (`linkedin_cli.py`) and a full-screen Textual TUI (`src/tui/`, entry point `linkedin-tui`).
 
 ## Essential Commands
 

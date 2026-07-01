@@ -199,10 +199,9 @@ terminal UI (its leaked design-system components were studied directly):
 This is the deliberate move away from the boxed-in, outline-everything look
 toward a calm, modern terminal surface.
 
-> Note: `src/styles.css` is a pre-existing **orphaned** stylesheet from an early
-> experiment (Buttons/Switches/forms that don't exist). It is referenced
-> nowhere. It is left untouched here (not our debt to remove) but should be
-> deleted in a later cleanup once nothing else references it.
+> Note: `src/styles.css` was a pre-existing **orphaned** stylesheet from an early
+> experiment (Buttons/Switches/forms that don't exist), referenced nowhere. It
+> has since been deleted in a cleanup pass.
 
 ### App shell — `src/tui/app.py` + `src/tui/screens/base.py`
 

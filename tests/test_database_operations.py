@@ -20,8 +20,12 @@ from database.models import Campaign, Contact, Analytics, Settings
 class TestDatabaseManagerInit:
     """Test DatabaseManager initialization."""
 
-    def test_init_with_default_path(self):
+    def test_init_with_default_path(self, tmp_path, monkeypatch):
         """Test initialization with default database path."""
+        # Run in a temp cwd so the default *relative* path creates the SQLite
+        # file there instead of leaving a stray linkedin_networking.db at the
+        # repo root (the Path assertion is cwd-independent).
+        monkeypatch.chdir(tmp_path)
         db_manager = DatabaseManager()
         assert db_manager.db_path == Path("linkedin_networking.db")
         assert db_manager.engine is not None
