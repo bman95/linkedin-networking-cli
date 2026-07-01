@@ -767,10 +767,20 @@ class TestGotoRetry:
         recovery — not transient-retry — engages.
         """
         page = _quiet_page()
+
+        def _hang_then_timeout(awaitable, *args, **kwargs):
+            # The production code eagerly builds the page.goto(...) coroutine and
+            # hands it to wait_for. Close it so it isn't left un-awaited (which
+            # would raise a spurious "coroutine was never awaited" RuntimeWarning
+            # at GC time), then simulate the outer watchdog firing.
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise asyncio.TimeoutError()
+
         # No recover callback: the crash-shaped error must propagate.
         with patch(
             "automation.navigation.asyncio.wait_for",
-            new=AsyncMock(side_effect=asyncio.TimeoutError()),
+            new=AsyncMock(side_effect=_hang_then_timeout),
         ):
             with pytest.raises(PWError) as excinfo:
                 await nav.navigate_guarded(

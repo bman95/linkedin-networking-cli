@@ -2490,9 +2490,17 @@ class TestNavigationGuardWiring:
     ):
         """The search goto is routed through navigate_guarded(strict_path=...)."""
         campaign = Campaign(name="Wiring", keywords="eng")
+        # navigate_guarded returns the page it finished on; search_profiles rebinds
+        # self.page to it, so the mock must hand the (properly-configured async)
+        # page back rather than a bare MagicMock — otherwise the downstream
+        # verify_listing_rendered await leaks an un-awaited coroutine.
         with patch(
-            "automation.linkedin.navigate_guarded", new=AsyncMock()
-        ) as guarded:
+            "automation.linkedin.navigate_guarded",
+            new=AsyncMock(side_effect=lambda page, *a, **k: page),
+        ) as guarded, patch.object(
+            mock_linkedin_automation, "_extract_profiles_new_ui",
+            new=AsyncMock(return_value=[]),
+        ):
             await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
         guarded.assert_awaited()
