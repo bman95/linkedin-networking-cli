@@ -8,6 +8,29 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer environment variable, tolerating malformed values.
+
+    Returns ``default`` when ``name`` is unset or holds a value that is not a
+    valid ``int`` (logging a warning in the malformed case). This keeps a typo
+    like ``DAILY_CONNECTION_LIMIT=twenty`` from crashing startup with an
+    unhandled ``ValueError``; the tunable simply degrades to its default.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid integer for %s=%r; falling back to default %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
 class AppSettings:
     """Application settings manager"""
 
@@ -199,19 +222,19 @@ class AppSettings:
     def get_automation_settings(self) -> Dict[str, Any]:
         """Get automation settings"""
         settings = {
-            "connection_delay_min": int(os.getenv("CONNECTION_DELAY_MIN", "2")),
-            "connection_delay_max": int(os.getenv("CONNECTION_DELAY_MAX", "5")),
-            "daily_connection_limit": int(os.getenv("DAILY_CONNECTION_LIMIT", "20")),
-            "connection_cooldown": int(os.getenv("CONNECTION_COOLDOWN", "0")),
-            "search_limit": int(os.getenv("SEARCH_LIMIT", "100")),
+            "connection_delay_min": _env_int("CONNECTION_DELAY_MIN", 2),
+            "connection_delay_max": _env_int("CONNECTION_DELAY_MAX", 5),
+            "daily_connection_limit": _env_int("DAILY_CONNECTION_LIMIT", 20),
+            "connection_cooldown": _env_int("CONNECTION_COOLDOWN", 0),
+            "search_limit": _env_int("SEARCH_LIMIT", 100),
             # Humanization tunables (issue #15). Typing is per-keystroke in ms;
             # action dwell is between major actions in seconds; the per-minute
             # cap throttles a sliding 60s window of actions.
-            "typing_delay_min": int(os.getenv("TYPING_DELAY_MIN", "50")),
-            "typing_delay_max": int(os.getenv("TYPING_DELAY_MAX", "150")),
-            "action_delay_min": int(os.getenv("ACTION_DELAY_MIN", "1")),
-            "action_delay_max": int(os.getenv("ACTION_DELAY_MAX", "4")),
-            "max_actions_per_minute": int(os.getenv("MAX_ACTIONS_PER_MINUTE", "20")),
+            "typing_delay_min": _env_int("TYPING_DELAY_MIN", 50),
+            "typing_delay_max": _env_int("TYPING_DELAY_MAX", 150),
+            "action_delay_min": _env_int("ACTION_DELAY_MIN", 1),
+            "action_delay_max": _env_int("ACTION_DELAY_MAX", 4),
+            "max_actions_per_minute": _env_int("MAX_ACTIONS_PER_MINUTE", 20),
         }
 
         logger.debug(
@@ -252,13 +275,11 @@ class AppSettings:
           this watchdog and a wedged unit is refreshed and skipped.
         """
         settings = {
-            "goto_timeout_ms": int(os.getenv("NAV_GOTO_TIMEOUT_MS", "30000")),
-            "max_retries": int(os.getenv("NAV_MAX_RETRIES", "2")),
-            "retry_backoff_base_s": int(os.getenv("NAV_RETRY_BACKOFF_BASE_S", "3")),
-            "hard_timeout_margin_s": int(os.getenv("NAV_HARD_TIMEOUT_MARGIN_S", "15")),
-            "interaction_watchdog_s": int(
-                os.getenv("NAV_INTERACTION_WATCHDOG_S", "240")
-            ),
+            "goto_timeout_ms": _env_int("NAV_GOTO_TIMEOUT_MS", 30000),
+            "max_retries": _env_int("NAV_MAX_RETRIES", 2),
+            "retry_backoff_base_s": _env_int("NAV_RETRY_BACKOFF_BASE_S", 3),
+            "hard_timeout_margin_s": _env_int("NAV_HARD_TIMEOUT_MARGIN_S", 15),
+            "interaction_watchdog_s": _env_int("NAV_INTERACTION_WATCHDOG_S", 240),
         }
 
         logger.debug(

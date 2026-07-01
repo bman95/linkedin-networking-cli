@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import available_timezones, TZPATH
 
-from config.settings import AppSettings
+from config.settings import AppSettings, _env_int
 
 
 def _zone_bytes(name):
@@ -632,6 +632,96 @@ class TestNavigationSettings:
 
 
 # ============================================================================
+# Env-var int parsing guard
+# ============================================================================
+
+@pytest.mark.unit
+class TestEnvIntHelper:
+    """`_env_int` tolerates malformed values instead of crashing startup."""
+
+    def test_valid_value_parsed(self, monkeypatch):
+        """A well-formed value is parsed to an int."""
+        monkeypatch.setenv("SOME_INT", "42")
+        assert _env_int("SOME_INT", 7) == 42
+
+    def test_missing_value_uses_default(self, monkeypatch):
+        """An unset variable returns the default (no warning)."""
+        monkeypatch.delenv("SOME_INT", raising=False)
+        assert _env_int("SOME_INT", 7) == 7
+
+    def test_malformed_value_falls_back_with_warning(self, monkeypatch, caplog):
+        """A malformed value returns the default and logs a warning."""
+        import logging
+
+        monkeypatch.setenv("SOME_INT", "twenty")
+        with caplog.at_level(logging.WARNING):
+            assert _env_int("SOME_INT", 7) == 7
+        assert any("SOME_INT" in rec.message for rec in caplog.records)
+
+    def test_empty_value_falls_back(self, monkeypatch):
+        """An empty string is malformed and degrades to the default."""
+        monkeypatch.setenv("SOME_INT", "")
+        assert _env_int("SOME_INT", 7) == 7
+
+    def test_whitespace_padded_value_parsed(self, monkeypatch):
+        """int() tolerates surrounding whitespace, so a padded value parses."""
+        monkeypatch.setenv("SOME_INT", "  5  ")
+        assert _env_int("SOME_INT", 7) == 5
+
+
+@pytest.mark.unit
+class TestAutomationSettingsGuardedParsing:
+    """Malformed automation env vars degrade to defaults (block 205-217)."""
+
+    def test_valid_value(self, monkeypatch):
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "35")
+        assert AppSettings().get_automation_settings()["daily_connection_limit"] == 35
+
+    def test_missing_value_uses_default(self, monkeypatch):
+        monkeypatch.delenv("DAILY_CONNECTION_LIMIT", raising=False)
+        assert AppSettings().get_automation_settings()["daily_connection_limit"] == 20
+
+    def test_malformed_value_falls_back_and_warns(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "twenty")
+        with caplog.at_level(logging.WARNING):
+            auto = AppSettings().get_automation_settings()
+        assert auto["daily_connection_limit"] == 20
+        assert any("DAILY_CONNECTION_LIMIT" in rec.message for rec in caplog.records)
+
+    def test_one_malformed_var_does_not_break_the_others(self, monkeypatch):
+        """A single bad value degrades only itself; the rest still parse."""
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "oops")
+        monkeypatch.setenv("SEARCH_LIMIT", "250")
+        auto = AppSettings().get_automation_settings()
+        assert auto["connection_delay_min"] == 2   # default (malformed)
+        assert auto["search_limit"] == 250          # honored
+
+
+@pytest.mark.unit
+class TestNavigationSettingsGuardedParsing:
+    """Malformed navigation env vars degrade to defaults (block 258-264)."""
+
+    def test_valid_value(self, monkeypatch):
+        monkeypatch.setenv("NAV_GOTO_TIMEOUT_MS", "45000")
+        assert AppSettings().get_navigation_settings()["goto_timeout_ms"] == 45000
+
+    def test_missing_value_uses_default(self, monkeypatch):
+        monkeypatch.delenv("NAV_GOTO_TIMEOUT_MS", raising=False)
+        assert AppSettings().get_navigation_settings()["goto_timeout_ms"] == 30000
+
+    def test_malformed_value_falls_back_and_warns(self, monkeypatch, caplog):
+        import logging
+
+        monkeypatch.setenv("NAV_MAX_RETRIES", "lots")
+        with caplog.at_level(logging.WARNING):
+            nav = AppSettings().get_navigation_settings()
+        assert nav["max_retries"] == 2
+        assert any("NAV_MAX_RETRIES" in rec.message for rec in caplog.records)
+
+
+# ============================================================================
 # Path Tests
 # ============================================================================
 
@@ -691,12 +781,13 @@ class TestSettingsEdgeCases:
         assert browser_settings["headless"] is True
 
     def test_automation_settings_with_invalid_int_value(self, monkeypatch):
-        """Test that invalid integer values raise ValueError."""
+        """A malformed int env var degrades to the default instead of crashing."""
         monkeypatch.setenv("CONNECTION_DELAY_MIN", "not_a_number")
         settings = AppSettings()
 
-        with pytest.raises(ValueError):
-            settings.get_automation_settings()
+        auto_settings = settings.get_automation_settings()
+        # Falls back to the CONNECTION_DELAY_MIN default rather than raising.
+        assert auto_settings["connection_delay_min"] == 2
 
     def test_multiple_browser_settings_calls(self, app_settings):
         """Test that browser settings can be called multiple times."""
