@@ -168,7 +168,7 @@ class HomeScreen(WorkerGuardMixin, Screen):
         except Exception:  # never crash the home screen
             logger.debug("Could not gather home summary", exc_info=True)
             summary = HomeSummary(configured=None, campaigns=None,
-                                  used_today=None, daily_limit=None, db_ok=False)
+                                  used_today=None, active_limits=None, db_ok=False)
         self.marshal_load(app, generation, self._populate, summary)
 
     def _gather(self, app: App) -> HomeSummary:
@@ -183,21 +183,35 @@ class HomeScreen(WorkerGuardMixin, Screen):
 
         settings = AppSettings()
         configured = settings.validate_credentials()
-        daily_limit = settings.get_automation_settings().get("daily_connection_limit")
+        # The enforced daily cap is per-campaign (Campaign.daily_limit); the
+        # DAILY_CONNECTION_LIMIT env value is only the fallback for campaigns
+        # without a valid positive limit (issue #46). Mirror the enforcement
+        # rule in LinkedInAutomation._effective_daily_limit.
+        fallback_limit = settings.get_automation_settings().get("daily_connection_limit")
 
         db = app.db_manager
         if db is None:
             return HomeSummary(configured=configured, campaigns=None,
-                              used_today=None, daily_limit=daily_limit, db_ok=False)
+                              used_today=None, active_limits=None, db_ok=False)
         try:
-            campaigns = len(db.get_campaigns(active_only=False))
+            campaigns = db.get_campaigns(active_only=False)
+            active_limits = tuple(
+                c.daily_limit
+                if isinstance(c.daily_limit, int)
+                and not isinstance(c.daily_limit, bool)
+                and c.daily_limit > 0
+                else fallback_limit
+                for c in campaigns
+                if c.active
+            )
             used_today = db.get_daily_connection_count(date.today().isoformat())
-            return HomeSummary(configured=configured, campaigns=campaigns,
-                              used_today=used_today, daily_limit=daily_limit, db_ok=True)
+            return HomeSummary(configured=configured, campaigns=len(campaigns),
+                              used_today=used_today, active_limits=active_limits,
+                              db_ok=True)
         except Exception:
             logger.debug("Could not read home counts", exc_info=True)
             return HomeSummary(configured=configured, campaigns=None,
-                              used_today=None, daily_limit=daily_limit, db_ok=False)
+                              used_today=None, active_limits=None, db_ok=False)
 
     def _populate(self, summary: HomeSummary) -> None:
         self.query_one("#home-status", Static).update(summary.line())
@@ -210,7 +224,10 @@ class HomeSummary:
     configured: bool | None
     campaigns: int | None
     used_today: int | None
-    daily_limit: int | None
+    #: Effective daily limits of the *active* campaigns (per-campaign
+    #: ``daily_limit``, falling back to the env default only when a campaign
+    #: carries no valid positive value). ``None`` when the DB is unavailable.
+    active_limits: tuple[int, ...] | None
     db_ok: bool
 
     def line(self) -> str:
@@ -222,7 +239,18 @@ class HomeSummary:
         if self.campaigns is not None:
             noun = "campaign" if self.campaigns == 1 else "campaigns"
             parts.append(f"{self.campaigns} {noun}")
-        if self.used_today is not None and self.daily_limit is not None:
-            parts.append(f"{self.used_today}/{self.daily_limit} sent today")
+        if self.used_today is not None:
+            # The binding daily cap is per-campaign, so usage is shown against
+            # the active campaigns' limits — never the env fallback (issue #46).
+            parts.append(f"{self.used_today} sent today")
+            if self.active_limits:
+                limits = "+".join(str(limit) for limit in self.active_limits)
+                if len(self.active_limits) == 1:
+                    parts.append(f"limit {limits} (1 active campaign)")
+                else:
+                    parts.append(
+                        f"limits {limits} across "
+                        f"{len(self.active_limits)} active campaigns"
+                    )
         parts.append("ready" if self.db_ok else "database unavailable")
         return "  ·  ".join(parts)

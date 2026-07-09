@@ -10,6 +10,7 @@ from textual.widgets import Static
 
 from database.operations import DatabaseManager
 from tui.app import CampaignsScreen, HomeScreen, LinkedInTUI
+from tui.screens.home import HomeSummary
 
 
 async def wait_home_status(pilot, needle: str, tries: int = 60) -> str:
@@ -19,6 +20,68 @@ async def wait_home_status(pilot, needle: str, tries: int = 60) -> str:
             break
         await pilot.pause()
     return str(status.render())
+
+
+# ── HomeSummary.line() unit tests (issue #46) ──────────────────────────────
+# The enforced daily cap is per-campaign; the DAILY_CONNECTION_LIMIT env value
+# is only the fallback, so the summary must never render usage against it.
+
+
+@pytest.mark.unit
+def test_home_summary_line_unconfigured():
+    line = HomeSummary(
+        configured=False, campaigns=None, used_today=None,
+        active_limits=None, db_ok=True,
+    ).line()
+    assert "Not configured" in line
+    assert "LINKEDIN_EMAIL" in line
+
+
+@pytest.mark.unit
+def test_home_summary_line_shows_active_campaign_limits():
+    line = HomeSummary(
+        configured=True, campaigns=3, used_today=7,
+        active_limits=(80, 20), db_ok=True,
+    ).line()
+    assert "3 campaigns" in line
+    assert "7 sent today" in line
+    assert "limits 80+20 across 2 active campaigns" in line
+    assert "ready" in line
+    assert "7/" not in line  # never "used/env-fallback"
+
+
+@pytest.mark.unit
+def test_home_summary_line_single_active_campaign():
+    line = HomeSummary(
+        configured=True, campaigns=1, used_today=4,
+        active_limits=(80,), db_ok=True,
+    ).line()
+    assert "4 sent today" in line
+    assert "limit 80 (1 active campaign)" in line
+
+
+@pytest.mark.unit
+def test_home_summary_line_without_active_campaigns():
+    """With nothing active there is no binding limit to show — just the count."""
+    line = HomeSummary(
+        configured=True, campaigns=2, used_today=7,
+        active_limits=(), db_ok=True,
+    ).line()
+    assert "7 sent today" in line
+    assert "limit" not in line
+    assert "/" not in line
+
+
+@pytest.mark.unit
+def test_home_summary_line_degraded():
+    line = HomeSummary(
+        configured=True, campaigns=None, used_today=None,
+        active_limits=None, db_ok=False,
+    ).line()
+    assert "database unavailable" in line
+
+
+# ── screen-level tests (threaded worker → #home-status) ────────────────────
 
 
 @pytest.mark.unit
@@ -47,6 +110,10 @@ async def test_home_summary_reports_counts_when_configured(
         await pilot.pause()
         text = await wait_home_status(pilot, "campaign")
         assert "1 campaign" in text
+        assert "0 sent today" in text
+        # The campaign's own limit — never the env fallback (issue #46).
+        assert "limit 5 (1 active campaign)" in text
+        assert "0/" not in text
         assert "ready" in text
 
 
