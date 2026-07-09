@@ -13,7 +13,7 @@ from __future__ import annotations
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from database.models import Campaign
 from database.operations import DatabaseManager
@@ -25,7 +25,12 @@ logger = get_logger(__name__)
 
 
 class CampaignEditScreen(CampaignFormScreen):
-    """Pre-filled campaign form that updates an existing campaign."""
+    """Pre-filled campaign form that updates an existing campaign.
+
+    Interaction design (owner rule, 2026-07-09): a visible, focusable "Save"
+    button sits below the fields — reachable with tab + Enter — with ``ctrl+s``
+    kept as an optional accelerator, never the only path.
+    """
 
     BINDINGS = [
         # "back" (not app.pop_screen): the shared form owns esc so a dirty form
@@ -55,6 +60,7 @@ class CampaignEditScreen(CampaignFormScreen):
 
     def compose_body(self) -> ComposeResult:
         yield from campaign_form_widgets()
+        yield Button("Save", id="form-submit", classes="flat-button")
         yield Static("Loading campaign…", id="edit-status", classes="status-line")
 
     def on_mount(self) -> None:
@@ -88,12 +94,17 @@ class CampaignEditScreen(CampaignFormScreen):
             self._set_status("Campaign not found.", "error")
             return
         fill_form(self, campaign)
-        self._set_status("Edit the fields, then ctrl+s to save.")
+        self._set_status("Edit the fields, then Save.")
         self.query_one("#field-name").focus()
         # The prefilled values are the pristine state for the esc guard.
         self.mark_clean()
 
     # ── save ──────────────────────────────────────────────────────────────
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "form-submit":
+            event.stop()
+            self.action_save()
 
     def action_save(self) -> None:
         if self._db_manager is None or self._saving or self._saved:
@@ -125,6 +136,6 @@ class CampaignEditScreen(CampaignFormScreen):
             self._set_status(f"Error saving campaign: {error}", "error")
             return
         self._saved = True
-        for widget in self.query("#form-body Input, #form-body Select"):
+        for widget in self.query("#form-body Input, #form-body Select, #form-submit"):
             widget.disabled = True
         self._set_status(f"✓ Campaign '{name}' updated. Press esc to return.", "good")

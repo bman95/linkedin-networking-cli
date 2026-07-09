@@ -49,6 +49,22 @@ respect them.
   `AppSettings()` construction) are synchronous/blocking and may touch disk, so
   every data load runs in a `@work(thread=True, exclusive=True)` worker with the
   full safety contract in §6.
+- **Arrows + Enter first, everywhere (owner rule, 2026-07-09; issue #49).**
+  Every user-facing action on every screen must be a visible, focusable element
+  (list item or button) reachable with ↑/↓/tab and activated with Enter.
+  Letter/number/ctrl-chord keys (`n`, `r`, `e`/`a`/`x`/`d`, `ctrl+s`, `ctrl+r`, …)
+  may stay as optional accelerators shown in the hint bar, but never as the sole
+  trigger for an action — a screen with no on-screen affordance for one of its
+  actions is a bug. Destructive or side-effecting confirmations use a focused
+  inline confirm (`ConfirmBar`: Enter confirms, esc cancels; a repeated
+  accelerator press also confirms) rather than a "press the same chord twice"
+  pattern. Exempted: `esc` itself, already the universal Back/Cancel key on
+  every screen, may still warn-then-repeat (e.g. the dirty-form discard guard,
+  the mid-run leave warning) — that is a navigation safety check, not a
+  hidden-shortcut action needing its own widget. Applied first to the
+  automation flows (issue #42/#43, detailed in §4 item 3); issue #49 swept every
+  remaining screen (Campaigns' New/Refresh, Dashboard's and Settings' Refresh,
+  Create/Edit's Save) onto the same pattern.
 
 ## 3. Target screen map
 

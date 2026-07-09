@@ -243,6 +243,17 @@ HomeScreen.narrow #home-wordmark-fallback {
     height: 1fr;
 }
 
+/* New Campaign / Refresh: visible, focusable buttons below the table (owner
+ * rule, 2026-07-09) — tab + Enter reach them; n/r remain accelerators. */
+#campaigns-toolbar {
+    height: auto;
+    margin: 0 4 1 4;
+}
+
+#campaigns-toolbar Button {
+    margin-right: 2;
+}
+
 /* ── Dashboard screen ─────────────────────────────────────────────────── */
 
 #dashboard-body {
@@ -292,6 +303,12 @@ HomeScreen.narrow #home-wordmark-fallback {
     margin-top: 0;
 }
 
+/* Refresh: a visible, focusable button below the table (owner rule,
+ * 2026-07-09) — tab + Enter reach it; r remains an accelerator. */
+#dashboard-refresh {
+    margin: 1 0 0 0;
+}
+
 /* ── Settings screen ──────────────────────────────────────────────────── */
 
 #settings-body {
@@ -306,6 +323,12 @@ HomeScreen.narrow #home-wordmark-fallback {
     height: auto;
     padding: 1 2;
     margin-bottom: 1;
+}
+
+/* Refresh: this screen's sole focusable widget (owner rule, 2026-07-09) — tab +
+ * Enter reach it; r remains an accelerator. */
+#settings-refresh {
+    margin: 1 0 0 0;
 }
 
 .settings-section-title {
@@ -383,6 +406,14 @@ SelectOverlay > .option-list--option-highlighted {
  * sentinel options reveal them (widget.display toggles inline, which wins). */
 .loc-conditional {
     display: none;
+}
+
+/* Create/Save: a visible, focusable button below the fields (owner rule,
+ * 2026-07-09) — tab + Enter reach it; ctrl+s remains an accelerator. Left/right
+ * margin matches #form-body's own gutter since the button is a sibling, not a
+ * child, of that scroll container. */
+#form-submit {
+    margin: 1 4 0 4;
 }
 
 /* ── Campaign detail screen (issue #42: the campaign's action hub) ─────── */
@@ -523,6 +554,32 @@ ConfirmBar {
 }
 ConfirmBar .confirm-no {
     margin-left: 2;
+}
+
+/* ── Flat action buttons (shared idiom, owner rule 2026-07-09) ──────────── */
+
+/* Every action that used to be key-only (New/Refresh/Save/Create) is now a
+ * visible, focusable button — reusing the exact same flat, left-accent-rule
+ * idiom as the automation run controls (#run-start, #run-stop, ConfirmBar
+ * Button above) so the whole app reads as one design language. */
+.flat-button {
+    width: auto;
+    height: 1;
+    min-width: 0;
+    padding: 0 2;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel;
+    color: $text;
+    text-style: none;
+}
+.flat-button:focus {
+    border-left: thick $primary;
+    background: $panel-lighten-1;
+    text-style: bold;
+}
+.flat-button:disabled {
+    color: $text-muted;
 }
 
 /* ── Shared status-line semantics (forms, detail, automation) ─────────── */

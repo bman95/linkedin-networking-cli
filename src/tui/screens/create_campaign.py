@@ -15,7 +15,7 @@ from __future__ import annotations
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from database.operations import DatabaseManager
 from utils.logging import get_logger
@@ -26,7 +26,12 @@ logger = get_logger(__name__)
 
 
 class CreateCampaignScreen(CampaignFormScreen):
-    """Form screen that creates a campaign, then writes it in a thread worker."""
+    """Form screen that creates a campaign, then writes it in a thread worker.
+
+    Interaction design (owner rule, 2026-07-09): a visible, focusable "Create"
+    button sits below the fields — reachable with tab + Enter — with ``ctrl+s``
+    kept as an optional accelerator, never the only path.
+    """
 
     BINDINGS = [
         # "back" (not app.pop_screen): the shared form owns esc so a dirty form
@@ -56,6 +61,7 @@ class CreateCampaignScreen(CampaignFormScreen):
 
     def compose_body(self) -> ComposeResult:
         yield from campaign_form_widgets()
+        yield Button("Create", id="form-submit", classes="flat-button")
         yield Static("", id="create-status", classes="status-line")
 
     def on_mount(self) -> None:
@@ -69,6 +75,11 @@ class CreateCampaignScreen(CampaignFormScreen):
         self.mark_clean()
 
     # ── submit ────────────────────────────────────────────────────────────
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "form-submit":
+            event.stop()
+            self.action_create()
 
     def action_create(self) -> None:
         if self._db_manager is None or self._submitting or self._created:
@@ -107,6 +118,6 @@ class CreateCampaignScreen(CampaignFormScreen):
         # Terminal success state: lock the form (no re-submit) and invite esc,
         # where the home summary refreshes and reflects the new campaign.
         self._created = True
-        for widget in self.query("#form-body Input, #form-body Select"):
+        for widget in self.query("#form-body Input, #form-body Select, #form-submit"):
             widget.disabled = True
         self._set_status(f"✓ Campaign '{name}' created (ID {cid}). Press esc to return.", "good")
