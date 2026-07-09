@@ -1558,15 +1558,13 @@ class LinkedInCLI:
                                     self.db_manager.get_contacts_by_status(campaign.id, "sent")
                                     + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
                                 )
-                                checker_stats = await automation.check_connection_status(
+                                # The checker's stats carry how many contacts
+                                # were actually visited before a failure cut
+                                # the walk short — never over-report with
+                                # len(pending_contacts) (issue #43).
+                                stats = await automation.check_connection_status(
                                     pending_contacts, progress_update
                                 )
-                                stats = {
-                                    "checked": len(pending_contacts),
-                                    "newly_accepted": checker_stats.get(
-                                        "newly_accepted", 0
-                                    ),
-                                }
 
                             total_stats["total_checked"] += stats.get("checked", 0)
                             total_stats["total_newly_accepted"] += stats.get("newly_accepted", 0)
@@ -1582,15 +1580,11 @@ class LinkedInCLI:
                                 self.db_manager.get_contacts_by_status(selected.id, "sent")
                                 + self.db_manager.get_contacts_by_status(selected.id, "possibly_sent")
                             )
-                            checker_stats = await automation.check_connection_status(
+                            # Same rule as the all-campaigns branch: report the
+                            # checker's real visited count (issue #43).
+                            stats = await automation.check_connection_status(
                                 pending_contacts, progress_update
                             )
-                            stats = {
-                                "checked": len(pending_contacts),
-                                "newly_accepted": checker_stats.get(
-                                    "newly_accepted", 0
-                                ),
-                            }
 
                         return {"status": "success", **stats}
 
