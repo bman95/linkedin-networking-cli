@@ -896,7 +896,13 @@ async def test_failed_delete_returns_focus_to_actions(db_manager: DatabaseManage
 
 
 @pytest.mark.unit
-async def test_detail_delete_blocked_while_run_active(db_manager: DatabaseManager):
+async def test_detail_mutations_blocked_while_run_active(
+    db_manager: DatabaseManager,
+):
+    """Campaign mutations wait for the stop control while a run is active
+    (codex gate finding): delete, toggle and edit are refused — the screen must
+    never show a deleted/edited/inactive campaign while invites keep sending —
+    while the read-only export stays available."""
     campaign = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
@@ -908,11 +914,25 @@ async def test_detail_delete_blocked_while_run_active(db_manager: DatabaseManage
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Running")
+
         await pilot.press("d")
         status = await wait_text(pilot, "#detail-status", "stop it before deleting")
         assert "stop it before deleting" in status
         assert not screen.query_one("#detail-delete-confirm", ConfirmBar).armed
         assert db_manager.get_campaign(campaign.id) is not None
+
+        await pilot.press("a")
+        await wait_text(pilot, "#detail-status", "changing its active state")
+        assert db_manager.get_campaign(campaign.id).active is True  # unchanged
+
+        await pilot.press("e")
+        await wait_text(pilot, "#detail-status", "editing the campaign")
+        assert app.screen is screen  # no edit screen was pushed
+
+        # The read-only export is deliberately NOT blocked mid-run.
+        await pilot.press("x")
+        await wait_text(pilot, "#detail-status", "No contacts to export")
+
         screen.panel.request_stop()  # let the run wind down before teardown
         await wait_text_timed(pilot, "#run-status", "Stopped at your request")
 

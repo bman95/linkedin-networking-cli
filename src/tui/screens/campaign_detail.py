@@ -537,9 +537,26 @@ class CampaignDetailScreen(BaseScreen):
 
     # ── manage actions ────────────────────────────────────────────────────
 
+    def _blocked_by_active_run(self, what: str) -> bool:
+        """Refuse a campaign mutation while its automation run is active.
+
+        The engine works from its own campaign snapshot, so a mid-run edit or
+        toggle would not corrupt the run — but it would make the screen lie
+        (an "Inactive"/edited campaign shown while invites keep sending).
+        Mutations wait for the stop control; the read-only export does not.
+        """
+        if self.panel.run_active:
+            self._set_status(
+                f"A run is in progress — stop it before {what}.", "warn"
+            )
+            return True
+        return False
+
     def action_edit(self) -> None:
         self._cancel_armed_confirms()
         if self._db_manager is None or self._busy:
+            return
+        if self._blocked_by_active_run("editing the campaign"):
             return
         from .campaign_edit import CampaignEditScreen
 
@@ -548,6 +565,8 @@ class CampaignDetailScreen(BaseScreen):
     def action_toggle_active(self) -> None:
         self._cancel_armed_confirms()
         if self._db_manager is None or self._busy or self._active is None:
+            return
+        if self._blocked_by_active_run("changing its active state"):
             return
         self._busy = True
         new_state = not self._active
@@ -568,11 +587,7 @@ class CampaignDetailScreen(BaseScreen):
         self.panel.dismiss_confirm()
         if self._db_manager is None or self._busy:
             return
-        if self.panel.run_active:
-            self._set_status(
-                "A run is in progress — stop it before deleting the campaign.",
-                "warn",
-            )
+        if self._blocked_by_active_run("deleting the campaign"):
             return
         bar = self.query_one("#detail-delete-confirm", ConfirmBar)
         if bar.armed:
