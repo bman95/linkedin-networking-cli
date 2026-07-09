@@ -32,7 +32,9 @@ async def smart_connection_checker(
     partial stats carry ``"stopped": True``.
 
     Returns:
-        Dict with counts: {"checked": int, "newly_accepted": int, "updated": int}
+        Dict with counts: {"checked": int, "newly_accepted": int, "updated": int},
+        plus ``stopped: True`` after a stop request and ``truncated: True`` when
+        the scroll-rounds backstop cut the walk short.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -94,7 +96,9 @@ async def smart_connection_checker(
             stop_event=stop_event,
         )
 
-        if progress_callback:
+        # A stopped walk already announced itself; a "completed" line on top
+        # would contradict the stop acknowledgement in the progress stream.
+        if progress_callback and not stats.get("stopped"):
             progress_callback(
                 f"Checker completed: {stats['newly_accepted']} newly accepted connections found"
             )
@@ -428,8 +432,10 @@ async def check_specific_contacts(
                 if progress_callback:
                     progress_callback(f"✅ {contact.name} accepted connection")
 
-            # Random delay between checks
-            await automation.page.wait_for_timeout(random.randint(2000, 4000))
+            # Random delay between checks — a pure humanization wait, skipped
+            # once a stop was requested (mirrors the send loops, issue #43).
+            if stop_event is None or not stop_event.is_set():
+                await automation.page.wait_for_timeout(random.randint(2000, 4000))
 
         except Exception as e:
             logger.error(f"Error checking contact {contact_id}: {e}")

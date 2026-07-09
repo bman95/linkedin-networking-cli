@@ -7,6 +7,7 @@ run → summary/error pipeline (via a browser-free fake that overrides the singl
 """
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -364,6 +365,31 @@ async def test_midrun_esc_warning_mentions_stop_control(
         assert "leaving does not stop it" in status
         assert "Stop" in status and "s)" in status
         assert app.screen is screen  # first esc warns, does not leave
+
+
+@pytest.mark.unit
+async def test_stop_after_armed_leave_rearms_the_esc_warning(
+    db_manager: DatabaseManager,
+):
+    """esc (warn armed) → stop → esc must warn again, not leave: the stop
+    request overwrote the warning status line, so the armed second-esc dies
+    with it (state driven directly for determinism — no worker race)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(_FakeStoppableRunScreen(app.db_manager, _DummySettings()))
+        await pilot.pause()
+        screen = app.screen
+        screen._run_active = True
+        screen._stop_event = threading.Event()
+
+        screen.action_back()  # first esc: arms the leave warning
+        assert screen._leave_confirming is True
+        screen._request_stop()  # stop supersedes the warning…
+        assert screen._leave_confirming is False
+        screen.action_back()  # …so the next esc warns again instead of leaving
+        assert screen._leave_confirming is True
+        assert app.screen is screen
 
 
 @pytest.mark.unit

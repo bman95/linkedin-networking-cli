@@ -3977,6 +3977,45 @@ class TestCooperativeCancellation:
         assert any("Stop requested" in m for m in messages)
 
     @pytest.mark.asyncio
+    async def test_stop_skips_post_send_humanization_delay(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """Once the stop is requested, the post-send humanization delay is
+        skipped — it only shields the next action, which the stop cancels."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "77")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "77")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+
+        def progress(message):
+            # The 1st send reports "1/20 used today" from inside the attempt —
+            # the stop request lands before the post-send delay would run.
+            if "1/20 used today" in str(message):
+                stop.set()
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(3),
+                progress_callback=progress,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 1
+        assert result["stopped_reason"] == "cancelled"
+        # The 77s inter-connection wait (77000 ms) was never awaited.
+        delays = [
+            call.args[0]
+            for call in mock_linkedin_automation.page.wait_for_timeout.call_args_list
+        ]
+        assert 77000 not in delays
+
+    @pytest.mark.asyncio
     async def test_stop_ends_card_pass_and_skips_fallback(
         self, mock_linkedin_automation, monkeypatch
     ):
