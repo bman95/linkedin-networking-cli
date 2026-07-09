@@ -33,7 +33,7 @@ from database.operations import DatabaseManager
 from utils.logging import get_logger
 
 from .base import BaseScreen
-from .run_panel import AutomationRunPanel, RunSpec, run_with_linkedin
+from .run_panel import AutomationRunPanel, ConfirmBar, RunSpec, run_with_linkedin
 
 logger = get_logger(__name__)
 
@@ -200,6 +200,13 @@ class AutomationRunScreen(BaseScreen):
     ) -> None:
         # The dismissed bar held focus; hand it back to the Start control so
         # arrows/Enter keep working (the degraded screen keeps it disabled).
+        # The message arrives one pump after the dismissal, so only refocus if
+        # focus is still stranded on the hidden bar — never steal a focus some
+        # same-tick action placed deliberately.
+        focused = self.focused
+        bar = event.panel.query_one("#run-confirm", ConfirmBar)
+        if focused is not None and bar not in focused.ancestors_with_self:
+            return
         if self._run_can_start and not self.panel.run_active:
             self.query_one("#run-start", Button).focus()
 

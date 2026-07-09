@@ -825,10 +825,14 @@ async def test_detail_mutation_disarms_armed_run_confirm(
         await pilot.press("r")
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("a")  # deactivate the campaign
+        # Wait on the UI-applied signal (the reloaded detail), not just the DB
+        # write, so the follow-up Enter runs against settled screen state.
+        await wait_text(pilot, "#detail-status", "select an action")
         for _ in range(60):
             await pilot.pause()
-            if db_manager.get_campaign(campaign.id).active is False:
+            if screen._active is False:
                 break
+        assert screen._active is False
         bar = screen.query_one("#detail-run-panel ConfirmBar", ConfirmBar)
         assert not bar.armed  # the toggle disarmed the stale confirm
         await pilot.press("enter")  # actions list has focus: re-requests Run now
@@ -836,6 +840,59 @@ async def test_detail_mutation_disarms_armed_run_confirm(
         assert screen.panel.run_active is False  # blocked by the inactive gate
         status = await wait_text(pilot, "#run-status", "inactive")
         assert "inactive" in status
+
+
+@pytest.mark.unit
+async def test_delete_confirm_keeps_focus_after_dismissing_run_confirm(
+    db_manager: DatabaseManager,
+):
+    """`r` then `d`: arming delete dismisses the run confirm, whose deferred
+    ConfirmDismissed refocus must NOT steal focus from the freshly armed delete
+    bar — otherwise the promised Enter lands on 'Run now' and a second Enter
+    starts a run the user never asked for (reviewer finding, iteration 2)."""
+    campaign = make_campaign(db_manager, name="Focus Steal")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _push_detail(pilot, app, campaign.id)
+        await pilot.press("r")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        await pilot.press("d")
+        await wait_text(pilot, "#detail-status", "Enter to confirm")
+        await pilot.pause()  # let the queued ConfirmDismissed handler run
+        await pilot.pause()
+        delete_bar = screen.query_one("#detail-delete-confirm", ConfirmBar)
+        assert delete_bar.armed
+        # Focus stays on the delete confirm the whole time…
+        assert app.focused is delete_bar.query_one(".confirm-yes", Button)
+        # …and the run confirm is gone, so no stale prompt contradicts it.
+        assert not screen.query_one("#detail-run-panel ConfirmBar", ConfirmBar).armed
+        await pilot.press("enter")  # the promised Enter deletes — never runs
+        for _ in range(60):
+            if db_manager.get_campaign(campaign.id) is None:
+                break
+            await pilot.pause()
+        assert db_manager.get_campaign(campaign.id) is None
+        assert screen.panel.run_active is False  # no run was ever started
+
+
+@pytest.mark.unit
+async def test_failed_delete_returns_focus_to_actions(db_manager: DatabaseManager):
+    """A delete that fails server-side (campaign already gone) must not strand
+    focus on the hidden confirm bar."""
+    campaign = make_campaign(db_manager, name="Ghost")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _push_detail(pilot, app, campaign.id)
+        await pilot.press("d")
+        await wait_text(pilot, "#detail-status", "Enter to confirm")
+        db_manager.delete_campaign(campaign.id)  # yanked from under the screen
+        await pilot.press("enter")  # confirm → delete fails: "Campaign not found."
+        await wait_text(pilot, "#detail-status", "not found")
+        actions = screen.query_one("#detail-actions", ListView)
+        assert app.focused is actions  # keyboard alive again
+        assert app.screen is screen  # a failed delete does not pop the screen
 
 
 @pytest.mark.unit

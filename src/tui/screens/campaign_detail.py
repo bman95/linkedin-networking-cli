@@ -391,11 +391,8 @@ class CampaignDetailScreen(BaseScreen):
         cancel the confirmation — not pop the whole screen. Mid-run the panel
         warns once (leaving does not stop the run) before a second esc leaves.
         """
-        delete_bar = self.query_one("#detail-delete-confirm", ConfirmBar)
-        if delete_bar.armed:
-            delete_bar.disarm()
-            self._set_status("Delete cancelled.")
-            self.query_one("#detail-actions", ListView).focus()
+        if self.query_one("#detail-delete-confirm", ConfirmBar).armed:
+            self._cancel_delete_confirm()
             return
         if self.panel.handle_escape():
             return
@@ -527,7 +524,15 @@ class CampaignDetailScreen(BaseScreen):
         self, event: AutomationRunPanel.ConfirmDismissed
     ) -> None:
         # The dismissed bar held focus; hand it back to the actions list so
-        # arrows/Enter keep working.
+        # arrows/Enter keep working. This message arrives one pump AFTER the
+        # dismissal, so only refocus if focus is still stranded on the hidden
+        # bar — an action that dismissed-then-armed the delete confirm in the
+        # same tick (action_delete) has already placed focus deliberately, and
+        # yanking it to the list would point the promised Enter at "Run now".
+        focused = self.focused
+        bar = event.panel.query_one("#run-confirm", ConfirmBar)
+        if focused is not None and bar not in focused.ancestors_with_self:
+            return
         self.query_one("#detail-actions", ListView).focus()
 
     # ── manage actions ────────────────────────────────────────────────────
@@ -601,6 +606,10 @@ class CampaignDetailScreen(BaseScreen):
         bar = self.query_one("#detail-delete-confirm", ConfirmBar)
         if bar.armed:
             bar.disarm()
+            # Retire the delete prompt: its "Enter to confirm" promise is dead,
+            # and a superseding action may be arming the run confirm — two live
+            # contradictory prompts must never share the screen.
+            self._set_status("Delete cancelled.")
             # The bar held focus while armed; hand it back so arrows/Enter
             # keep working (a hidden widget does not release focus itself).
             self.query_one("#detail-actions", ListView).focus()
@@ -672,6 +681,9 @@ class CampaignDetailScreen(BaseScreen):
             return
         if message is not None:
             self._set_status(message, "error")
+            # A failed delete arrived with focus on the (now hidden) confirm
+            # bar's button; hand it back so the keyboard keeps working.
+            self.query_one("#detail-actions", ListView).focus()
             return
         if reload:
             self.load_detail()
