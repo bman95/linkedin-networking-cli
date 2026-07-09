@@ -57,6 +57,32 @@ def _settings(valid=True, search_limit=100):
 
 
 # ---------------------------------------------------------------------------
+# CampaignRunner.__init__ — degrade gracefully, but stay visible on stderr
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestCampaignRunnerInit:
+    def test_init_failure_degrades_and_prints_to_stderr(self, monkeypatch, capsys):
+        """A scheduled run has no interactive console — a construction failure
+        (bad settings/DB) must be visible on stderr, not just logged, since
+        stdout/stderr is the operator's primary diagnostic surface."""
+
+        def _boom(*a, **k):
+            raise RuntimeError("disk unavailable")
+
+        monkeypatch.setattr(runner_module, "AppSettings", _boom)
+
+        runner = CampaignRunner()
+
+        assert runner.settings is None
+        assert runner.db_manager is None
+        err = capsys.readouterr().err
+        assert "Error initializing components" in err
+        assert "disk unavailable" in err
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing / dispatch in main()
 # ---------------------------------------------------------------------------
 

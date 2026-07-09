@@ -33,6 +33,11 @@ class CampaignRunner:
             self.db_manager = DatabaseManager(str(self.settings.db_path))
         except Exception as e:
             logger.error(f"Error initializing components: {e}", exc_info=True)
+            # A scheduled run has no interactive console — stdout/stderr is
+            # the operator's only diagnostic surface until they think to check
+            # the log files, so the failure must be visible there too, not
+            # just logged.
+            print(f"Error initializing components: {e}", file=sys.stderr)
             self.db_manager = None
             self.settings = None
 
