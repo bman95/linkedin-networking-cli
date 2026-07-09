@@ -29,7 +29,8 @@ parity is maintained by hand-copying. The 2026-07-06 pass extracted the shared l
 (acceptance-rate, CSV, email masking, error mapping) into `src/cli/`, so the
 *duplication* is gone, but two presentation layers still have to be kept in step.
 
-**Approach.** Now that both UIs consume one shared core, the cutover is mechanical:
+**Approach** (as originally planned and then executed — see **Status** above).
+Now that both UIs consume one shared core, the cutover is mechanical:
 per flow, confirm the TUI screen matches the classic behaviour (the last known gap —
 the browser-bound online location search / custom-geoUrn entry in Create/Edit — was
 ported on 2026-07-07, see `campaign_form.py` + `tests/test_tui_location_search.py`),
