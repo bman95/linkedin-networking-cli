@@ -843,3 +843,109 @@ class TestSettingsEdgeCases:
         with patch("pathlib.Path.home", return_value=tmp_path):
             settings = AppSettings()
             assert app_dir.exists()
+
+
+# ============================================================================
+# LLM (AI Assist) Settings Tests
+# ============================================================================
+
+_LLM_ENV_VARS = (
+    "LLM_BASE_URL",
+    "LLM_API_KEY",
+    "LLM_MODEL",
+    "LLM_MODE",
+    "LLM_TIMEOUT_S",
+    "LLM_PULL_TIMEOUT_S",
+    "LLM_MAX_TOKENS",
+    "LLM_MAX_INPUT_CHARS",
+)
+
+
+def _clear_llm_env(monkeypatch):
+    for var in _LLM_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.mark.unit
+class TestLLMSettings:
+    """Test get_llm_settings() defaults, derivation, and overrides."""
+
+    def test_defaults_are_local_mode(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        llm = AppSettings().get_llm_settings()
+
+        assert llm["mode"] == "local"
+        assert llm["base_url"] == "http://localhost:11434"
+        assert llm["api_key"] is None
+        assert llm["model"] is None
+        assert llm["timeout_s"] == 60
+        assert llm["pull_timeout_s"] == 1800
+        assert llm["max_tokens"] == 1024
+        assert llm["max_input_chars"] == 4000
+
+    def test_api_key_present_derives_hosted_mode(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_API_KEY", "sk-test")
+
+        llm = AppSettings().get_llm_settings()
+
+        assert llm["mode"] == "hosted"
+        assert llm["api_key"] == "sk-test"
+
+    def test_explicit_mode_overrides_derivation(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("LLM_MODE", "local")
+
+        llm = AppSettings().get_llm_settings()
+
+        assert llm["mode"] == "local"
+
+    def test_invalid_mode_falls_back_to_derived_and_warns(self, monkeypatch, caplog):
+        import logging
+
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_MODE", "cloud")
+        with caplog.at_level(logging.WARNING):
+            llm = AppSettings().get_llm_settings()
+
+        assert llm["mode"] == "local"  # derived (no API key), not crashed
+        assert any("LLM_MODE" in rec.message for rec in caplog.records)
+
+    def test_base_url_trims_whitespace_and_trailing_slash(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_BASE_URL", "  http://localhost:11434/  ")
+
+        llm = AppSettings().get_llm_settings()
+
+        assert llm["base_url"] == "http://localhost:11434"
+
+    def test_model_env_var_honored(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_MODEL", "gemma3:4b")
+
+        assert AppSettings().get_llm_settings()["model"] == "gemma3:4b"
+
+
+@pytest.mark.unit
+class TestLLMSettingsGuardedParsing:
+    """Malformed numeric LLM env vars degrade to defaults, never crash."""
+
+    def test_valid_value(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_TIMEOUT_S", "30")
+        assert AppSettings().get_llm_settings()["timeout_s"] == 30
+
+    def test_missing_value_uses_default(self, monkeypatch):
+        _clear_llm_env(monkeypatch)
+        assert AppSettings().get_llm_settings()["timeout_s"] == 60
+
+    def test_malformed_value_falls_back_and_warns(self, monkeypatch, caplog):
+        import logging
+
+        _clear_llm_env(monkeypatch)
+        monkeypatch.setenv("LLM_MAX_TOKENS", "lots")
+        with caplog.at_level(logging.WARNING):
+            llm = AppSettings().get_llm_settings()
+        assert llm["max_tokens"] == 1024
+        assert any("LLM_MAX_TOKENS" in rec.message for rec in caplog.records)

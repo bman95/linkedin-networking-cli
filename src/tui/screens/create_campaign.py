@@ -20,7 +20,13 @@ from textual.widgets import Button, Static
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
-from .campaign_form import CampaignFormScreen, campaign_form_widgets, read_form
+from .campaign_ai_assist import CampaignAIAssistPanel
+from .campaign_form import (
+    CampaignFormScreen,
+    campaign_form_widgets,
+    fill_form_from_extraction,
+    read_form,
+)
 
 logger = get_logger(__name__)
 
@@ -60,6 +66,7 @@ class CreateCampaignScreen(CampaignFormScreen):
         self._created = False
 
     def compose_body(self) -> ComposeResult:
+        yield CampaignAIAssistPanel(id="ai-assist-panel")
         yield from campaign_form_widgets()
         yield Button("Create", id="form-submit", classes="flat-button")
         yield Static("", id="create-status", classes="status-line")
@@ -73,6 +80,33 @@ class CreateCampaignScreen(CampaignFormScreen):
         # The freshly composed defaults are the pristine state for the
         # dirty-form esc guard.
         self.mark_clean()
+
+    # ── AI assist ─────────────────────────────────────────────────────────
+
+    # Textual's handler-name derivation collapses "AIAssist" to "aiassist"
+    # (no underscore before "Assist") — this name is NOT a typo of the class.
+    def on_campaign_aiassist_panel_extracted(
+        self, event: CampaignAIAssistPanel.Extracted
+    ) -> None:
+        flagged = fill_form_from_extraction(self, event.result)
+        filled = 8 - len(flagged)
+        if flagged:
+            self._set_status(
+                f"Filled {filled} of 8 fields from your description — "
+                "review the highlighted ones.",
+                "warn",
+            )
+        else:
+            self._set_status(f"Filled {filled} of 8 fields from your description.", "good")
+        self.query_one(flagged[0] if flagged else "#field-name").focus()
+        # Deliberately no mark_clean(): an AI prefill is unsaved work, so esc
+        # still warns before discarding it.
+
+    def action_back(self) -> None:
+        panel = self.query_one(CampaignAIAssistPanel)
+        if panel.handle_escape():
+            return
+        super().action_back()
 
     # ── submit ────────────────────────────────────────────────────────────
 

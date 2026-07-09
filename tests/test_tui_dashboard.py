@@ -526,6 +526,41 @@ async def test_settings_renders_rate_limiting_parity(
 
 
 @pytest.mark.unit
+async def test_settings_ai_assist_local_mode(db_manager: DatabaseManager, monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "settings")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        body = str(screen.query_one("#body-ai_assist", Static).render())
+        assert "Mode: local" in body
+        assert "Base URL: http://localhost:11434" in body
+        assert "API Key: Not set" in body
+
+
+@pytest.mark.unit
+async def test_settings_ai_assist_hosted_mode_masks_key(
+    db_manager: DatabaseManager, monkeypatch
+):
+    monkeypatch.setenv("LLM_API_KEY", "sk-super-secret")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "settings")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        body = str(screen.query_one("#body-ai_assist", Static).render())
+        assert "Mode: hosted" in body
+        assert "Model: gpt-4o-mini" in body
+        assert "API Key: Set" in body
+        assert "sk-super-secret" not in body
+
+
+@pytest.mark.unit
 async def test_settings_error_state(db_manager: DatabaseManager, monkeypatch):
     """A failure while gathering settings shows 'Settings unavailable.'."""
     import config.settings as settings_module

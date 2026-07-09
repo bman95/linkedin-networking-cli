@@ -306,6 +306,56 @@ class AppSettings:
         )
         return settings
 
+    def get_llm_settings(self) -> dict[str, Any]:
+        """AI-assist (LLM) settings for the "describe your campaign" feature.
+
+        ``api_key`` is env-only and carries the same trust tier as
+        ``LINKEDIN_PASSWORD`` — never persisted to the SQLite ``Settings``
+        table. ``mode`` derives from whether ``LLM_API_KEY`` is set unless
+        ``LLM_MODE`` explicitly overrides it (an invalid override falls back
+        to the derived value, with a warning, rather than crashing).
+        """
+        base_url = (os.getenv("LLM_BASE_URL") or "http://localhost:11434").strip().rstrip("/")
+        api_key = os.getenv("LLM_API_KEY") or None
+        model = os.getenv("LLM_MODEL") or None
+
+        mode_env = (os.getenv("LLM_MODE") or "").strip().lower()
+        if mode_env in ("local", "hosted"):
+            mode = mode_env
+        else:
+            if mode_env:
+                logger.warning(
+                    "Invalid LLM_MODE=%r (expected 'local' or 'hosted'); "
+                    "deriving from LLM_API_KEY instead",
+                    mode_env,
+                )
+            mode = "hosted" if api_key else "local"
+
+        settings = {
+            "mode": mode,
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+            "timeout_s": _env_int("LLM_TIMEOUT_S", 60),
+            "pull_timeout_s": _env_int("LLM_PULL_TIMEOUT_S", 1800),
+            "max_tokens": _env_int("LLM_MAX_TOKENS", 1024),
+            "max_input_chars": _env_int("LLM_MAX_INPUT_CHARS", 4000),
+        }
+
+        logger.debug(
+            "LLM settings: mode=%s, base_url=%s, model=%s, api_key=%s, "
+            "timeout_s=%s, pull_timeout_s=%s, max_tokens=%s, max_input_chars=%s",
+            settings["mode"],
+            settings["base_url"],
+            settings["model"] or "unset",
+            "set" if settings["api_key"] else "unset",
+            settings["timeout_s"],
+            settings["pull_timeout_s"],
+            settings["max_tokens"],
+            settings["max_input_chars"],
+        )
+        return settings
+
     def validate_credentials(self) -> bool:
         """Check if LinkedIn credentials are available"""
         is_valid = bool(self.linkedin_email and self.linkedin_password)

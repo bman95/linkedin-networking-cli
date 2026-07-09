@@ -595,3 +595,105 @@ ConfirmBar .confirm-no {
 .status-line.-error {
     color: $error;
 }
+
+/* ── AI Assist panel (Create Campaign only) ────────────────────────────── */
+
+#ai-assist-panel {
+    height: auto;
+    padding: 0 4;
+    margin-bottom: 1;
+}
+
+/* Capped + internally scrollable so an expanded panel (missing-model
+ * sub-panel, log, progress, privacy notice) can never push the campaign
+ * form fields below the fold on a small terminal. */
+#ai-assist-body {
+    height: auto;
+    max-height: 18;
+    overflow-y: auto;
+    background: $panel;
+    padding: 1 2;
+    margin-top: 1;
+}
+
+#ai-assist-panel Input,
+#ai-assist-panel Select {
+    width: 76;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel-lighten-1;
+    padding: 0 1;
+}
+#ai-assist-panel Input {
+    height: 1;
+}
+#ai-assist-panel Input:focus,
+#ai-assist-panel Select:focus {
+    border-left: thick $primary;
+    background: $panel-lighten-2;
+}
+
+#ai-assist-input {
+    height: 5;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel-lighten-1;
+}
+#ai-assist-input:focus {
+    border-left: thick $primary;
+}
+
+#ai-assist-counter {
+    color: $text-muted;
+    height: 1;
+}
+
+/* Buttons reuse the shared .flat-button idiom (app.tcss "Flat action
+ * buttons" section) — just spacing here, since #ai-assist-toggle sits above
+ * the collapsible body and the run/stop pair sit side by side. */
+#ai-assist-toggle {
+    margin-bottom: 1;
+}
+#ai-assist-controls Button,
+#missing-model-controls Button {
+    margin: 1 2 0 0;
+}
+
+#ai-assist-log {
+    height: 8;
+    margin: 1 0 0 0;
+    padding: 1 2;
+    background: $panel-lighten-1;
+    border: none;
+}
+
+#ai-assist-progress {
+    margin: 1 0 0 0;
+}
+
+#ai-assist-missing-model,
+#ai-assist-privacy-notice {
+    height: auto;
+    background: $panel-lighten-1;
+    padding: 1 2;
+    margin-top: 1;
+}
+
+/* A quiet caption surfacing the model's own words when a fuzzy match on
+ * location/industry/network falls back to the field's default — never a
+ * fake option, just a nudge to review/pick manually. */
+.field-hint {
+    display: none;
+    color: $text-muted;
+    margin: 0 0 1 0;
+}
+
+/* An AI-prefilled field the pipeline couldn't resolve with confidence — an
+ * amber accent (vs. the primary-blue focus rule) so it reads as "review me,"
+ * not "selected." Cleared the moment the user edits the field. Matches
+ * #form-body's Input/Select selector specificity so it wins over the
+ * unfocused default left-accent rule. */
+#form-body Input.field-flagged,
+#form-body Select.field-flagged {
+    border-left: thick $warning;
+}

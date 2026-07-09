@@ -20,7 +20,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.widgets import Button, Static
 
-from cli.helpers import mask_email
+from cli.helpers import mask_api_key, mask_email
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
@@ -42,6 +42,8 @@ class SettingsData:
     used_today: int | None
     used_week: int | None
     paths: dict
+    llm: dict
+    llm_api_key_state: str
 
 
 class SettingsScreen(BaseScreen):
@@ -71,6 +73,7 @@ class SettingsScreen(BaseScreen):
                 ("browser", "Browser Configuration"),
                 ("limits", "Rate Limiting"),
                 ("data", "Data Storage"),
+                ("ai_assist", "AI Assist"),
             ):
                 with Container(classes="settings-section", id=f"section-{section_id}"):
                     yield Static(title, classes="settings-section-title")
@@ -126,6 +129,7 @@ class SettingsScreen(BaseScreen):
 
         browser = settings.get_browser_settings()
         automation = settings.get_automation_settings()
+        llm = settings.get_llm_settings()
 
         used_today: int | None = None
         used_week: int | None = None
@@ -155,12 +159,14 @@ class SettingsScreen(BaseScreen):
                 "session_path": str(settings.session_path),
                 "browser_data": str(settings.app_dir / "browser_data"),
             },
+            llm=llm,
+            llm_api_key_state=mask_api_key(llm.get("api_key")),
         )
 
     def _populate(self, data: SettingsData | None, error: str | None) -> None:
         status = self.query_one("#settings-status", Static)
         if error is not None:
-            for section_id in ("credentials", "browser", "limits", "data"):
+            for section_id in ("credentials", "browser", "limits", "data", "ai_assist"):
                 self.query_one(f"#body-{section_id}", Static).update("")
             status.update("Settings unavailable.")
             return
@@ -213,4 +219,12 @@ class SettingsScreen(BaseScreen):
             f"Database: {p['db_path']}\n"
             f"Session Data: {p['session_path']}\n"
             f"Browser Data: {p['browser_data']}"
+        )
+
+        llm = data.llm
+        self.query_one("#body-ai_assist", Static).update(
+            f"Mode: {llm.get('mode')}\n"
+            f"Base URL: {llm.get('base_url')}\n"
+            f"Model: {llm.get('model') or 'not set (local falls back to a RAM-based default)'}\n"
+            f"API Key: {data.llm_api_key_state}"
         )

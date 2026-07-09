@@ -113,3 +113,12 @@ def mask_email(email: str | None) -> str:
         prefix = local[:3] if len(local) >= 3 else local
         return f"{prefix}***@{domain}"
     return f"{email[:3]}***"
+
+
+def mask_api_key(key: str | None) -> str:
+    """'Set' / 'Not set' for display — an API key has no safe-to-show prefix
+
+    (unlike an email's domain), so this stays binary, matching how
+    ``LINKEDIN_PASSWORD`` is already shown in ``SettingsScreen``.
+    """
+    return "Set" if key else "Not set"

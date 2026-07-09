@@ -16,6 +16,7 @@ from cli.helpers import (
     campaign_get_field,
     csv_value,
     effective_daily_limit,
+    mask_api_key,
     mask_email,
 )
 
@@ -34,6 +35,16 @@ class TestMaskEmail:
     def test_empty_or_none(self):
         assert mask_email(None) == "Not set"
         assert mask_email("") == "Not set"
+
+
+@pytest.mark.unit
+class TestMaskApiKey:
+    def test_set(self):
+        assert mask_api_key("sk-abc123") == "Set"
+
+    def test_empty_or_none(self):
+        assert mask_api_key(None) == "Not set"
+        assert mask_api_key("") == "Not set"
 
 
 @pytest.mark.unit

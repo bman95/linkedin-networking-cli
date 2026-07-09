@@ -106,6 +106,32 @@ non-zero on failure — including a protective CAPTCHA/challenge stop.
   export PLAYWRIGHT_BROWSER_EXECUTABLE="/path/to/google-chrome"
   ```
 
+## AI-assisted campaign creation
+
+The TUI's Create Campaign screen has an optional "AI Assist" panel: describe
+who you want to connect with in plain language and a model fills in the form
+for you to review and edit before saving — it never saves on its own.
+
+- **Local (default, no API key, nothing leaves your machine)**: install
+  [Ollama](https://ollama.com) and pull a small model, e.g.
+  `ollama pull gemma3:1b`. The app talks to it at `http://localhost:11434` and
+  can also offer to pull a missing model for you (with a manual-command
+  alternative always shown alongside).
+- **Hosted (optional, via an API key)**: point at any OpenAI-compatible chat
+  endpoint:
+  ```bash
+  export LLM_BASE_URL="https://api.openai.com"
+  export LLM_API_KEY="sk-..."
+  export LLM_MODEL="gpt-4o-mini"
+  ```
+  Campaign descriptions are sent to this endpoint, so you'll be asked to
+  confirm once before the first hosted call.
+
+Other tunables (all optional): `LLM_MODE` (`local`/`hosted`, otherwise derived
+from whether `LLM_API_KEY` is set), `LLM_TIMEOUT_S` (default 60),
+`LLM_PULL_TIMEOUT_S` (default 1800), `LLM_MAX_TOKENS` (default 1024),
+`LLM_MAX_INPUT_CHARS` (default 4000).
+
 ## Development & Testing
 
 Install the development dependencies and run the test suite:
