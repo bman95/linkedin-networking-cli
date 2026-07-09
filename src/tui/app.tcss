@@ -451,7 +451,7 @@ SelectOverlay > .option-list--option-highlighted {
     height: 1fr;
 }
 
-/* ── Automation run surfaces (run panel + Extract screen) ─────────────── */
+/* ── Automation run surfaces (run panel + AutomationRunScreen hosts) ──── */
 
 #run-body {
     height: auto;

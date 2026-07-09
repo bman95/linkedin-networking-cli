@@ -3,10 +3,13 @@
 The **gate → select → confirm → run (streaming log) → summary / error** pipeline
 itself lives in :mod:`tui.screens.run_panel` (extracted for issue #42 so the
 campaign detail screen can embed it); this base is the *screen-shaped* host for
-flows that still need their own selection surface (today: Extract Profile
-Data). It owns the gate on ``db_manager`` + ``settings``, the selection
-widgets and their threaded population, the visible **Start** control, and
-delegates the confirm/run/stop/summary machinery to an embedded
+flows that need their own selection surface. None ship currently: issue #44
+removed the last one (``ExtractProfilesScreen``) pending the Voyager extraction
+rework (``DESIGN-PROPOSALS.md`` §6), which would restore a subclass here. Until
+then the run-pipeline tests keep exercising the panel through this host shape.
+It owns the gate on ``db_manager`` + ``settings``,
+the selection widgets and their threaded population, the visible **Start**
+control, and delegates the confirm/run/stop/summary machinery to an embedded
 :class:`~tui.screens.run_panel.AutomationRunPanel`.
 
 Interaction design (owner rule, 2026-07-09): starting a run is arrows + Enter

@@ -28,7 +28,6 @@ from .screens.campaign_edit import CampaignEditScreen
 from .screens.campaigns import CampaignsScreen
 from .screens.create_campaign import CreateCampaignScreen
 from .screens.dashboard import DashboardScreen
-from .screens.extract_profiles import ExtractProfilesScreen
 from .screens.home import HomeScreen
 from .screens.settings_view import SettingsScreen
 from .theme import LINKEDIN_THEME
@@ -42,7 +41,6 @@ __all__ = [
     "CampaignDetailScreen",
     "CampaignEditScreen",
     "CreateCampaignScreen",
-    "ExtractProfilesScreen",
     "DashboardScreen",
     "SettingsScreen",
     "run",

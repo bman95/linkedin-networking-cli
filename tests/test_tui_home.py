@@ -188,16 +188,6 @@ def test_home_shrinks_to_four_destinations():
 
 
 @pytest.mark.unit
-def test_extract_stays_reachable_from_the_palette():
-    """Extract Profile Data leaves the home launcher but remains a registered
-    destination, so the command palette (which enumerates NAV_ITEMS) keeps it."""
-    from tui.nav import NAV_ITEMS
-
-    extract = next(item for item in NAV_ITEMS if item.key == "extract")
-    assert extract.home is False
-
-
-@pytest.mark.unit
 async def test_home_renders_only_home_items(db_manager: DatabaseManager):
     from textual.widgets import ListView
 
