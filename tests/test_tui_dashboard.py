@@ -85,7 +85,8 @@ def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
 
 @pytest.mark.unit
 async def test_home_has_all_entries(db_manager: DatabaseManager):
-    """The home exposes every destination, ordered."""
+    """The home exposes every home destination, ordered (issue #42: the
+    automation flows moved onto the campaign detail; Extract is palette-only)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -96,9 +97,6 @@ async def test_home_has_all_entries(db_manager: DatabaseManager):
             "nav-dashboard",
             "nav-campaigns",
             "nav-create",
-            "nav-execute",
-            "nav-check",
-            "nav-extract",
             "nav-settings",
         ]
         assert menu.has_focus and menu.index == 0
@@ -149,9 +147,7 @@ async def test_command_palette_navigates(db_manager: DatabaseManager):
         assert names == [
             "Dashboard",
             "Campaigns",
-            "Create Campaign",
-            "Execute Campaign",
-            "Check Connections",
+            "New Campaign",
             "Extract Profile Data",
             "Settings",
             "Quit",

@@ -1,43 +1,39 @@
-"""Shared base for the long-running automation screens (issue #24).
+"""Shared base for the standalone long-running automation screens (issue #24).
 
-Execute Campaign, Check Connections and Extract Profile Data share one shape:
-**gate → select → confirm → run (streaming log) → summary / error**. This base
-owns everything generic to that shape — the gate on ``db_manager`` + ``settings``,
-the two-press confirm before an irreversible run, the thread worker that drives
-``asyncio.run`` around the automation, the progress sink that streams lines into a
-``RichLog`` from the worker thread, and the typed-error mapping. Subclasses fill
-in only what differs: the selection widgets, what to load into them, the
-confirmation summary, the async automation body, and the success summary.
+The **gate → select → confirm → run (streaming log) → summary / error** pipeline
+itself lives in :mod:`tui.screens.run_panel` (extracted for issue #42 so the
+campaign detail screen can embed it); this base is the *screen-shaped* host for
+flows that still need their own selection surface (today: Extract Profile
+Data). It owns the gate on ``db_manager`` + ``settings``, the selection
+widgets and their threaded population, the visible **Start** control, and
+delegates the confirm/run/stop/summary machinery to an embedded
+:class:`~tui.screens.run_panel.AutomationRunPanel`.
 
-Why a thread worker around ``asyncio.run`` (not a native async worker): it mirrors
-the classic CLI exactly (``asyncio.run(run_automation())``) and keeps the blocking
-``LinkedInAutomation`` setup off Textual's event loop, reusing the same
-``call_from_thread`` marshaling discipline the read/write screens already use.
+Interaction design (owner rule, 2026-07-09): starting a run is arrows + Enter
+first — focus the Start button and press Enter, then confirm on the focused
+inline confirm. ``ctrl+r`` remains as an accelerator (pressing it twice still
+starts, matching the old two-press muscle memory), never the only path.
 
-Browser side effects are **user-initiated**: nothing runs until the user selects a
-target and confirms with a second ``ctrl+r``. ``run_body`` is the single seam a
-test overrides to exercise the run/log/summary/error pipeline without a browser.
+``run_body`` is the single seam a test overrides to exercise the
+run/log/summary/error pipeline without a browser.
 """
 
 from __future__ import annotations
 
-import asyncio
-import threading
 from typing import Any
 
-from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.widgets import Button, RichLog, Static
+from textual.widgets import Button
 
 from config.settings import AppSettings
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
-from .automation_errors import describe_automation_error
 from .base import BaseScreen
+from .run_panel import AutomationRunPanel, RunSpec, run_with_linkedin
 
 logger = get_logger(__name__)
 
@@ -50,6 +46,7 @@ class AutomationRunScreen(BaseScreen):
 
     BINDINGS = [
         ("escape", "back", "Back"),
+        # Accelerator only (the primary path is the focused Start button):
         # priority so it fires while a Select/Input holds focus.
         Binding("ctrl+r", "start", "Start", priority=True),
         # Optional accelerator for the Stop button (issue #43). Deliberately
@@ -60,7 +57,7 @@ class AutomationRunScreen(BaseScreen):
     ]
 
     HINTS = (
-        ("ctrl+r", "start"),
+        ("enter", "start"),
         ("s", "stop"),
         ("esc", "back"),
         ("q", "quit"),
@@ -73,56 +70,43 @@ class AutomationRunScreen(BaseScreen):
         super().__init__()
         self._db_manager = db_manager
         self._settings = settings
-        self._app_ref: App | None = None
-        # NB: distinct names — a bare ``_running`` shadows Textual's
-        # MessagePump._running (always True once mounted), which would make the
-        # start guard a permanent no-op. See docs/tui-migration.md §9.
-        self._run_confirming = False
-        self._run_active = False
-        self._run_done = False
-        # First esc mid-run warns (the run would keep going headless); the
-        # second one leaves anyway.
-        self._leave_confirming = False
+        self._panel: AutomationRunPanel | None = None
         # Subclasses flip this off (in apply_options) to block start, e.g. when
         # there are no eligible campaigns.
         self._run_can_start = True
-        # Cooperative cancellation (issue #43): a fresh Event per run, shared
-        # with the engine loops (checked between profiles). _stop_requested
-        # keeps the request idempotent and drives the "Stopping…" status.
-        self._stop_event: threading.Event | None = None
-        self._stop_requested = False
 
     # ── compose ───────────────────────────────────────────────────────────
 
     def compose_body(self) -> ComposeResult:
         with VerticalScroll(id="run-body"):
             yield from self.compose_selection()
-            yield RichLog(id="run-log", highlight=False, markup=False, wrap=True)
-        # The stop control (issue #43): a visible, focusable button — arrows/
-        # tab + Enter first, with "s" as the accelerator. Hidden until a run
-        # starts; focused by default while the run is active so a bare Enter
-        # requests the stop.
-        yield Button("Stop after current profile", id="run-stop")
-        yield Static("", id="run-status", classes="status-line")
+            # The start control: a visible, focusable button — arrows/tab +
+            # Enter first, with ctrl+r as the accelerator.
+            yield Button("Start", id="run-start")
+        yield AutomationRunPanel(id="run-panel")
 
     def compose_selection(self) -> ComposeResult:
         """Yield the selection widgets. Override; default is empty."""
         return iter(())
 
     def on_mount(self) -> None:
-        # The log and stop control are hidden until a run starts; selection
-        # comes first.
-        self.query_one("#run-log", RichLog).display = False
-        self.query_one("#run-stop", Button).display = False
+        # Cached on the UI thread: the worker-thread seams (progress,
+        # _stop_event) must not run a DOM query per call.
+        self._panel = self.query_one("#run-panel", AutomationRunPanel)
         if self._db_manager is None or self._settings is None:
-            self._set_status(
+            self.panel.set_status(
                 "Automation unavailable: a database and app settings are required.",
                 "error",
             )
             self._run_can_start = False
-            self._disable_selection()
+            self._disable_selection(True)
             return
         self.populate_selection()
+
+    @property
+    def panel(self) -> AutomationRunPanel:
+        assert self._panel is not None  # set in on_mount
+        return self._panel
 
     # ── subclass hooks ────────────────────────────────────────────────────
 
@@ -139,7 +123,7 @@ class AutomationRunScreen(BaseScreen):
         self._set_status(self.ready_hint())
 
     def ready_hint(self) -> str:
-        return "Configure the run, then ctrl+r to start."
+        return "Configure the run, then Start."
 
     def validate(self) -> str | None:
         """Return a one-line confirmation summary, or None if the current
@@ -152,25 +136,11 @@ class AutomationRunScreen(BaseScreen):
         Default enters ``LinkedInAutomation``, logs in, then calls
         :meth:`automate`. Tests override this whole method to avoid a browser.
         """
-        from automation.linkedin import LinkedInAutomation
-
         # action_start gates the run on both being present.
         assert self._db_manager is not None and self._settings is not None
-        if self._stop_event is not None and self._stop_event.is_set():
-            # Stopped before anything started — don't even launch the browser.
-            return {"status": "cancelled"}
-        async with LinkedInAutomation(self._db_manager, self._settings) as automation:
-            self.progress("Launching browser and attaching to Chrome…")
-            ok = await automation.login(self.progress)
-            if not ok:
-                return {"status": "login_failed"}
-            # A stop requested while login was underway takes effect here,
-            # before any automation work begins (the login confirmation waits
-            # are blocking Playwright calls and cannot be interrupted).
-            if self._stop_event is not None and self._stop_event.is_set():
-                self.progress("Stop requested — ending the run before automation began.")
-                return {"status": "cancelled"}
-            return await self.automate(automation)
+        return await run_with_linkedin(
+            self._db_manager, self._settings, self.panel, self.automate
+        )
 
     async def automate(self, automation) -> dict:
         """The flow-specific automation, given a logged-in automation. Override."""
@@ -180,28 +150,11 @@ class AutomationRunScreen(BaseScreen):
         """Render a successful result dict to a summary string. Override."""
         return "Run complete."
 
-    # ── start / confirm / run ─────────────────────────────────────────────
+    # ── start / stop / esc ────────────────────────────────────────────────
 
     def action_back(self) -> None:
-        """``esc``: cancel an armed confirmation, warn once mid-run, else leave.
-
-        The confirm prompt promises "esc to cancel", so esc while confirming
-        cancels the confirmation. Mid-run, leaving does NOT stop the automation
-        (the worker keeps driving the browser), so the first esc says exactly
-        that and only a second esc leaves.
-        """
-        if self._run_confirming:
-            self._run_confirming = False
-            self._set_status("Cancelled. " + self.ready_hint())
-            return
-        if self._run_active and not self._leave_confirming:
-            self._leave_confirming = True
-            self._set_status(
-                "Run in progress — leaving does not stop it; use the Stop "
-                "button (Enter or s) to stop after the current profile. "
-                "Press esc again to leave anyway.",
-                "warn",
-            )
+        """``esc``: let the panel cancel/warn first; only then leave."""
+        if self.panel.handle_escape():
             return
         self.app.pop_screen()
 
@@ -210,152 +163,47 @@ class AutomationRunScreen(BaseScreen):
             self._db_manager is None
             or self._settings is None
             or not self._run_can_start
-            or self._run_active
-            or self._run_done
+            or self.panel.run_active
         ):
             return
         summary = self.validate()
         if summary is None:
-            self._run_confirming = False
             return
-        if not self._run_confirming:
-            self._run_confirming = True
-            self._set_status(
-                f"{summary}  Press ctrl+r again to start, esc to cancel.", "warn"
+        self.panel.request(
+            RunSpec(
+                action_label=self.ACTION_LABEL,
+                confirm=summary,
+                body=self.run_body,
+                render=self.render_result,
             )
-            return
-        self._run_confirming = False
-        self._begin_run()
-
-    def _begin_run(self) -> None:
-        self._run_active = True
-        self._disable_selection()
-        log = self.query_one("#run-log", RichLog)
-        log.display = True
-        log.clear()
-        # Fresh stop flag per run, created BEFORE the worker starts so the
-        # engine sees the same Event the stop control sets.
-        self._stop_event = threading.Event()
-        self._stop_requested = False
-        stop = self.query_one("#run-stop", Button)
-        stop.display = True
-        stop.disabled = False
-        # Focus lands on the stop control while the run is active, so a bare
-        # Enter stops the run (owner rule: arrows + Enter first).
-        stop.focus()
-        self._set_status(
-            "Running…  Enter (or s) stops after the current profile."
         )
-        # Capture the app on the UI thread for the worker's progress marshaling.
-        self._app_ref = self.app
-        self._run_worker(self.app)
-
-    # ── stop (issue #43) ──────────────────────────────────────────────────
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run-stop":
-            self._request_stop()
 
     def action_stop(self) -> None:
-        self._request_stop()
+        self.panel.request_stop()
 
-    def _request_stop(self) -> None:
-        """Ask the run to stop after the current profile (idempotent).
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "run-start":
+            event.stop()
+            self.action_start()
 
-        Sets the shared ``threading.Event``; the engine loops poll it between
-        profiles, so the in-flight send always completes and the run returns a
-        normal partial summary (rendered by :meth:`_finish` as ``cancelled``).
-        """
-        if not self._run_active or self._stop_requested or self._stop_event is None:
-            return
-        self._stop_requested = True
-        # A stop supersedes a pending leave warning: the status line it wrote
-        # is replaced below, so the armed second-esc must not survive it.
-        self._leave_confirming = False
-        self._stop_event.set()
-        stop = self.query_one("#run-stop", Button)
-        stop.disabled = True
-        # Phase-neutral copy: during login there is no "current profile" yet —
-        # the run ends at the next safe point the loop (or run_body) checks.
-        self._append_log("Stop requested — finishing the current step…")
-        self._set_status(
-            "Stopping…  The run ends at the next safe point.", "warn"
-        )
+    def on_automation_run_panel_started(self, event: AutomationRunPanel.Started) -> None:
+        self._disable_selection(True)
 
-    @work(thread=True, exclusive=True, group="run")
-    def _run_worker(self, app: App) -> None:
-        try:
-            result = asyncio.run(self.run_body())
-        except Exception as exc:  # any automation failure → friendly stop
-            self.marshal(app, self._finish, None, exc)
-            return
-        self.marshal(app, self._finish, result, None)
+    def on_automation_run_panel_finished(self, event: AutomationRunPanel.Finished) -> None:
+        # Re-enable the selection for a follow-up run (the panel allows a new
+        # request once the previous run has finished).
+        self._disable_selection(False)
+        self.query_one("#run-start", Button).focus()
 
-    # ── progress (worker thread → UI) ─────────────────────────────────────
+    # ── progress / stop seams (used by subclass automate bodies) ──────────
 
     def progress(self, message: Any) -> None:
-        """Progress sink passed to the automation as its ``progress_callback``.
+        self.panel.progress(message)
 
-        Called from the worker thread; marshals a line into the log on the UI
-        thread, and is a silent no-op once the app has stopped.
-        """
-        self.marshal(self._app_ref, self._append_log, str(message))
-
-    def _append_log(self, message: str) -> None:
-        self.query_one("#run-log", RichLog).write(message)
-
-    # ── finish (worker thread → UI) ───────────────────────────────────────
-
-    def _finish(self, result: dict | None, exc: Exception | None) -> None:
-        self._run_active = False
-        self._run_done = True
-        self._leave_confirming = False
-        self.query_one("#run-stop", Button).display = False
-        log = self.query_one("#run-log", RichLog)
-        if exc is not None:
-            headline, evidence = describe_automation_error(exc, self.ACTION_LABEL)
-            log.write(headline)
-            log.write(evidence)
-            self._set_status("Stopped. Press esc to return.", "error")
-            return
-        status = (result or {}).get("status")
-        # A stop requested during the final profile can race the loop's own
-        # flag check: all the work finishes before the flag is observed and
-        # the body honestly reports success. Report the completion — calling
-        # it "partial" would misstate a finished run — but acknowledge the
-        # request instead of showing a bare green "Done." after "Stopping…".
-        # One policy for every run screen; engine-observed stops arrive here
-        # as status "cancelled" and take the branch below instead.
-        if status == "success" and self._stop_requested:
-            log.write(self.render_result(result or {}))
-            self._set_status(
-                "Done — the run finished before the stop took effect. "
-                "Press esc to return.",
-                "good",
-            )
-            return
-        if status == "login_failed":
-            log.write("Login to LinkedIn failed — could not start the run.")
-            self._set_status("Login failed. Press esc to return.", "error")
-            return
-        if status == "safety_stop":
-            # A protective CAPTCHA/challenge stop: show the subclass's summary
-            # but never a green "Done." for a run cut short mid-flight.
-            log.write(self.render_result(result or {}))
-            self._set_status(
-                "Stopped early to protect the account. Press esc to return.",
-                "error",
-            )
-            return
-        if status == "cancelled":
-            # A user-requested stop (issue #43) renders like a completion, not
-            # an error — the loop stopped at a safe point, so the partial
-            # counts are consistent. Neutral status: not the green "Done.".
-            log.write(self.render_result(result or {}))
-            self._set_status("Stopped at your request. Press esc to return.")
-            return
-        log.write(self.render_result(result or {}))
-        self._set_status("Done. Press esc to return.", "good")
+    @property
+    def _stop_event(self):
+        # The engine-facing stop flag lives on the panel (fresh per run).
+        return self.panel.stop_event
 
     # ── populate worker ───────────────────────────────────────────────────
 
@@ -374,17 +222,14 @@ class AutomationRunScreen(BaseScreen):
             self._set_status(error, "error")
             return
         self.apply_options(data)
+        # The panel echoes this hint after a cancelled confirmation.
+        self.panel.idle_hint = self.ready_hint()
 
     # ── helpers ───────────────────────────────────────────────────────────
 
-    def _disable_selection(self) -> None:
-        for widget in self.query("#run-body Input, #run-body Select"):
-            widget.disabled = True
+    def _disable_selection(self, disabled: bool = True) -> None:
+        for widget in self.query("#run-body Input, #run-body Select, #run-start"):
+            widget.disabled = disabled
 
     def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#run-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        # Text() renders literally: messages carry raw exception text and user
-        # data (campaign names), whose square brackets must not be parsed as
-        # markup — see automation_errors' plain-text contract.
-        status.update(Text(message))
+        self.panel.set_status(message, kind)

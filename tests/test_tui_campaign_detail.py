@@ -6,7 +6,7 @@ actions (toggle active, delete with confirmation, edit) against a real
 """
 
 import pytest
-from textual.widgets import DataTable, Input, Static
+from textual.widgets import Button, DataTable, Input, Label, ListView, Static
 
 from database.operations import DatabaseManager
 from tui.app import (
@@ -16,6 +16,7 @@ from tui.app import (
     HomeScreen,
     LinkedInTUI,
 )
+from tui.screens.run_panel import ConfirmBar
 
 
 def make_campaign(db: DatabaseManager, name="Backend Engineers", **extra):
@@ -74,7 +75,7 @@ async def test_detail_renders_fields(db_manager: DatabaseManager):
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, c.id))
-        await wait_text(pilot, "#detail-status", "Read-only")
+        await wait_text(pilot, "#detail-status", "select an action")
         overview = str(app.screen.query_one("#detail-body-overview", Static).render())
         assert "Designers NYC" in overview
         assert "Active" in overview
@@ -88,7 +89,7 @@ async def test_detail_toggle_active(db_manager: DatabaseManager):
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, c.id))
-        await wait_text(pilot, "#detail-status", "Read-only")
+        await wait_text(pilot, "#detail-status", "select an action")
         await pilot.press("a")  # toggle -> deactivate
         for _ in range(60):
             if db_manager.get_campaign(c.id).active is False:
@@ -98,13 +99,75 @@ async def test_detail_toggle_active(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_detail_actions_list_enter_opens_edit(db_manager: DatabaseManager):
+    """The ACTIONS list is the primary path (owner rule): arrows + Enter reach
+    every manage action — here, Edit (the third item)."""
+    c = make_campaign(db_manager)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "select an action")
+        actions = app.screen.query_one("#detail-actions", ListView)
+        assert app.focused is actions
+        await pilot.press("down", "down")  # Run now → Check acceptances → Edit
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, CampaignEditScreen)
+
+
+@pytest.mark.unit
+async def test_detail_toggle_item_names_the_transition(db_manager: DatabaseManager):
+    """The toggle action reads 'Deactivate' while active and 'Activate' after."""
+    c = make_campaign(db_manager)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "select an action")
+        label = app.screen.query_one("#action-toggle .nav-title", Label)
+        assert str(label.render()) == "Deactivate"
+        await pilot.press("a")
+        for _ in range(60):
+            await pilot.pause()
+            if str(label.render()) == "Activate":
+                break
+        assert str(label.render()) == "Activate"
+        assert db_manager.get_campaign(c.id).active is False
+
+
+@pytest.mark.unit
+async def test_detail_delete_via_focused_confirm_button(db_manager: DatabaseManager):
+    """Activating Delete arms a focused inline confirm (owner rule: Enter
+    confirms, esc cancels — no chord-twice requirement)."""
+    c = make_campaign(db_manager)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "select an action")
+        await pilot.press("d")  # arms the confirm bar
+        await wait_text(pilot, "#detail-status", "Enter to confirm")
+        bar = app.screen.query_one("#detail-delete-confirm", ConfirmBar)
+        assert bar.armed
+        assert app.focused is bar.query_one(".confirm-yes", Button)
+        assert db_manager.get_campaign(c.id) is not None  # not deleted yet
+        await pilot.press("enter")
+        for _ in range(60):
+            if db_manager.get_campaign(c.id) is None:
+                break
+            await pilot.pause()
+    assert db_manager.get_campaign(c.id) is None
+
+
+@pytest.mark.unit
 async def test_detail_delete_needs_two_presses(db_manager: DatabaseManager):
     c = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, c.id))
-        await wait_text(pilot, "#detail-status", "Read-only")
+        await wait_text(pilot, "#detail-status", "select an action")
 
         await pilot.press("d")  # arms confirmation only
         text = await wait_text(pilot, "#detail-status", "confirm")
@@ -155,7 +218,7 @@ async def test_detail_export_csv(db_manager: DatabaseManager, tmp_path, monkeypa
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, c.id))
-        await wait_text(pilot, "#detail-status", "Read-only")
+        await wait_text(pilot, "#detail-status", "select an action")
         await pilot.press("x")
         text = await wait_text(pilot, "#detail-status", "Exported")
         assert "Exported" in text

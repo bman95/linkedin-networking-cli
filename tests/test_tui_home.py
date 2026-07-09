@@ -171,3 +171,42 @@ async def test_home_number_key_opens_destination(db_manager: DatabaseManager):
         await pilot.press("2")  # 2 -> Campaigns
         await pilot.pause()
         assert isinstance(app.screen, CampaignsScreen)
+
+
+# ── campaign-centric navigation (issue #42) ─────────────────────────────────
+
+
+@pytest.mark.unit
+def test_home_shrinks_to_four_destinations():
+    """Home lists exactly Dashboard · Campaigns · New Campaign · Settings;
+    Execute/Check folded into the campaign detail screen (issue #42)."""
+    from tui.nav import HOME_ITEMS
+
+    assert [item.key for item in HOME_ITEMS] == [
+        "dashboard", "campaigns", "create", "settings",
+    ]
+
+
+@pytest.mark.unit
+def test_extract_stays_reachable_from_the_palette():
+    """Extract Profile Data leaves the home launcher but remains a registered
+    destination, so the command palette (which enumerates NAV_ITEMS) keeps it."""
+    from tui.nav import NAV_ITEMS
+
+    extract = next(item for item in NAV_ITEMS if item.key == "extract")
+    assert extract.home is False
+
+
+@pytest.mark.unit
+async def test_home_renders_only_home_items(db_manager: DatabaseManager):
+    from textual.widgets import ListView
+
+    from tui.nav import HOME_ITEMS
+
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        nav = app.screen.query_one("#home-nav", ListView)
+        ids = [item.id for item in nav.children]
+        assert ids == [f"nav-{item.key}" for item in HOME_ITEMS]
+        assert "nav-execute" not in ids and "nav-check" not in ids
