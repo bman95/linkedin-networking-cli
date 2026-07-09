@@ -2,10 +2,11 @@
 
 Both the Create and Edit flows gather the exact same campaign fields, with the
 same validation and the same display-name → stored-value mapping the classic
-InquirerPy CLI uses (`linkedin_cli.py` create_campaign / edit_campaign). To avoid
-two copies, the field widgets, the read+validate step, and the prefill step live
-here; each screen keeps its own (different) persistence worker — create calls
-``create_campaign``, edit calls ``update_campaign``.
+InquirerPy CLI used (`create_campaign` / `edit_campaign` in the now-retired
+`linkedin_cli.py`, issue #47). To avoid two copies, the field widgets, the
+read+validate step, and the prefill step live here; each screen keeps its own
+(different) persistence worker — create calls ``create_campaign``, edit calls
+``update_campaign``.
 
 ``CampaignFormScreen`` is the shared base class. Besides the status-line helper
 it owns the **location** flows the classic CLI exposes beyond the curated list:

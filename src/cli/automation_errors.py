@@ -1,11 +1,11 @@
-"""Typed automation error → user-facing message mapping, shared by both UIs.
+"""Typed automation error → user-facing message mapping.
 
 One home for the six exception headlines and the evidence-reference wording so
-the classic InquirerPy CLI (``linkedin_cli.py``) and the Textual TUI
-(``src/tui/screens/automation_errors.py`` re-exports from here) cannot drift.
-The strings returned are plain text: each UI applies its own presentation on
-top (the CLI Rich-escapes and logs the traceback; the TUI writes them into a
-``markup=False`` log as-is).
+the Textual TUI (``src/tui/screens/automation_errors.py`` re-exports from here)
+and the non-interactive ``linkedin-run`` entry point (``cli.runner``) cannot
+drift. The strings returned are plain text: each caller applies its own
+presentation on top (the TUI writes them into a ``markup=False`` log as-is;
+``linkedin-run`` prints them straight to stderr).
 """
 
 from __future__ import annotations

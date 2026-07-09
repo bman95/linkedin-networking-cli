@@ -19,6 +19,11 @@ Success is the **quality of the experience** — full-screen, smooth, navigable,
 calm, like Claude Code / Codex — not line count. #24 is an **epic** that stays
 open until every flow is migrated.
 
+> **Update (issue #47, cutover complete).** Every flow in §3 reached a
+> signed-off TUI equivalent; `linkedin_cli.py` and the InquirerPy dependency
+> have been removed. The TUI (`linkedin-tui`) is now the sole interactive UI.
+> See §4 item 4 and §5 for what the cutover kept, dropped, and why.
+
 ## 2. Architecture constraints (do not break)
 
 These invariants are load-bearing and protected by tests. Every new screen must
@@ -28,9 +33,10 @@ respect them.
   `src/database`, `src/config` is UI-agnostic and reused **as-is**. If a change
   seems to need touching business logic, stop and reconsider — it almost
   certainly doesn't.
-- **The classic CLI keeps working.** `linkedin_cli.py` and the InquirerPy
-  dependency stay until full parity is reached. Both entry points
-  (`linkedin-cli`, `linkedin-tui`) ship side by side during the migration.
+- **The classic CLI kept working until full parity was reached.**
+  `linkedin_cli.py` and the InquirerPy dependency shipped side by side with the
+  TUI throughout the migration (`linkedin-cli`, `linkedin-tui` as separate
+  entry points) and were retired in the issue #47 cutover; see §4 item 4 / §5.
 - **Lazy package import (PEP 562).** `tui/__init__.py` exposes `LinkedInTUI`
   lazily and must **not** eagerly import `tui.app` or any `tui.screens.*` module.
   Screen modules call `get_logger(__name__)` at module scope, which the first
@@ -74,12 +80,12 @@ side effects); write and automation flows follow.
 | Classic flow | TUI screen | Data / deps | Side effects | Status |
 | --- | --- | --- | --- | --- |
 | Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_weekly_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
-| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
+| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** (the classic CLI's standalone "Look up location code (online)" utility was not ported — its purpose, finding a geoUrn to paste elsewhere, is superseded by Create/Edit Campaign's own inline online location search, which turns a result directly into a usable option instead of a code to copy; dropped in the issue #47 cutover) |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
-| Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail, smart checker only; issue #45 removed the direct per-profile checker everywhere — "check all campaigns" remains classic-CLI-only) |
-| Extract Profile Data | — | `extract_detailed_profile` | browser, network | **removed from the TUI (issue #44)** — pre-SDUI selectors, results weren't persisted; classic CLI (`linkedin_cli.py`) still has it. Pending the Voyager rework, see `DESIGN-PROPOSALS.md` §6 |
+| Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail, smart checker only; issue #45 removed the direct per-profile checker everywhere. The classic CLI's "check all campaigns" convenience — looping the same per-campaign checker across every campaign with pending connections in one action — was not ported: it was judged redundant with checking each campaign in turn, and dropped in the issue #47 cutover rather than kept classic-CLI-only) |
+| Extract Profile Data | — | `extract_detailed_profile` | browser, network | **removed entirely (issue #44 removed it from the TUI; the issue #47 cutover deleted the classic CLI's copy too)**. Pending the Voyager rework, see `DESIGN-PROPOSALS.md` §6 |
 | Exit | key binding (`q`) / command palette | — | — | done |
 
 ## 4. Flow-by-flow migration order, with rationale
@@ -146,20 +152,25 @@ side effects); write and automation flows follow.
    Enter stops; `s` is the accelerator) that returns a normal partial summary
    with `status: "cancelled"`. Leaving the screen still does *not* stop the
    run; `esc` after completion returns.
-4. **Cutover.** Once every flow has a TUI equivalent at parity, drop InquirerPy.
-   Every classic main-menu flow now has a TUI equivalent, including the
-   browser-bound online location search / custom geoUrn entry in Create/Edit;
-   cutover itself (removing InquirerPy and `linkedin_cli.py`) is gated on the
-   owner's per-flow sign-off.
+4. **Cutover (done, issue #47).** Every classic main-menu flow had a TUI
+   equivalent, including the browser-bound online location search / custom
+   geoUrn entry in Create/Edit, so `linkedin_cli.py` and the InquirerPy
+   dependency were removed. Two small classic-only conveniences were dropped
+   rather than ported — both documented where they lived in §3 (the Check
+   Connections "check all campaigns" loop, and the standalone Settings
+   location-lookup utility, each superseded by an equivalent already in the
+   TUI) — and Extract Profile Data (already TUI-absent since issue #44) is now
+   gone everywhere. The non-interactive `run` path survives as its own
+   `linkedin-run` entry point (`linkedin_run.py` / `src/cli/runner.py`).
 
 Rationale: de-risk by deferring side-effecting flows. Each stage builds on the
 proven conventions of the previous one, so the experience stays coherent as the
 surface grows.
 
-## 5. Parity / cutover strategy for dropping InquirerPy
+## 5. Parity / cutover strategy for dropping InquirerPy (done, issue #47)
 
-The TUI coexists with `linkedin_cli.py` throughout. Cutover is gated on a
-per-flow parity checklist:
+The TUI coexisted with `linkedin_cli.py` throughout the migration. Cutover was
+gated on a per-flow parity checklist:
 
 - **Vocabulary parity.** The TUI reuses the classic CLI's labels and wording so
   users aren't relearning the tool. Verified examples already in place:
@@ -175,8 +186,10 @@ per-flow parity checklist:
     "Search Limit", "App Directory", "Database", "Session Data", "Browser Data".
 - **Behavior parity.** Each migrated flow does what its classic counterpart
   does, including the demo/degraded fallbacks.
-- **Cutover.** InquirerPy and `linkedin_cli.py` are removed only when every flow
-  in §3 has a signed-off TUI equivalent. Until then both entry points ship.
+- **Cutover.** InquirerPy and `linkedin_cli.py` were removed once every flow in
+  §3 had a signed-off TUI equivalent (two minor classic-only conveniences were
+  deliberately dropped rather than ported — see §3 and §4 item 4 — since each
+  was superseded by an equivalent already in the TUI).
 
 ## 6. Design system
 

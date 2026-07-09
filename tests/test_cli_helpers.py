@@ -2,10 +2,9 @@
 Tests for the pure CLI helpers.
 
 These cover formatting/field-access/CSV helpers that don't require an
-interactive terminal, a database, or a browser. The logic now lives in
-``cli.helpers`` (extracted from the ``linkedin_cli.py`` monolith); the
-``LinkedInCLI`` static methods remain as thin delegators, so we also assert
-those still return identical results (no behavior change).
+interactive terminal, a database, or a browser. The logic lives in
+``cli.helpers``, shared by the TUI and the non-interactive ``linkedin-run``
+entry point.
 """
 
 from datetime import datetime
@@ -19,7 +18,6 @@ from cli.helpers import (
     effective_daily_limit,
     mask_email,
 )
-from linkedin_cli import LinkedInCLI
 
 
 @pytest.mark.unit
@@ -37,13 +35,6 @@ class TestMaskEmail:
         assert mask_email(None) == "Not set"
         assert mask_email("") == "Not set"
 
-    def test_delegator_matches_helper(self):
-        """The class static method delegates to the extracted helper."""
-        assert LinkedInCLI._mask_email("johndoe@example.com") == mask_email(
-            "johndoe@example.com"
-        )
-        assert LinkedInCLI._mask_email(None) == "Not set"
-
 
 @pytest.mark.unit
 class TestCsvValue:
@@ -58,11 +49,6 @@ class TestCsvValue:
         assert csv_value(42) == "42"
         assert csv_value("sent") == "sent"
 
-    def test_delegator_matches_helper(self):
-        dt = datetime(2025, 1, 15, 12, 30, 0)
-        assert LinkedInCLI._csv_value(dt) == csv_value(dt)
-        assert LinkedInCLI._csv_value(None) == ""
-
 
 @pytest.mark.unit
 class TestCampaignGetField:
@@ -75,12 +61,6 @@ class TestCampaignGetField:
         data = {"name": "Demo"}
         assert campaign_get_field(data, "name") == "Demo"
         assert campaign_get_field(data, "missing", 7) == 7
-
-    def test_delegator_matches_helper(self):
-        data = {"name": "Demo"}
-        assert LinkedInCLI._campaign_get_field(data, "name") == campaign_get_field(
-            data, "name"
-        )
 
 
 @pytest.mark.unit
