@@ -408,6 +408,16 @@ class CampaignDetailScreen(BaseScreen):
             self.app, "settings", None
         )
 
+    def _cancel_armed_confirms(self) -> None:
+        """Disarm every armed confirmation before a different action proceeds.
+
+        An armed confirm captured its gates (e.g. "campaign is active") at
+        request time; any mutating or superseding action invalidates them, so
+        no armed Enter may survive it.
+        """
+        self._cancel_delete_confirm()
+        self.panel.dismiss_confirm()
+
     def _automation_ready(self) -> bool:
         """Shared gate for the run/check actions; reports into the panel."""
         self._cancel_delete_confirm()
@@ -476,6 +486,12 @@ class CampaignDetailScreen(BaseScreen):
         campaign = self._db_manager.get_campaign(self._campaign_id)
         if campaign is None:
             raise RuntimeError("Campaign no longer exists.")
+        if not campaign.active:
+            # Defense in depth behind the action-time gate: the campaign may
+            # have been deactivated between arming the confirm and this read.
+            raise RuntimeError(
+                "Campaign is inactive — activate it before running."
+            )
         limit = self._automation_settings.get_automation_settings().get("search_limit", 100)
         self.panel.progress(f"Searching for up to {limit} targeted profiles…")
         results = await automation.search_and_connect(
@@ -507,10 +523,17 @@ class CampaignDetailScreen(BaseScreen):
         self.load_detail()
         self.query_one("#detail-actions", ListView).focus()
 
+    def on_automation_run_panel_confirm_dismissed(
+        self, event: AutomationRunPanel.ConfirmDismissed
+    ) -> None:
+        # The dismissed bar held focus; hand it back to the actions list so
+        # arrows/Enter keep working.
+        self.query_one("#detail-actions", ListView).focus()
+
     # ── manage actions ────────────────────────────────────────────────────
 
     def action_edit(self) -> None:
-        self._cancel_delete_confirm()
+        self._cancel_armed_confirms()
         if self._db_manager is None or self._busy:
             return
         from .campaign_edit import CampaignEditScreen
@@ -518,7 +541,7 @@ class CampaignDetailScreen(BaseScreen):
         self.app.push_screen(CampaignEditScreen(self._db_manager, self._campaign_id))
 
     def action_toggle_active(self) -> None:
-        self._cancel_delete_confirm()
+        self._cancel_armed_confirms()
         if self._db_manager is None or self._busy or self._active is None:
             return
         self._busy = True
@@ -527,7 +550,7 @@ class CampaignDetailScreen(BaseScreen):
         self._run_update(self.app, {"active": new_state})
 
     def action_export(self) -> None:
-        self._cancel_delete_confirm()
+        self._cancel_armed_confirms()
         if self._db_manager is None or self._busy:
             return
         self._busy = True
@@ -535,6 +558,9 @@ class CampaignDetailScreen(BaseScreen):
         self._run_export(self.app)
 
     def action_delete(self) -> None:
+        # An armed run confirm must not coexist with the delete confirm (two
+        # live "Enter to confirm" prompts); the delete bar arms below.
+        self.panel.dismiss_confirm()
         if self._db_manager is None or self._busy:
             return
         if self.panel.run_active:
@@ -575,6 +601,9 @@ class CampaignDetailScreen(BaseScreen):
         bar = self.query_one("#detail-delete-confirm", ConfirmBar)
         if bar.armed:
             bar.disarm()
+            # The bar held focus while armed; hand it back so arrows/Enter
+            # keep working (a hidden widget does not release focus itself).
+            self.query_one("#detail-actions", ListView).focus()
 
     def _do_delete(self) -> None:
         if self._db_manager is None or self._busy:
@@ -583,7 +612,11 @@ class CampaignDetailScreen(BaseScreen):
         self._set_status("Deleting…", "warn")
         self._run_delete(self.app)
 
-    @work(thread=True, exclusive=True)
+    # Own worker group: `exclusive=True` in the *default* group would let a
+    # reload scheduled in the same tick (screen resume, run-finished refresh)
+    # cancel a queued mutation before it ever ran — silently losing the write
+    # and leaving `_busy` stuck True (its marshal would never fire).
+    @work(thread=True, exclusive=True, group="mutate")
     def _run_update(self, app: App, updates: dict) -> None:
         assert self._db_manager is not None  # guarded in action_toggle_active
         try:
@@ -621,7 +654,7 @@ class CampaignDetailScreen(BaseScreen):
         self._busy = False
         self._set_status(message, kind)
 
-    @work(thread=True, exclusive=True)
+    @work(thread=True, exclusive=True, group="mutate")
     def _run_delete(self, app: App) -> None:
         assert self._db_manager is not None  # guarded in action_delete
         try:

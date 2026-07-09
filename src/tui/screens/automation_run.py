@@ -195,6 +195,14 @@ class AutomationRunScreen(BaseScreen):
         self._disable_selection(False)
         self.query_one("#run-start", Button).focus()
 
+    def on_automation_run_panel_confirm_dismissed(
+        self, event: AutomationRunPanel.ConfirmDismissed
+    ) -> None:
+        # The dismissed bar held focus; hand it back to the Start control so
+        # arrows/Enter keep working (the degraded screen keeps it disabled).
+        if self._run_can_start and not self.panel.run_active:
+            self.query_one("#run-start", Button).focus()
+
     # ── progress / stop seams (used by subclass automate bodies) ──────────
 
     def progress(self, message: Any) -> None:

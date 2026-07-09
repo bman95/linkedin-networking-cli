@@ -143,6 +143,10 @@ class ConfirmBar(Horizontal):
         self.post_message(self.Confirmed(self) if confirmed else self.Cancelled(self))
 
     def on_key(self, event) -> None:
+        # A disarmed bar must never eat keys: focus can still sit on one of its
+        # (now hidden) buttons for the instant before the host refocuses.
+        if not self.armed:
+            return
         # Arrows move between the two buttons (arrows + Enter first).
         if event.key in ("left", "right", "up", "down"):
             event.stop()
@@ -171,6 +175,18 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
             self.panel = panel
             self.result = result
             self.error = error
+
+    class ConfirmDismissed(Message):
+        """An armed confirmation went away without starting a run.
+
+        Hosts restore focus to their primary control on this: the confirm bar
+        held focus while armed, and hiding a widget does not move focus off it
+        — without the hand-back, arrows/Enter would land in an invisible bar.
+        """
+
+        def __init__(self, panel: AutomationRunPanel) -> None:
+            super().__init__()
+            self.panel = panel
 
     def __init__(self, *, idle_hint: str = "", id: str | None = None) -> None:
         super().__init__(id=id)
@@ -265,6 +281,21 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
     def _cancel_confirm(self) -> None:
         self._spec = None
         self.set_status(("Cancelled. " + self.idle_hint).strip())
+        # The bar held focus while armed; hosts refocus their primary control.
+        self.post_message(self.ConfirmDismissed(self))
+
+    def dismiss_confirm(self) -> None:
+        """Disarm an armed confirmation (no-op otherwise).
+
+        Called by hosts when another action supersedes the armed run — e.g.
+        toggling/editing/deleting the campaign the confirmation was validated
+        against. The armed spec captured gates (like "campaign is active") at
+        request time, so it must never survive a state change.
+        """
+        bar = self.query_one("#run-confirm", ConfirmBar)
+        if bar.armed:
+            bar.disarm()
+            self._cancel_confirm()
 
     def handle_escape(self) -> bool:
         """esc, as the host delegates it: cancel an armed confirmation, warn
@@ -277,8 +308,7 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
         """
         bar = self.query_one("#run-confirm", ConfirmBar)
         if bar.armed:
-            bar.disarm()
-            self._cancel_confirm()
+            self.dismiss_confirm()
             return True
         if self._active and not self._leave_confirming:
             self._leave_confirming = True

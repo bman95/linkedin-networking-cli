@@ -233,6 +233,49 @@ async def test_confirm_cancel_button_reachable_with_arrows(
 
 
 @pytest.mark.unit
+async def test_confirm_cancel_restores_focus_to_start(db_manager: DatabaseManager):
+    """Cancelling the confirm hands focus back to the Start control — the bar
+    held focus while armed, and a hidden widget does not release it itself."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = _FakeRunScreen(app.db_manager, _DummySettings())
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.press("ctrl+r")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        await pilot.press("escape")
+        await wait_text(pilot, "#run-status", "Cancelled")
+        start = screen.query_one("#run-start", Button)
+        assert app.focused is start
+        # The keyboard still drives the flow: Enter re-arms the confirmation.
+        await pilot.press("enter")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        assert screen.query_one("#run-confirm", ConfirmBar).armed
+
+
+@pytest.mark.unit
+async def test_rerun_after_completion(db_manager: DatabaseManager):
+    """A finished run re-enables the surface for a follow-up run: focus lands
+    back on Start, and a second confirm starts a fresh run over a cleared log."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _run_fake(pilot, app, "success")
+        await wait_text(pilot, "#run-status", "Done")
+        screen = app.screen
+        assert app.focused is screen.query_one("#run-start", Button)
+        await pilot.press("enter")  # re-arm from the refocused Start control
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        await pilot.press("enter")  # confirm
+        await wait_text(pilot, "#run-status", "Done")
+        text = log_text(screen)
+        # The log was cleared for the new run: one copy of each line, not two.
+        assert text.count("step one") == 1
+        assert text.count("summary: n=7") == 1
+
+
+@pytest.mark.unit
 async def test_run_pipeline_captcha_maps_error(db_manager: DatabaseManager):
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
@@ -639,7 +682,9 @@ async def test_detail_run_accelerator_and_cancelled_summary(
 @pytest.mark.unit
 async def test_detail_check_acceptances_from_detail(db_manager: DatabaseManager):
     """The issue #42 e2e criterion: check from the detail screen with a fake
-    check_body seam — gated on pending invites, summary on the same surface."""
+    check_body seam — gated on pending invites, summary on the same surface.
+    Pins both paths: the `c` accelerator arms it, and (after an esc cancel)
+    arrows + Enter alone arm and start it."""
     campaign = make_campaign(db_manager, name="Detail Check")
     db_manager.create_contact({
         "campaign_id": campaign.id,
@@ -651,9 +696,19 @@ async def test_detail_check_acceptances_from_detail(db_manager: DatabaseManager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("c")
+        await pilot.press("c")  # accelerator arms the confirm
         status = await wait_text(pilot, "#run-status", "Enter to confirm")
         assert "smart checker" in status
+        await pilot.press("escape")
+        await wait_text(pilot, "#run-status", "Cancelled")
+        # After the cancel, focus is back on the actions list: the primary
+        # arrows + Enter path arms and starts the same check.
+        actions = screen.query_one("#detail-actions", ListView)
+        assert app.focused is actions
+        await pilot.press("down")  # Run now → Check acceptances
+        assert actions.index == 1
+        await pilot.press("enter")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")  # confirm button holds focus
         await wait_text(pilot, "#run-status", "Done")
         text = log_text(screen)
@@ -756,6 +811,56 @@ async def test_detail_stop_control_stops_run(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_detail_mutation_disarms_armed_run_confirm(
+    db_manager: DatabaseManager,
+):
+    """An armed run confirm must not survive a state change: deactivating the
+    campaign disarms it, so a follow-up Enter cannot start a run whose 'active'
+    gate no longer holds (reviewer finding, iteration 1)."""
+    campaign = make_campaign(db_manager, name="Gate Hole")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _push_detail(pilot, app, campaign.id)
+        await pilot.press("r")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        await pilot.press("a")  # deactivate the campaign
+        for _ in range(60):
+            await pilot.pause()
+            if db_manager.get_campaign(campaign.id).active is False:
+                break
+        bar = screen.query_one("#detail-run-panel ConfirmBar", ConfirmBar)
+        assert not bar.armed  # the toggle disarmed the stale confirm
+        await pilot.press("enter")  # actions list has focus: re-requests Run now
+        await pilot.pause()
+        assert screen.panel.run_active is False  # blocked by the inactive gate
+        status = await wait_text(pilot, "#run-status", "inactive")
+        assert "inactive" in status
+
+
+@pytest.mark.unit
+async def test_detail_delete_blocked_while_run_active(db_manager: DatabaseManager):
+    campaign = make_campaign(db_manager)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _push_detail(
+            pilot, app, campaign.id, screen_cls=_StoppableRunDetail
+        )
+        await pilot.press("r")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
+        await pilot.press("enter")
+        await wait_text(pilot, "#run-status", "Running")
+        await pilot.press("d")
+        status = await wait_text(pilot, "#detail-status", "stop it before deleting")
+        assert "stop it before deleting" in status
+        assert not screen.query_one("#detail-delete-confirm", ConfirmBar).armed
+        assert db_manager.get_campaign(campaign.id) is not None
+        screen.panel.request_stop()  # let the run wind down before teardown
+        await wait_text_timed(pilot, "#run-status", "Stopped at your request")
+
+
+@pytest.mark.unit
 async def test_detail_run_blocked_when_campaign_inactive(
     db_manager: DatabaseManager,
 ):
@@ -797,6 +902,62 @@ async def test_detail_run_degraded_without_settings(db_manager: DatabaseManager)
         await pilot.press("r")
         status = await wait_text(pilot, "#run-status", "unavailable")
         assert "unavailable" in status
+
+
+@pytest.mark.unit
+async def test_detail_connect_automate_refuses_inactive_campaign(
+    db_manager: DatabaseManager,
+):
+    """Defense in depth behind the action-time gate: the body re-reads the
+    campaign and refuses to run it if it went inactive meanwhile."""
+    campaign = make_campaign(db_manager, name="Deactivated meanwhile")
+
+    class _Settings:
+        def get_automation_settings(self):
+            return {"search_limit": 10}
+
+    calls = []
+
+    class _Fake:
+        async def search_and_connect(self, *args, **kwargs):
+            calls.append(args)
+            return {}
+
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = CampaignDetailScreen(db_manager, campaign.id, settings=_Settings())
+        app.push_screen(screen)
+        await wait_text(pilot, "#detail-status", "select an action")
+        screen._automation_settings = screen._resolve_settings()
+        db_manager.update_campaign(campaign.id, {"active": False})
+        with pytest.raises(RuntimeError, match="inactive"):
+            await screen._connect_automate(_Fake())
+        assert calls == []  # nothing was sent
+
+
+@pytest.mark.unit
+async def test_detail_mutation_racing_reload_is_not_lost(
+    db_manager: DatabaseManager,
+):
+    """A reload scheduled in the same tick as a mutation must not cancel it:
+    the mutation workers run in their own group, so the toggle lands and
+    `_busy` clears (reviewer finding, iteration 1)."""
+    campaign = make_campaign(db_manager, name="Race")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = CampaignDetailScreen(db_manager, campaign.id)
+        app.push_screen(screen)
+        await wait_text(pilot, "#detail-status", "select an action")
+        screen.action_toggle_active()
+        screen.load_detail()  # same-tick reload (screen resume / run finished)
+        for _ in range(80):
+            await pilot.pause()
+            if db_manager.get_campaign(campaign.id).active is False and not screen._busy:
+                break
+        assert db_manager.get_campaign(campaign.id).active is False  # not lost
+        assert screen._busy is False  # not wedged
 
 
 @pytest.mark.unit

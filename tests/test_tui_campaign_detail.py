@@ -137,6 +137,42 @@ async def test_detail_toggle_item_names_the_transition(db_manager: DatabaseManag
 
 
 @pytest.mark.unit
+async def test_detail_actions_list_dispatches_toggle_export_delete(
+    db_manager: DatabaseManager,
+):
+    """Every remaining ACTIONS item dispatches from the list via Enter alone
+    (run/check/edit are pinned elsewhere): Toggle active, Export CSV, Delete."""
+    c = make_campaign(db_manager)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "select an action")
+        actions = app.screen.query_one("#detail-actions", ListView)
+
+        await pilot.press("down", "down", "down")  # index 3: Toggle active
+        assert actions.index == 3
+        await pilot.press("enter")
+        for _ in range(60):
+            await pilot.pause()
+            if db_manager.get_campaign(c.id).active is False:
+                break
+        assert db_manager.get_campaign(c.id).active is False
+
+        await pilot.press("down")  # index 4: Export CSV (no contacts yet)
+        assert actions.index == 4
+        await pilot.press("enter")
+        await wait_text(pilot, "#detail-status", "No contacts to export")
+
+        await pilot.press("down")  # index 5: Delete — arms the confirm
+        assert actions.index == 5
+        await pilot.press("enter")
+        await wait_text(pilot, "#detail-status", "Enter to confirm")
+        assert app.screen.query_one("#detail-delete-confirm", ConfirmBar).armed
+        assert db_manager.get_campaign(c.id) is not None  # armed, not deleted
+
+
+@pytest.mark.unit
 async def test_detail_delete_via_focused_confirm_button(db_manager: DatabaseManager):
     """Activating Delete arms a focused inline confirm (owner rule: Enter
     confirms, esc cancels — no chord-twice requirement)."""

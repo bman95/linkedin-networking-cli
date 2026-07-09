@@ -323,8 +323,10 @@ capture) get dedicated deterministic tests, mirroring the #37 approach. See
   for "a run is in flight" — but `MessagePump._running` is a Textual attribute
   that is `True` for every mounted node, so the start guard `if self._running:
   return` became a permanent no-op and `ctrl+r` did nothing. The run-state flags
-  are now namespaced (`_run_active` / `_run_done` / `_run_confirming` /
-  `_run_can_start`). Use distinct private names for state, not just methods.
+  live on `AutomationRunPanel` as `_active` / `_done` (verified against Textual's
+  `Widget`/`MessagePump` attribute surface — nothing to shadow there; re-verify
+  on Textual upgrades) with `_run_can_start` on the host screen. Use distinct
+  private names for state, not just methods.
 - **Packaging.** `app.tcss` lives next to `app.py` so `CSS_PATH` resolves, and
   the wheel's `only-include = ["src", …]` ships non-`.py` files — verified by
   inspecting the built wheel for `tui/app.tcss`.
