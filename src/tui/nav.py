@@ -28,13 +28,16 @@ class NavItem:
     ``key`` doubles as the home nav item's id suffix (``nav-<key>``); ``title``
     is the visible name in both the home list and the palette; ``description``
     is the home sub-line and the palette help text; ``push`` builds the screen
-    from the live app's ``db_manager``/``settings`` and pushes it.
+    from the live app's ``db_manager``/``settings`` and pushes it. ``home``
+    controls whether the destination appears on the home launcher — palette-only
+    destinations (issue #42) set it to False.
     """
 
     key: str
     title: str
     description: str
     push: Callable[[App], None]
+    home: bool = True
 
 
 def _dashboard(app: App) -> None:
@@ -55,18 +58,6 @@ def _create(app: App) -> None:
     app.push_screen(CreateCampaignScreen(app.db_manager))
 
 
-def _execute(app: App) -> None:
-    from .screens.execute_campaign import ExecuteCampaignScreen
-
-    app.push_screen(ExecuteCampaignScreen(app.db_manager, app.settings))
-
-
-def _check(app: App) -> None:
-    from .screens.check_connections import CheckConnectionsScreen
-
-    app.push_screen(CheckConnectionsScreen(app.db_manager, app.settings))
-
-
 def _extract(app: App) -> None:
     from .screens.extract_profiles import ExtractProfilesScreen
 
@@ -83,15 +74,18 @@ NAV_ITEMS: tuple[NavItem, ...] = (
     NavItem("dashboard", "Dashboard",
             "Campaign overview, connection stats, recent activity", _dashboard),
     NavItem("campaigns", "Campaigns",
-            "Browse, open and manage your outreach campaigns", _campaigns),
-    NavItem("create", "Create Campaign",
+            "Browse, run and manage your outreach campaigns", _campaigns),
+    NavItem("create", "New Campaign",
             "Set up a new outreach campaign", _create),
-    NavItem("execute", "Execute Campaign",
-            "Run automation: search and send connection requests", _execute),
-    NavItem("check", "Check Connections",
-            "Reconcile which pending invites were accepted", _check),
+    # Palette-only (issue #42): running and checking moved onto the campaign
+    # detail screen, and extraction leaves the shrunk 4-item home but stays
+    # reachable from anywhere via ctrl+p.
     NavItem("extract", "Extract Profile Data",
-            "Pull detailed public data from profiles", _extract),
+            "Pull detailed public data from profiles", _extract, home=False),
     NavItem("settings", "Settings",
             "Credentials, browser, rate limits, data locations", _settings),
 )
+
+#: The home launcher's destinations (issue #42 shrank home to four: Dashboard ·
+#: Campaigns · New Campaign · Settings); the palette shows all of NAV_ITEMS.
+HOME_ITEMS: tuple[NavItem, ...] = tuple(item for item in NAV_ITEMS if item.home)

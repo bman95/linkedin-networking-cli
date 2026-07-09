@@ -61,9 +61,9 @@ side effects); write and automation flows follow.
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
-| Execute Campaign | `ExecuteCampaignScreen` | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (user-initiated run) |
-| Check Connections | `CheckConnectionsScreen` | `smart_connection_checker` / `check_connection_status` | browser, network | **done** (user-initiated run) |
-| Extract Profile Data | `ExtractProfilesScreen` | `extract_detailed_profile` | browser, network | **done** (user-initiated run) |
+| Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
+| Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail; smart checker only — the direct per-profile checker and "check all campaigns" remain classic-CLI-only) |
+| Extract Profile Data | `ExtractProfilesScreen` | `extract_detailed_profile` | browser, network | **done** (user-initiated run; palette-only since issue #42 — home shrank to Dashboard · Campaigns · New Campaign · Settings) |
 | Exit | key binding (`q`) / command palette | — | — | done |
 
 ## 4. Flow-by-flow migration order, with rationale
@@ -90,19 +90,36 @@ side effects); write and automation flows follow.
    `tests/test_tui_location_search.py`).
 3. **Automation flows: Execute / Check Connections / Extract Profile Data (done).**
    The hardest slice: long-running async Playwright work with live in-place
-   progress and credential gating. A shared `AutomationRunScreen` base
-   (`automation_run.py`) encodes one shape — **gate → select → confirm → run
-   (streaming log) → summary / error** — so the three screens differ only in
-   their selection widgets, the async automation body, and the summary. The run
-   drives `asyncio.run` inside a `@work(thread=True)` worker (mirroring the
-   classic `asyncio.run(run_automation())`), and the automation's
+   progress and credential gating. The pipeline — **gate → confirm → run
+   (streaming log) → summary / error** — lives in a reusable
+   `AutomationRunPanel` widget (`run_panel.py`, extracted for issue #42), which
+   hosts hand a `RunSpec` (confirmation summary, async body, result renderer).
+   The run drives `asyncio.run` inside a `@work(thread=True)` worker (mirroring
+   the classic `asyncio.run(run_automation())`), and the automation's
    `progress_callback` streams lines into a `RichLog` via `call_from_thread`.
    Typed automation exceptions (CAPTCHA / rate-limit / auth / landing / selector)
    map to the same actionable stop messages as the classic
    `_report_automation_failure`, via `automation_errors.describe_automation_error`,
-   plus the saved evidence path. The browser run is **user-initiated**: nothing
-   runs until a campaign/mode is selected and confirmed with a *second* `ctrl+r`.
-   `run_body` is the single seam tests override to exercise the
+   plus the saved evidence path.
+
+   **Campaign-centric navigation (issue #42).** The natural object of the app
+   is the campaign, so the standalone Execute/Check screens (each a picker over
+   campaigns) were deleted: `CampaignDetailScreen` now hosts a focusable
+   **ACTIONS** list (Run now, Check acceptances, Edit, Activate/Deactivate,
+   Export CSV, Delete) beside the embedded run panel, whose log fills the right
+   half of the screen. `AutomationRunScreen` (`automation_run.py`) remains as
+   the screen-shaped host for flows that still need their own selection surface
+   (Extract Profile Data, reachable from the command palette).
+
+   **Interaction design (owner rule, 2026-07-09): arrows + Enter first.** Every
+   action is a visible, focusable element (list item or button); letter keys
+   (`r`/`c`/`e`/`a`/`x`/`d`, `s` for stop, `ctrl+r` on the run screens) are
+   optional accelerators, never the only path. Confirmations use a focused
+   inline confirm (`ConfirmBar`: Enter confirms, esc cancels; a repeated
+   accelerator press also confirms) — this superseded the earlier two-press
+   `ctrl+r` pattern. The browser run stays **user-initiated**: nothing runs
+   until the user confirms the armed run. `run_body` (and the detail's
+   `run_now_body` / `check_body`) are the seams tests override to exercise the
    run/log/summary/error pipeline without a browser; the live run itself is
    validated manually (it sends real invites). Cooperative cancellation
    (issue #43): the engine loops take a `threading.Event`-style `stop_event`
@@ -306,8 +323,10 @@ capture) get dedicated deterministic tests, mirroring the #37 approach. See
   for "a run is in flight" — but `MessagePump._running` is a Textual attribute
   that is `True` for every mounted node, so the start guard `if self._running:
   return` became a permanent no-op and `ctrl+r` did nothing. The run-state flags
-  are now namespaced (`_run_active` / `_run_done` / `_run_confirming` /
-  `_run_can_start`). Use distinct private names for state, not just methods.
+  live on `AutomationRunPanel` as `_active` / `_done` (verified against Textual's
+  `Widget`/`MessagePump` attribute surface — nothing to shadow there; re-verify
+  on Textual upgrades) with `_run_can_start` on the host screen. Use distinct
+  private names for state, not just methods.
 - **Packaging.** `app.tcss` lives next to `app.py` so `CSS_PATH` resolves, and
   the wheel's `only-include = ["src", …]` ships non-`.py` files — verified by
   inspecting the built wheel for `tui/app.tcss`.

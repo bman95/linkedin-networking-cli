@@ -35,8 +35,9 @@ async def wait_status(pilot, needle: str, tries: int = 60) -> str:
 
 
 @pytest.mark.unit
-async def test_home_key_3_opens_create_and_7_opens_settings(db_manager: DatabaseManager):
-    """Create Campaign is on key 3; Settings sits last on key 7."""
+async def test_home_key_3_opens_create_and_4_opens_settings(db_manager: DatabaseManager):
+    """New Campaign is on key 3; Settings sits last on key 4 (issue #42 shrank
+    home to four destinations)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -45,7 +46,7 @@ async def test_home_key_3_opens_create_and_7_opens_settings(db_manager: Database
         assert isinstance(app.screen, CreateCampaignScreen)
         await pilot.press("escape")
         await pilot.pause()
-        await pilot.press("7")
+        await pilot.press("4")
         await pilot.pause()
         assert isinstance(app.screen, SettingsScreen)
 

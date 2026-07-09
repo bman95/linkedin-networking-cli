@@ -1,9 +1,14 @@
 """Regression tests for the 2026-07-07 UX pass (issue #24).
 
 Pins the escape semantics ("esc to cancel" must cancel, not leave), the
-dirty-form discard guard, and the new navigation affordances (``n`` on the
+dirty-form discard guard, and the navigation affordances (``n`` on the
 campaigns list, activating a dashboard row). All flows run in the headless
 harness with no browser.
+
+Issue #42 (owner rule, 2026-07-09) superseded the two-press ``ctrl+r`` confirm
+with a focused inline confirm (Enter confirms, esc cancels); the esc semantics
+pinned here are unchanged — esc still cancels an armed confirmation and warns
+once mid-run — only the arming/confirming control moved onto focusable buttons.
 """
 
 import asyncio
@@ -49,15 +54,15 @@ async def wait_text(pilot, status_id: str, needle: str, tries: int = 80) -> str:
 
 @pytest.mark.unit
 async def test_detail_esc_cancels_armed_delete(db_manager: DatabaseManager):
-    """First d arms the delete; esc cancels the confirmation and STAYS."""
+    """First d arms the delete confirm; esc cancels the confirmation and STAYS."""
     campaign = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, campaign.id))
-        await wait_text(pilot, "#detail-status", "Read-only")
+        await wait_text(pilot, "#detail-status", "select an action")
         await pilot.press("d")
-        await wait_text(pilot, "#detail-status", "again to confirm")
+        await wait_text(pilot, "#detail-status", "Enter to confirm")
         await pilot.press("escape")
         await pilot.pause()
         # Still on the detail screen, delete disarmed, campaign intact.
@@ -92,13 +97,13 @@ async def test_run_esc_cancels_armed_confirmation(db_manager: DatabaseManager):
         app.push_screen(screen)
         await pilot.pause()
         await pilot.press("ctrl+r")
-        await wait_text(pilot, "#run-status", "ctrl+r again")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("escape")
         await pilot.pause()
         # Confirmation cancelled; still on the screen; run never started.
         assert app.screen is screen
-        assert screen._run_confirming is False
-        assert screen._run_active is False
+        assert screen.panel.confirming is False
+        assert screen.panel.run_active is False
         await wait_text(pilot, "#run-status", "Cancelled")
 
 
@@ -111,7 +116,7 @@ async def test_run_esc_mid_run_warns_then_leaves(db_manager: DatabaseManager):
         app.push_screen(screen)
         await pilot.pause()
         await pilot.press("ctrl+r")
-        await wait_text(pilot, "#run-status", "ctrl+r again")
+        await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("ctrl+r")
         await wait_text(pilot, "#run-status", "Running")
         # First esc warns and stays; the run is not stopped by leaving.

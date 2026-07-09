@@ -56,7 +56,7 @@ class ExtractProfilesScreen(AutomationRunScreen):
             self.query_one(selector).display = manual
 
     def ready_hint(self) -> str:
-        return "Choose a source, then ctrl+r to start extracting."
+        return "Choose a source, then Start to begin extracting."
 
     # ── selection data ────────────────────────────────────────────────────
 

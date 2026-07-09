@@ -7,9 +7,11 @@ idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
 background bar or border.
 
-Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys ``1``–``7`` jump
-straight to a destination, and the command palette (ctrl+p) reaches the same
-screens from anywhere.
+Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys jump straight to a
+destination, and the command palette (ctrl+p) reaches every registered
+destination — including the palette-only ones (issue #42 shrank home to four:
+Dashboard · Campaigns · New Campaign · Settings; running and checking live on
+the campaign detail screen now).
 
 The workspace summary is a DB/settings read, so it follows the threaded-worker
 race discipline (``docs/tui-migration.md`` §6): the app is captured on the UI
@@ -34,7 +36,7 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from utils.logging import get_logger
 
-from ..nav import NAV_ITEMS
+from ..nav import HOME_ITEMS
 from ._mascot_large import MASCOT_LARGE
 from ._wordmark import WORDMARK_TALL
 from .base import hint_markup
@@ -57,7 +59,7 @@ POINTER = "❯"
 # art is therefore the sharpest portable option.)
 
 HINTS = (
-    ("1-7 ↑↓", "navigate"),
+    (f"1-{len(HOME_ITEMS)} ↑↓", "navigate"),
     ("enter", "open"),
     ("q", "quit"),
     ("ctrl+p", "more"),
@@ -69,11 +71,11 @@ class HomeScreen(WorkerGuardMixin, Screen):
 
     BINDINGS = [
         ("q", "app.quit", "Quit"),
-        # Number keys jump straight to a destination (1-indexed over NAV_ITEMS,
-        # the shared registry in ``tui.nav``).
+        # Number keys jump straight to a destination (1-indexed over HOME_ITEMS,
+        # the home slice of the shared registry in ``tui.nav``).
         *(
             Binding(str(i + 1), f"open({i})", item.title, show=False)
-            for i, item in enumerate(NAV_ITEMS)
+            for i, item in enumerate(HOME_ITEMS)
         ),
     ]
 
@@ -106,7 +108,7 @@ class HomeScreen(WorkerGuardMixin, Screen):
                                 id=f"nav-{item.key}",
                                 classes="nav-item",
                             )
-                            for item in NAV_ITEMS
+                            for item in HOME_ITEMS
                         ),
                         id="home-nav",
                     )
@@ -145,11 +147,11 @@ class HomeScreen(WorkerGuardMixin, Screen):
 
     def action_open(self, index: int) -> None:
         """Number-key jump: open the nav item at ``index`` (0-based)."""
-        if 0 <= index < len(NAV_ITEMS):
-            NAV_ITEMS[index].push(self.app)
+        if 0 <= index < len(HOME_ITEMS):
+            HOME_ITEMS[index].push(self.app)
 
     def _open_key(self, key: str) -> None:
-        for item in NAV_ITEMS:
+        for item in HOME_ITEMS:
             if item.key == key:
                 item.push(self.app)
                 return

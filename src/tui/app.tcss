@@ -98,7 +98,7 @@ DataTable > .datatable--even-row {
 #home {
     height: 1fr;
     /* Top/bottom kept to 1: the hero mascot is 21 rows tall, and with the
-     * 7-item nav below the whole home must land inside 40 terminal rows. */
+     * nav below the whole home must land inside 40 terminal rows. */
     padding: 1 4;
 }
 
@@ -385,24 +385,94 @@ SelectOverlay > .option-list--option-highlighted {
     display: none;
 }
 
-/* ── Campaign detail screen ───────────────────────────────────────────── */
+/* ── Campaign detail screen (issue #42: the campaign's action hub) ─────── */
+
+/* Two columns: configuration/performance on the left, the ACTIONS list and
+ * the embedded run panel (the streaming log surface) on the right. */
+#detail-columns {
+    height: 1fr;
+    padding: 0 4;
+}
 
 #detail-body {
+    width: 1fr;
     height: 1fr;
+    overflow-y: auto;
+    margin-right: 2;
+}
+
+#detail-side {
+    width: 1fr;
+    height: 1fr;
+}
+
+/* The detail's action list mirrors the home nav idiom: a `❯` pointer + the
+ * recoloured title carry the selection — no background bar, no border. */
+#detail-actions {
+    height: auto;
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin-bottom: 1;
+}
+
+#detail-actions:focus {
+    border: none;
+}
+
+#detail-actions > ListItem {
+    height: auto;
+    background: transparent;
+    color: $foreground;
+}
+
+#detail-actions > ListItem.-highlight,
+#detail-actions:focus > ListItem.-highlight {
+    background: transparent;
+    color: $foreground;
+    text-style: none;
+}
+
+#detail-actions > ListItem.-highlight .nav-caret {
+    color: $secondary;
+}
+
+#detail-actions > ListItem.-highlight .nav-title {
+    color: $secondary;
+}
+
+#detail-actions > ListItem.-hovered .nav-caret {
+    color: $text-muted;
+}
+
+/* The embedded run panel fills the right column's remaining space; the run
+ * screens' full-width panel keeps the shared gutter instead. */
+#detail-run-panel {
+    height: 1fr;
+}
+
+/* ── Automation run surfaces (run panel + Extract screen) ─────────────── */
+
+#run-body {
+    height: auto;
+    max-height: 50%;
     overflow-y: auto;
     padding: 0 4;
 }
 
-/* ── Automation run screens (Execute / Check / Extract) ───────────────── */
-
-#run-body {
+#run-panel {
     height: 1fr;
-    overflow-y: auto;
     padding: 0 4;
+}
+
+/* The panel supplies its own gutter (or the detail column does), so its
+ * status line drops the screen-level status padding. */
+AutomationRunPanel .status-line {
+    padding: 0;
 }
 
 /* The streaming progress log — an elevated panel, revealed only once a run
- * starts (hidden during selection so the form has room). */
+ * starts (hidden while idle so the selection/actions have room). */
 #run-log {
     height: 1fr;
     min-height: 10;
@@ -412,15 +482,17 @@ SelectOverlay > .option-list--option-highlighted {
     border: none;
 }
 
-/* The stop control (issue #43) — revealed only while a run is active and
- * focused by default, so a bare Enter stops after the current profile. The
- * same field idiom as the inputs (flat elevated panel, left accent rule that
- * lights up brand-blue on focus) rather than Textual's chunky default button. */
-#run-stop {
+/* The run controls — Start (#run-start), the inline confirm's buttons, and
+ * the stop control (issue #43), each revealed when relevant and focusable so
+ * arrows/tab + Enter drive the whole flow. The same field idiom as the inputs
+ * (flat elevated panel, left accent rule that lights up brand-blue on focus)
+ * rather than Textual's chunky default button. */
+#run-start,
+#run-stop,
+ConfirmBar Button {
     width: auto;
     height: 1;
     min-width: 0;
-    margin: 0 4;
     padding: 0 2;
     border: none;
     border-left: thick $panel-lighten-2;
@@ -428,13 +500,29 @@ SelectOverlay > .option-list--option-highlighted {
     color: $text;
     text-style: none;
 }
-#run-stop:focus {
+#run-start:focus,
+#run-stop:focus,
+ConfirmBar Button:focus {
     border-left: thick $primary;
     background: $panel-lighten-1;
     text-style: bold;
 }
+#run-start:disabled,
 #run-stop:disabled {
     color: $text-muted;
+}
+
+#run-start {
+    margin: 1 0 0 0;
+}
+
+/* The inline confirmation: a focused confirm button beside Cancel. */
+ConfirmBar {
+    height: 1;
+    margin: 0 0 1 0;
+}
+ConfirmBar .confirm-no {
+    margin-left: 2;
 }
 
 /* ── Shared status-line semantics (forms, detail, automation) ─────────── */
