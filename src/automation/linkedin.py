@@ -3190,43 +3190,6 @@ class LinkedInAutomation:
             logger.warning(f"Failed to extract profile info: {e}")
             return None
 
-    async def check_connection_status(
-        self,
-        contacts: list[Contact],
-        progress_callback: Callable | None = None,
-        stop_event: Any | None = None,
-    ) -> dict[str, int]:
-        """Check status of pending connection requests using enhanced checker.
-
-        Returns the checker's stats dict (``checked`` / ``newly_accepted`` /
-        ``failed``, plus ``stopped: True`` when a ``stop_event`` cut the walk
-        short — issue #43) so callers can report partial progress honestly.
-        """
-        from .checker import check_specific_contacts
-
-        if not self.is_authenticated:
-            raise NotAuthenticatedException("Not authenticated. Please login first.")
-
-        # Filter to invites awaiting acceptance and get their IDs.
-        # "possibly_sent" (issue #31) is an assumed-sent invite, so poll it for
-        # acceptance like a "sent" one — otherwise a delivered ambiguous invite
-        # would stay stuck in possibly_sent and never update on acceptance.
-        sent_contacts = [
-            contact for contact in contacts
-            if contact.status in ("sent", "possibly_sent")
-        ]
-        contact_ids = [contact.id for contact in sent_contacts]
-
-        if not contact_ids:
-            if progress_callback:
-                progress_callback("No pending connections to check")
-            return {"checked": 0, "newly_accepted": 0, "failed": 0}
-
-        # Use the enhanced checker
-        return await check_specific_contacts(
-            self, contact_ids, progress_callback, stop_event=stop_event
-        )
-
     async def smart_connection_checker(
         self,
         campaign_id: int,

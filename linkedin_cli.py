@@ -1520,19 +1520,6 @@ class LinkedInCLI:
             if selected == "back":
                 return
 
-            # Select checker type
-            checker_type = inquirer.select(
-                message="Choose checker method:",
-                choices=[
-                    Choice(value="smart", name="🧠 Smart Checker - Monitor LinkedIn connections page"),
-                    Choice(value="direct", name="🎯 Direct Checker - Visit each profile individually"),
-                    Choice(value="back", name="🔙 Back"),
-                ]
-            ).execute()
-
-            if checker_type == "back":
-                return
-
             # Run the checker
             def progress_update(message: str) -> None:
                 self.console.print(f"[cyan]{message}[/cyan]")
@@ -1549,42 +1536,18 @@ class LinkedInCLI:
                         for campaign, _ in campaigns_with_pending:
                             progress_update(f"Checking campaign: {campaign.name}")
 
-                            if checker_type == "smart":
-                                stats = await automation.smart_connection_checker(
-                                    campaign.id, progress_update
-                                )
-                            else:  # direct
-                                pending_contacts = (
-                                    self.db_manager.get_contacts_by_status(campaign.id, "sent")
-                                    + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
-                                )
-                                # The checker's stats carry how many contacts
-                                # were actually visited before a failure cut
-                                # the walk short — never over-report with
-                                # len(pending_contacts) (issue #43).
-                                stats = await automation.check_connection_status(
-                                    pending_contacts, progress_update
-                                )
+                            stats = await automation.smart_connection_checker(
+                                campaign.id, progress_update
+                            )
 
                             total_stats["total_checked"] += stats.get("checked", 0)
                             total_stats["total_newly_accepted"] += stats.get("newly_accepted", 0)
 
                         return {"status": "success", **total_stats}
                     else:
-                        if checker_type == "smart":
-                            stats = await automation.smart_connection_checker(
-                                selected.id, progress_update
-                            )
-                        else:  # direct
-                            pending_contacts = (
-                                self.db_manager.get_contacts_by_status(selected.id, "sent")
-                                + self.db_manager.get_contacts_by_status(selected.id, "possibly_sent")
-                            )
-                            # Same rule as the all-campaigns branch: report the
-                            # checker's real visited count (issue #43).
-                            stats = await automation.check_connection_status(
-                                pending_contacts, progress_update
-                            )
+                        stats = await automation.smart_connection_checker(
+                            selected.id, progress_update
+                        )
 
                         return {"status": "success", **stats}
 

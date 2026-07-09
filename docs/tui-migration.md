@@ -62,7 +62,7 @@ side effects); write and automation flows follow.
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
-| Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail; smart checker only — the direct per-profile checker and "check all campaigns" remain classic-CLI-only) |
+| Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail, smart checker only; issue #45 removed the direct per-profile checker everywhere — "check all campaigns" remains classic-CLI-only) |
 | Extract Profile Data | — | `extract_detailed_profile` | browser, network | **removed from the TUI (issue #44)** — pre-SDUI selectors, results weren't persisted; classic CLI (`linkedin_cli.py`) still has it. Pending the Voyager rework, see `DESIGN-PROPOSALS.md` §6 |
 | Exit | key binding (`q`) / command palette | — | — | done |
 
