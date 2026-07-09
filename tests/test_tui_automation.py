@@ -299,7 +299,7 @@ async def test_stop_via_enter_yields_partial_summary_and_reenables(
         assert "Stopped at your request" in status
         # The stop acknowledgement was logged when the request was made (the
         # "Stopping…" status itself is transient — see the dedicated test).
-        assert "Stop requested — finishing the current profile" in log_text(screen)
+        assert "Stop requested — finishing the current step" in log_text(screen)
 
         # The partial summary renders like a normal completion (not an error)
         # and its count matches the work actually done before the stop.
@@ -393,13 +393,13 @@ async def test_stop_after_armed_leave_rearms_the_esc_warning(
 
 
 @pytest.mark.unit
-async def test_stop_racing_natural_completion_still_reports_cancelled(
+async def test_stop_racing_natural_completion_reports_finished(
     db_manager: DatabaseManager,
 ):
     """A stop requested during the final profile can lose the race with the
-    loop's flag check — the body then reports success. The user asked to stop
-    and saw 'Stopping…', so _finish honors the request (one policy for every
-    run screen)."""
+    loop's flag check — the body then honestly reports success. _finish shows
+    the completed summary (not a false 'partial') while acknowledging the stop
+    request instead of a bare green Done (one policy for every run screen)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -413,9 +413,62 @@ async def test_stop_racing_natural_completion_still_reports_cancelled(
         screen._stop_requested = True
         screen._finish({"status": "success", "n": 3}, None)
         status = str(screen.query_one("#run-status", Static).render())
-        assert "Stopped at your request" in status
+        assert "finished before the stop took effect" in status
         await pilot.pause()  # let the RichLog render the summary line
         assert "summary: n=3" in log_text(screen)
+
+
+@pytest.mark.unit
+async def test_stop_during_login_ends_run_before_automation(
+    db_manager: DatabaseManager, monkeypatch
+):
+    """A stop requested while login is underway takes effect the moment login
+    completes: the REAL run_body returns cancelled without calling automate()
+    (login's blocking waits themselves are not interruptible)."""
+    automate_calls = []
+
+    class _RunScreen(AutomationRunScreen):
+        SCREEN_TITLE = "Login Stop"
+        ACTION_LABEL = "login stop"
+
+        async def automate(self, automation) -> dict:
+            automate_calls.append(automation)
+            return {"status": "success"}
+
+        def render_result(self, result: dict) -> str:
+            return "should not complete"
+
+    class _FakeAutomation:
+        """Stands in for LinkedInAutomation; the stop lands mid-login."""
+
+        def __init__(self, db, settings):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def login(self, progress_callback=None):
+            screen._stop_event.set()  # the user pressed Stop during login
+            return True
+
+    import automation.linkedin as engine
+
+    monkeypatch.setattr(engine, "LinkedInAutomation", _FakeAutomation)
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = _RunScreen(app.db_manager, _DummySettings())
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.press("ctrl+r")
+        await wait_text(pilot, "#run-status", "ctrl+r again")
+        await pilot.press("ctrl+r")
+        status = await wait_text_timed(pilot, "#run-status", "Stopped at your request")
+        assert "Stopped at your request" in status
+        assert automate_calls == []  # the run ended before automation began
 
 
 @pytest.mark.unit

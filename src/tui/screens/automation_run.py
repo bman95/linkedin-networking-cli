@@ -156,11 +156,20 @@ class AutomationRunScreen(BaseScreen):
 
         # action_start gates the run on both being present.
         assert self._db_manager is not None and self._settings is not None
+        if self._stop_event is not None and self._stop_event.is_set():
+            # Stopped before anything started — don't even launch the browser.
+            return {"status": "cancelled"}
         async with LinkedInAutomation(self._db_manager, self._settings) as automation:
             self.progress("Launching browser and attaching to Chrome…")
             ok = await automation.login(self.progress)
             if not ok:
                 return {"status": "login_failed"}
+            # A stop requested while login was underway takes effect here,
+            # before any automation work begins (the login confirmation waits
+            # are blocking Playwright calls and cannot be interrupted).
+            if self._stop_event is not None and self._stop_event.is_set():
+                self.progress("Stop requested — ending the run before automation began.")
+                return {"status": "cancelled"}
             return await self.automate(automation)
 
     async def automate(self, automation) -> dict:
@@ -266,9 +275,11 @@ class AutomationRunScreen(BaseScreen):
         self._stop_event.set()
         stop = self.query_one("#run-stop", Button)
         stop.disabled = True
-        self._append_log("Stop requested — finishing the current profile…")
+        # Phase-neutral copy: during login there is no "current profile" yet —
+        # the run ends at the next safe point the loop (or run_body) checks.
+        self._append_log("Stop requested — finishing the current step…")
         self._set_status(
-            "Stopping…  The run ends after the current profile.", "warn"
+            "Stopping…  The run ends at the next safe point.", "warn"
         )
 
     @work(thread=True, exclusive=True, group="run")
@@ -309,12 +320,20 @@ class AutomationRunScreen(BaseScreen):
             return
         status = (result or {}).get("status")
         # A stop requested during the final profile can race the loop's own
-        # flag check: the work finishes before the flag is observed and the
-        # body reports success. The user still asked to stop and saw
-        # "Stopping…", so honor the request — one policy for every screen.
+        # flag check: all the work finishes before the flag is observed and
+        # the body honestly reports success. Report the completion — calling
+        # it "partial" would misstate a finished run — but acknowledge the
+        # request instead of showing a bare green "Done." after "Stopping…".
+        # One policy for every run screen; engine-observed stops arrive here
+        # as status "cancelled" and take the branch below instead.
         if status == "success" and self._stop_requested:
-            result = dict(result or {}, status="cancelled")
-            status = "cancelled"
+            log.write(self.render_result(result or {}))
+            self._set_status(
+                "Done — the run finished before the stop took effect. "
+                "Press esc to return.",
+                "good",
+            )
+            return
         if status == "login_failed":
             log.write("Login to LinkedIn failed — could not start the run.")
             self._set_status("Login failed. Press esc to return.", "error")
