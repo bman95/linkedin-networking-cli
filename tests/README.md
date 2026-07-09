@@ -130,16 +130,16 @@ tests/
 ├── test_cli_helpers.py              # ~80 LOC, 12 tests
 ├── test_cli_run_loops.py            # ~350 LOC, 22 tests
 ├── test_database_operations.py     # ~1,400 LOC, 88 tests
-├── test_diagnostics.py              # ~500 LOC, 30 tests
+├── test_diagnostics.py              # ~570 LOC, 33 tests
 ├── test_interactions.py             # ~420 LOC, 25 tests
-├── test_linkedin_automation.py      # ~3,700 LOC, 126 tests
+├── test_linkedin_automation.py      # ~4,000 LOC, 139 tests
 ├── test_linkedin_mappings.py        # ~530 LOC, 82 tests
-├── test_models.py                   # ~670 LOC, 49 tests
+├── test_models.py                   # ~760 LOC, 53 tests
 ├── test_navigation.py               # ~1,150 LOC, 89 tests
 ├── test_scraping.py                 # ~100 LOC, 8 tests
 ├── test_selectors.py                # ~340 LOC, 29 tests
 ├── test_settings.py                 # ~820 LOC, 94 tests
-├── test_tui*.py                     # TUI screen tests (64 tests across 6 files)
+├── test_tui*.py                     # TUI screen tests (78 tests across 8 files)
 └── README.md                        # This file
 ```
 
@@ -515,6 +515,6 @@ Before committing new code, ensure:
 
 ---
 
-**Total Tests**: 742 tests covering all major functionality
+**Total Tests**: 817 tests covering all major functionality
 **Test Coverage**: Targeting 80%+ code coverage
 **Test Execution Time**: ~5-10 seconds (with pytest-xdist)
