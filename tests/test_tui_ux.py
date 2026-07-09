@@ -276,9 +276,12 @@ async def test_dashboard_refresh_reachable_by_tab_and_enter(db_manager: Database
 
 @pytest.mark.unit
 async def test_settings_refresh_reachable_by_tab_and_enter(db_manager: DatabaseManager):
-    """Settings previously had no focusable widget at all; Refresh is now one,
-    reachable with tab + Enter (regression guard for the most severe instance
-    the issue #49 sweep found)."""
+    """Settings previously had no focusable widget at all; Refresh is now one
+    (regression guard for the most severe instance the issue #49 sweep found).
+    It is the screen's *only* focusable widget, so Textual's default auto-focus
+    lands on it directly — ``tab_until_focused`` below returns after zero tab
+    presses, which is the expected proof there is now something to focus at
+    all; Enter still drives the actual activation."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -309,6 +312,9 @@ async def test_create_campaign_full_happy_path_via_tab_and_enter(
         await tab_until_focused(pilot, button)
         await pilot.press("enter")
         await wait_text(pilot, "#create-status", "created")
+        # The submit button locks with the rest of the form on success (the
+        # one behavior this PR added to the disable-selector).
+        assert button.disabled is True
 
     assert db_manager.get_campaigns(active_only=False)[0].name == "Tab Reachable"
 
@@ -328,5 +334,8 @@ async def test_edit_save_reachable_by_tab_and_enter(db_manager: DatabaseManager)
         await tab_until_focused(pilot, button)
         await pilot.press("enter")
         await wait_text(pilot, "#edit-status", "updated")
+        # The submit button locks with the rest of the form on success (the
+        # one behavior this PR added to the disable-selector).
+        assert button.disabled is True
 
     assert db_manager.get_campaign(c.id).name == "New Name"
