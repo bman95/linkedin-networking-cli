@@ -17,15 +17,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import automation.diagnostics as diagnostics
 from automation.diagnostics import (
+    _MAX_ANOMALY_CAPTURES,
+    _PAGE_RING_SIZE,
+    _slugify,
     capture_anomaly_context,
     capture_error_context,
-    snapshot_page,
     reset_anomaly_rate_limit,
-    reset_page_ring,
     reset_diagnostics_run,
-    _slugify,
-    _PAGE_RING_SIZE,
-    _MAX_ANOMALY_CAPTURES,
+    reset_page_ring,
+    snapshot_page,
 )
 
 
@@ -422,8 +422,9 @@ class TestSearchReadinessWiring:
         self, mock_linkedin_automation
     ):
         from playwright.async_api import TimeoutError as PWTimeoutError
-        from database.models import Campaign
+
         from automation import selectors as sel
+        from database.models import Campaign
 
         campaign = Campaign(name="Wiring Test")
         # Force the readiness wait_for_selector to time out.

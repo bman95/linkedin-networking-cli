@@ -31,8 +31,8 @@ from automation import selectors as sel
 from exceptions import (
     CaptchaDetectedException,
     NotAuthenticatedException,
-    UnexpectedLandingException,
     SelectorNotFoundException,
+    UnexpectedLandingException,
 )
 
 
@@ -775,7 +775,7 @@ class TestGotoRetry:
             # at GC time), then simulate the outer watchdog firing.
             if hasattr(awaitable, "close"):
                 awaitable.close()
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
 
         # No recover callback: the crash-shaped error must propagate.
         with patch(

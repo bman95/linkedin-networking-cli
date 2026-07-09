@@ -2,21 +2,20 @@
 
 import logging
 import sys
-from pathlib import Path
-from typing import Optional
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 
 class LoggerSetup:
     """Configure and manage application-wide logging."""
 
     _initialized = False
-    _log_dir: Optional[Path] = None
+    _log_dir: Path | None = None
 
     @classmethod
     def setup(
         cls,
-        log_dir: Optional[Path] = None,
+        log_dir: Path | None = None,
         log_level: int = logging.INFO,
         console_output: bool = True,
         file_output: bool = True,

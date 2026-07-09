@@ -9,15 +9,12 @@ data-flow path, not mocks.
 import threading
 
 import pytest
-
 from textual.widgets import DataTable, ListView, Static
 
 from database.operations import DatabaseManager
 from tui.app import DashboardScreen, HomeScreen, LinkedInTUI, SettingsScreen
 from tui.commands import NavCommands
-from tui.screens.campaigns import CampaignsScreen
 from tui.screens.settings_view import mask_email
-
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -282,7 +279,6 @@ async def test_dashboard_used_today_states(db_manager: DatabaseManager, monkeypa
         from tui.screens.dashboard import DashboardData
 
         screen._populate(
-            screen._load_generation,
             DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=20, daily_limit=20),
             None,
         )
@@ -291,7 +287,6 @@ async def test_dashboard_used_today_states(db_manager: DatabaseManager, monkeypa
 
         # Quota unavailable -> blank dash, neutral.
         screen._populate(
-            screen._load_generation,
             DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=None, daily_limit=None),
             None,
         )
@@ -384,11 +379,12 @@ async def test_dashboard_stale_load_is_dropped(seeded_db_manager: DatabaseManage
         await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
 
         current = screen._load_generation
-        # An older-generation error result is ignored.
-        screen._populate(current - 1, None, "Database unavailable.")
+        # An older-generation error result is ignored (the mixin's generation
+        # gate drops it before _populate runs).
+        screen._apply_if_current(current - 1, screen._populate, None, "Database unavailable.")
         assert card_value(screen, "active-campaigns") == "1/2"
         # The current generation applies.
-        screen._populate(current, None, "Database unavailable.")
+        screen._apply_if_current(current, screen._populate, None, "Database unavailable.")
         assert card_value(screen, "active-campaigns") == "—"
 
 
@@ -420,7 +416,7 @@ async def test_dashboard_quit_while_load_in_flight_does_not_error(
 
     assert not app.is_running
     # The in-flight worker reaches its marshal step after exit: a silent no-op.
-    screen._marshal_populate(app, screen._load_generation, None, None)
+    screen.marshal_load(app, screen._load_generation, screen._populate, None, None)
     release.set()
 
 

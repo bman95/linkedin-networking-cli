@@ -22,20 +22,34 @@ class ExecuteCampaignScreen(AutomationRunScreen):
         super().__init__(db_manager, settings)
         self._campaigns: dict = {}
         self._selected = None
+        self._used_today = None
 
     def compose_selection(self) -> ComposeResult:
         yield Static("ACTIVE CAMPAIGN", classes="eyebrow")
         yield Select([], prompt="Loading campaigns…", id="run-campaign")
 
     def ready_hint(self) -> str:
-        return "Select a campaign, then ctrl+r to start sending invites."
+        hint = "Select a campaign, then ctrl+r to start sending invites."
+        if self._used_today:
+            hint += f"  {self._used_today} already sent today."
+        return hint
 
     # ── selection data ────────────────────────────────────────────────────
 
     def fetch_options(self):
-        return self._db_manager.get_campaigns(active_only=True)
+        campaigns = self._db_manager.get_campaigns(active_only=True)
+        try:
+            from datetime import date
 
-    def apply_options(self, campaigns) -> None:
+            used_today = self._db_manager.get_daily_connection_count(
+                date.today().isoformat()
+            )
+        except Exception:  # a quota hint must never block the run screen
+            used_today = None
+        return campaigns, used_today
+
+    def apply_options(self, data) -> None:
+        campaigns, self._used_today = data
         if not campaigns:
             self._run_can_start = False
             self._set_status(

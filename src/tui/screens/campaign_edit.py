@@ -10,8 +10,6 @@ form locks and ``esc`` returns to the detail screen, which reloads on resume.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -21,22 +19,25 @@ from database.models import Campaign
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
-from .base import BaseScreen
-from .campaign_form import campaign_form_widgets, fill_form, read_form
+from .campaign_form import CampaignFormScreen, campaign_form_widgets, fill_form, read_form
 
 logger = get_logger(__name__)
 
 
-class CampaignEditScreen(BaseScreen):
+class CampaignEditScreen(CampaignFormScreen):
     """Pre-filled campaign form that updates an existing campaign."""
 
     BINDINGS = [
-        ("escape", "app.pop_screen", "Back"),
+        # "back" (not app.pop_screen): the shared form owns esc so a dirty form
+        # warns before discarding (see CampaignFormScreen.action_back).
+        ("escape", "back", "Back"),
         Binding("ctrl+s", "save", "Save", priority=True),
         ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Edit Campaign"
+
+    STATUS_ID = "#edit-status"
 
     HINTS = (
         ("ctrl+s", "save"),
@@ -45,11 +46,10 @@ class CampaignEditScreen(BaseScreen):
         ("ctrl+p", "commands"),
     )
 
-    def __init__(self, db_manager: Optional[DatabaseManager], campaign_id: int) -> None:
+    def __init__(self, db_manager: DatabaseManager | None, campaign_id: int) -> None:
         super().__init__()
         self._db_manager = db_manager
         self._campaign_id = campaign_id
-        self._load_generation = 0
         self._saving = False
         self._saved = False
 
@@ -63,16 +63,10 @@ class CampaignEditScreen(BaseScreen):
             return
         self.load_campaign()
 
-    def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#edit-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
-
     # ── prefill load ──────────────────────────────────────────────────────
 
     def load_campaign(self) -> None:
-        self._load_generation += 1
-        self._run_load(self.app, self._load_generation)
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True, group="load")
     def _run_load(self, app: App, generation: int) -> None:
@@ -80,27 +74,13 @@ class CampaignEditScreen(BaseScreen):
         try:
             campaign = self._db_manager.get_campaign(self._campaign_id)
         except Exception as exc:
-            self._marshal_load(app, generation, None, f"Error loading campaign: {exc}")
+            self.marshal_load(
+                app, generation, self._prefill, None, f"Error loading campaign: {exc}"
+            )
             return
-        self._marshal_load(app, generation, campaign, None)
+        self.marshal_load(app, generation, self._prefill, campaign, None)
 
-    def _marshal_load(
-        self, app: App, generation: int, campaign: Optional[Campaign], error: Optional[str]
-    ) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._prefill, generation, campaign, error)
-        except RuntimeError:
-            return
-
-    def _prefill(
-        self, generation: int, campaign: Optional[Campaign], error: Optional[str]
-    ) -> None:
-        if not self.is_mounted:
-            return
-        if generation != self._load_generation:
-            return
+    def _prefill(self, campaign: Campaign | None, error: str | None) -> None:
         if error is not None:
             self._set_status(error, "error")
             return
@@ -110,6 +90,8 @@ class CampaignEditScreen(BaseScreen):
         fill_form(self, campaign)
         self._set_status("Edit the fields, then ctrl+s to save.")
         self.query_one("#field-name").focus()
+        # The prefilled values are the pristine state for the esc guard.
+        self.mark_clean()
 
     # ── save ──────────────────────────────────────────────────────────────
 
@@ -132,22 +114,12 @@ class CampaignEditScreen(BaseScreen):
         try:
             campaign = self._db_manager.update_campaign(self._campaign_id, updates)
         except Exception as exc:
-            self._marshal_done(app, None, str(exc))
+            self.marshal(app, self._done, None, str(exc))
             return
         name = campaign.name if campaign is not None else None
-        self._marshal_done(app, name, None if campaign is not None else "Campaign not found.")
+        self.marshal(app, self._done, name, None if campaign is not None else "Campaign not found.")
 
-    def _marshal_done(self, app: App, name: Optional[str], error: Optional[str]) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._done, name, error)
-        except RuntimeError:
-            return
-
-    def _done(self, name: Optional[str], error: Optional[str]) -> None:
-        if not self.is_mounted:
-            return
+    def _done(self, name: str | None, error: str | None) -> None:
         self._saving = False
         if error is not None:
             self._set_status(f"Error saving campaign: {error}", "error")

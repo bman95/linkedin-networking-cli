@@ -5,14 +5,14 @@ Tests LinkedInAutomation class with mocked Playwright interactions.
 """
 
 import asyncio
+from datetime import UTC, date, datetime
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
 import pytest
-from unittest.mock import AsyncMock, Mock, MagicMock, patch
-from datetime import datetime, timezone, date
 
-from automation.linkedin import LinkedInAutomation, LinkedInProfile, ConnectResult
 from automation import selectors as sel
+from automation.linkedin import ConnectResult, LinkedInAutomation, LinkedInProfile
 from database.models import Campaign, Contact
-
 
 # ============================================================================
 # LinkedInAutomation Initialization Tests
@@ -347,8 +347,9 @@ class TestLogin:
         "manual login timed out" LoginFailedException) so the caller stops.
         """
         from unittest.mock import PropertyMock
-        from exceptions import CaptchaDetectedException
+
         from config.settings import AppSettings
+        from exceptions import CaptchaDetectedException
 
         mock_linkedin_automation.is_authenticated = False
         mock_page = mock_linkedin_automation.page
@@ -389,8 +390,9 @@ class TestLogin:
         no inner guard and relies on the outer handler.
         """
         from unittest.mock import PropertyMock
-        from exceptions import UnexpectedLandingException
+
         from config.settings import AppSettings
+        from exceptions import UnexpectedLandingException
 
         mock_linkedin_automation.is_authenticated = False
         mock_page = mock_linkedin_automation.page
@@ -1212,6 +1214,46 @@ class TestPersistedDailyCap:
         assert any("already reached" in m for m in messages)
 
     @pytest.mark.asyncio
+    async def test_weekly_budget_reached_stops_before_sending(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """The run stops before sending once the weekly budget is reached.
+
+        LinkedIn's binding cap is a rolling ~weekly one; the proactive
+        weekly-budget pre-check must stop the loop cleanly before the next
+        invite (mirroring the daily-full stop) rather than sending into it.
+        """
+        from datetime import timedelta
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "5")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        # 5 invites already sent earlier this week, recorded on a PRIOR day so
+        # today's daily count stays 0 — proving the WEEKLY budget (not the daily
+        # cap) is what stops the run.
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        for _ in range(5):
+            db.increment_daily_connection_count(yesterday)
+
+        today = date.today().isoformat()
+        assert db.get_daily_connection_count(today) == 0  # daily cap not the cause
+        assert db.get_weekly_connection_count() == 5
+
+        messages = []
+        result = await mock_linkedin_automation.send_connection_requests(
+            campaign, self._profiles(5), progress_callback=messages.append
+        )
+
+        # No new requests sent; the browser was never driven.
+        assert result["sent"] == 0
+        assert not mock_linkedin_automation.page.goto.called
+        # Weekly count untouched and the user was told why the run stopped.
+        assert db.get_weekly_connection_count() == 5
+        assert any("Weekly invitation limit reached" in m for m in messages)
+
+    @pytest.mark.asyncio
     async def test_partial_prior_run_does_not_reset(
         self, mock_linkedin_automation, monkeypatch
     ):
@@ -1466,7 +1508,7 @@ class TestResilientSendTail:
                 awaitable.close()
                 if on_wedge is not None:
                     await on_wedge(kwargs)
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             return await awaitable
         return _run_bounded
 
@@ -2027,7 +2069,7 @@ class TestResilientSendTail:
             "name": profile.name,
             "profile_url": profile.profile_url,
             "status": "sent",
-            "connection_sent_at": datetime.now(timezone.utc),
+            "connection_sent_at": datetime.now(UTC),
         })
 
         async def _passthrough(awaitable, **kwargs):
@@ -2744,7 +2786,6 @@ class TestNavigationGuardWiring:
         self, mock_linkedin_automation
     ):
         """A per-item watchdog timeout skips that profile and keeps going."""
-        import asyncio
 
         db = mock_linkedin_automation.db_manager
         campaign = db.create_campaign({"name": "Skip"})
@@ -2768,7 +2809,7 @@ class TestNavigationGuardWiring:
                 # Mirror run_bounded's contract: refresh (rebinds self.page),
                 # then re-raise so the caller skips the item.
                 await kwargs["recover"]()
-                raise asyncio.TimeoutError()
+                raise TimeoutError()
             return mock_linkedin_automation.page
 
         async def _recover():
@@ -3544,7 +3585,7 @@ class TestSearchAndConnect:
         self._wire(auto, [(p0, "connect"), (p1, "connect")], monkeypatch)
 
         # The first card-connect wedges (bounded click+modal raises TimeoutError).
-        auto._attempt_connect = AsyncMock(side_effect=asyncio.TimeoutError())
+        auto._attempt_connect = AsyncMock(side_effect=TimeoutError())
         fallback = AsyncMock(
             return_value={"sent": 1, "failed": 0, "existing": 0, "total_processed": 1}
         )

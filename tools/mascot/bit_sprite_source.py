@@ -16,9 +16,8 @@ import argparse
 import base64
 import os
 import shutil
-import sys
 import zlib
-from typing import Iterable
+from collections.abc import Iterable
 
 SOURCE_WIDTH = 160
 SOURCE_HEIGHT = 160

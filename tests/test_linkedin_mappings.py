@@ -5,35 +5,35 @@ Tests all mapping functions, validators, and helper utilities.
 """
 
 import pytest
+
 from automation.linkedin_mappings import (
-    # Location functions
-    get_location_display_names,
-    get_location_urn,
-    get_location_name_from_urn,
-    validate_geo_urn,
-    LOCATION_MAPPING,
+    COMMON_COMPANIES,
+    INDUSTRY_CHOICES,
+    INDUSTRY_MAPPING,
+    # Constants for other mappings
+    LANGUAGE_MAPPING,
     LOCATION_CHOICES,
-    # Network functions
-    get_network_display_names,
-    get_network_value,
-    get_network_name_from_value,
-    NETWORK_MAPPING,
+    LOCATION_MAPPING,
     NETWORK_CHOICES,
+    NETWORK_MAPPING,
+    # Helper functions
+    format_ids_for_url,
     # Industry functions
     get_industry_display_names,
     get_industry_id,
     get_industry_ids_for_multiple,
     get_industry_name_from_id,
+    # Location functions
+    get_location_display_names,
+    get_location_name_from_urn,
+    get_location_urn,
+    # Network functions
+    get_network_display_names,
+    get_network_name_from_value,
+    get_network_value,
+    validate_geo_urn,
     validate_industry_id,
-    INDUSTRY_MAPPING,
-    INDUSTRY_CHOICES,
-    # Helper functions
-    format_ids_for_url,
-    # Constants for other mappings
-    LANGUAGE_MAPPING,
-    COMMON_COMPANIES,
 )
-
 
 # ============================================================================
 # Location Tests

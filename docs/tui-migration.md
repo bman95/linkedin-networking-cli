@@ -60,7 +60,7 @@ side effects); write and automation flows follow.
 | Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_daily_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count` | none (read-only) | **done (this PR)** |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
-| Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**; online location search + custom geoUrn deferred |
+| Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `ExecuteCampaignScreen` | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (user-initiated run) |
 | Check Connections | `CheckConnectionsScreen` | `smart_connection_checker` / `check_connection_status` | browser, network | **done** (user-initiated run) |
 | Extract Profile Data | `ExtractProfilesScreen` | `extract_detailed_profile` | browser, network | **done** (user-initiated run) |
@@ -76,14 +76,18 @@ side effects); write and automation flows follow.
    side effects.
 2. **Write flow: Create Campaign (done).** The first screen that mutates state.
    Introduces the form/validation patterns (inputs, selects, confirmation) and
-   the "instant in-place feedback after a write" interaction. Lower risk than
-   automation because there's no browser — which is exactly why the classic
-   flow's "🔎 Search location online (requires login)" option (and the
-   custom-geoUrn entry it falls back to) is **deferred**: both drive Playwright +
-   a LinkedIn login, so they belong with the automation slice. The static
+   the "instant in-place feedback after a write" interaction. The static
    location list, network degree, and industry are at full parity; `Any`
    location/industry persist as `None`, and the same validation rules apply
    (non-empty name, daily limit 1–100, `{name}` required in the message).
+   The classic flow's "🔎 Search location online (requires login)" option and
+   the custom-geoUrn entry were initially deferred (they drive Playwright + a
+   login) and have since been **ported**: the Location select's sentinel
+   options reveal an inline query input (browser search in a thread worker;
+   `CampaignFormScreen.perform_location_search` is the test seam) or the
+   geoUrn/name inputs, and a stored non-curated location survives Edit via a
+   display-name → geoUrn override map (see `campaign_form.py` and
+   `tests/test_tui_location_search.py`).
 3. **Automation flows: Execute / Check Connections / Extract Profile Data (done).**
    The hardest slice: long-running async Playwright work with live in-place
    progress and credential gating. A shared `AutomationRunScreen` base
@@ -104,10 +108,10 @@ side effects); write and automation flows follow.
    offered — the automation methods take no cancel token — so the screen says
    "keep this open until it finishes"; `esc` after completion returns.
 4. **Cutover.** Once every flow has a TUI equivalent at parity, drop InquirerPy.
-   Every classic main-menu flow now has a TUI equivalent. The only deferred
-   parity items are the browser-bound **online location search** / **custom
-   geoUrn** entry in Create/Edit; cutover itself (removing InquirerPy and
-   `linkedin_cli.py`) is gated on the owner's per-flow sign-off.
+   Every classic main-menu flow now has a TUI equivalent, including the
+   browser-bound online location search / custom geoUrn entry in Create/Edit;
+   cutover itself (removing InquirerPy and `linkedin_cli.py`) is gated on the
+   owner's per-flow sign-off.
 
 Rationale: de-risk by deferring side-effecting flows. Each stage builds on the
 proven conventions of the previous one, so the experience stays coherent as the
@@ -231,18 +235,23 @@ toward a calm, modern terminal surface.
 ### State design
 
 Every data screen renders designed **loading / populated / empty / error /
-degraded** states — never a raw traceback. The threaded-worker contract:
+degraded** states — never a raw traceback. The threaded-worker contract lives in
+one place — `tui/screens/workers.py` `WorkerGuardMixin`, inherited via
+`BaseScreen` (and mixed into `HomeScreen` directly):
 
-1. `load_*()` runs on the UI thread, bumps a monotonic `_load_generation`,
-   captures `self.app`, and hands both to the worker. (Resolving `self.app`
-   inside the deferred worker body would raise if the screen was popped first.)
+1. `load_*()` runs on the UI thread and calls `begin_load()`, which bumps a
+   monotonic `_load_generation` and captures `self.app`; both are handed to the
+   worker. (Resolving `self.app` inside the deferred worker body would raise if
+   the screen was popped first.)
 2. The `@work(thread=True, exclusive=True)` worker fetches off the event loop,
    wrapping reads in try/except to turn failures into a friendly in-place error.
-3. `_marshal_populate(app, generation, …)` guards `app.is_running` and catches
-   `RuntimeError`, so a late callback after quit is a silent no-op (no hang).
-4. `_populate(generation, …)` bails if `not self.is_mounted` and drops results
-   whose generation no longer matches the latest — a slower, superseded load can
-   never overwrite a newer snapshot.
+3. The worker hands results back through `marshal_load(app, generation,
+   callback, …)` (or `marshal(app, callback, …)` for one-shot actions with no
+   generation), which guards `app.is_running` and catches `RuntimeError`, so a
+   late callback after quit is a silent no-op (no hang).
+4. On the UI thread the mixin applies the callback only if the screen
+   `is_mounted` and (for loads) the generation still matches the latest — a
+   slower, superseded load can never overwrite a newer snapshot.
 
 Refreshing a screen (`r`) sets its status line to `Refreshing…` before the
 worker starts, so the action gives immediate feedback even though the existing

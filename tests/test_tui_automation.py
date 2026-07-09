@@ -7,16 +7,15 @@ run → summary/error pipeline (via a browser-free fake that overrides the singl
 """
 
 import pytest
-
 from textual.widgets import Input, RichLog, Select, Static
 
+from database.operations import DatabaseManager
 from exceptions import (
     CaptchaDetectedException,
     NotAuthenticatedException,
     RateLimitExceededException,
     SelectorNotFoundException,
 )
-from database.operations import DatabaseManager
 from tui.app import (
     CheckConnectionsScreen,
     ExecuteCampaignScreen,

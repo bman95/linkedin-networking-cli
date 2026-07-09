@@ -6,7 +6,6 @@ actions (toggle active, delete with confirmation, edit) against a real
 """
 
 import pytest
-
 from textual.widgets import DataTable, Input, Static
 
 from database.operations import DatabaseManager

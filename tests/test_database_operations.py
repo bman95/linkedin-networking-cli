@@ -4,13 +4,13 @@ Unit tests for database operations.
 Tests DatabaseManager CRUD operations and business logic.
 """
 
-import pytest
-from datetime import datetime, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from database.operations import DatabaseManager
-from database.models import Campaign, Contact, Analytics, Settings
+import pytest
 
+from database.models import Settings
+from database.operations import DatabaseManager
 
 # ============================================================================
 # DatabaseManager Initialization Tests
@@ -278,7 +278,7 @@ class TestContactOperations:
 
         updates = {
             "status": "accepted",
-            "connection_accepted_at": datetime.now(timezone.utc),
+            "connection_accepted_at": datetime.now(UTC),
         }
         updated = db_manager.update_contact(created.id, updates)
 
@@ -406,7 +406,7 @@ class TestContactOperations:
         db_manager.create_contact({
             "campaign_id": campaign.id, "name": "John Doe",
             "profile_url": url, "status": "sent",
-            "connection_sent_at": datetime.now(timezone.utc),
+            "connection_sent_at": datetime.now(UTC),
         })
         deleted = db_manager.delete_contacts_by_profile(
             campaign.id, url, only_unfinalized=True
@@ -463,7 +463,7 @@ class TestContactOperations:
         db_manager.create_contact({
             "campaign_id": campaign.id, "name": "John Doe",
             "profile_url": url, "status": "sent",
-            "connection_sent_at": datetime.now(timezone.utc),
+            "connection_sent_at": datetime.now(UTC),
         })
         result = db_manager.upsert_contact({
             "campaign_id": campaign.id, "name": "John Doe",
@@ -530,7 +530,7 @@ class TestContactOperations:
         db_manager.create_contact({
             "campaign_id": campaign.id, "name": "John Doe",
             "profile_url": url, "status": "sent",
-            "connection_sent_at": datetime.now(timezone.utc),
+            "connection_sent_at": datetime.now(UTC),
         })
         promoted = db_manager.promote_reserved_to_possibly_sent(campaign.id, url)
         assert promoted == 0
@@ -744,7 +744,7 @@ class TestContactUniqueness:
         db_manager.upsert_contact({
             "campaign_id": campaign.id, "name": "Guard",
             "profile_url": url, "status": "possibly_sent",
-            "connection_sent_at": datetime.now(timezone.utc),
+            "connection_sent_at": datetime.now(UTC),
         })
         result = db_manager.upsert_contact({
             "campaign_id": campaign.id, "name": "Guard",
@@ -1060,9 +1060,9 @@ class TestDailyConnectionCount:
 
     def test_increment_records_last_action_at(self, db_manager):
         """Incrementing records a timezone-aware last-action timestamp."""
-        before = datetime.now(timezone.utc)
+        before = datetime.now(UTC)
         db_manager.increment_daily_connection_count("2025-01-15")
-        after = datetime.now(timezone.utc)
+        after = datetime.now(UTC)
 
         last = db_manager.get_last_connection_at()
         assert last is not None
@@ -1171,6 +1171,63 @@ class TestDailyConnectionCount:
                 select(Settings).where(Settings.key == "test_key")
             ).first()
             assert setting.description == "Test description"
+
+
+# ============================================================================
+# Weekly Connection Count Tests (proactive weekly-invitation budget)
+# ============================================================================
+
+@pytest.mark.unit
+class TestWeeklyConnectionCount:
+    """Test the trailing-7-day connection sum used for the weekly budget."""
+
+    def test_absent_week_is_zero(self, db_manager):
+        """No recorded days sums to zero."""
+        assert db_manager.get_weekly_connection_count(reference_date=date(2025, 1, 15)) == 0
+
+    def test_sums_trailing_seven_days(self, db_manager):
+        """The reference day and the previous 6 days are all included."""
+        ref = date(2025, 1, 15)
+        for n in range(7):  # today .. 6 days ago, 1 each
+            db_manager.increment_daily_connection_count(
+                (ref - timedelta(days=n)).isoformat()
+            )
+        assert db_manager.get_weekly_connection_count(reference_date=ref) == 7
+
+    def test_excludes_days_older_than_seven(self, db_manager):
+        """A day 7+ days before the reference date is outside the window."""
+        ref = date(2025, 1, 15)
+        # Within window: today and 6 days ago.
+        db_manager.increment_daily_connection_count(ref.isoformat())
+        db_manager.increment_daily_connection_count(
+            (ref - timedelta(days=6)).isoformat()
+        )
+        # Just outside the window (7 days before): must be excluded.
+        for _ in range(5):
+            db_manager.increment_daily_connection_count(
+                (ref - timedelta(days=7)).isoformat()
+            )
+        assert db_manager.get_weekly_connection_count(reference_date=ref) == 2
+
+    def test_sums_varying_daily_counts(self, db_manager):
+        """Per-day counts (not just 1 each) are summed correctly."""
+        ref = date(2025, 1, 15)
+        for _ in range(3):
+            db_manager.increment_daily_connection_count(ref.isoformat())
+        for _ in range(4):
+            db_manager.increment_daily_connection_count(
+                (ref - timedelta(days=2)).isoformat()
+            )
+        assert db_manager.get_weekly_connection_count(reference_date=ref) == 7
+
+    def test_default_reference_date_is_today(self, db_manager):
+        """Called with no argument, it buckets by the local ``date.today()``."""
+        today = date.today()
+        db_manager.increment_daily_connection_count(today.isoformat())
+        db_manager.increment_daily_connection_count(
+            (today - timedelta(days=3)).isoformat()
+        )
+        assert db_manager.get_weekly_connection_count() == 2
 
 
 # ============================================================================

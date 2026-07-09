@@ -22,7 +22,7 @@ test overrides to exercise the run/log/summary/error pipeline without a browser.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Any
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -47,7 +47,7 @@ class AutomationRunScreen(BaseScreen):
     ACTION_LABEL = "automation"
 
     BINDINGS = [
-        ("escape", "app.pop_screen", "Back"),
+        ("escape", "back", "Back"),
         # priority so it fires while a Select/Input holds focus.
         Binding("ctrl+r", "start", "Start", priority=True),
         ("q", "app.quit", "Quit"),
@@ -61,18 +61,21 @@ class AutomationRunScreen(BaseScreen):
     )
 
     def __init__(
-        self, db_manager: Optional[DatabaseManager], settings: Optional[AppSettings]
+        self, db_manager: DatabaseManager | None, settings: AppSettings | None
     ) -> None:
         super().__init__()
         self._db_manager = db_manager
         self._settings = settings
-        self._app_ref: Optional[App] = None
+        self._app_ref: App | None = None
         # NB: distinct names — a bare ``_running`` shadows Textual's
         # MessagePump._running (always True once mounted), which would make the
         # start guard a permanent no-op. See docs/tui-migration.md §9.
         self._run_confirming = False
         self._run_active = False
         self._run_done = False
+        # First esc mid-run warns (the run would keep going headless); the
+        # second one leaves anyway.
+        self._leave_confirming = False
         # Subclasses flip this off (in apply_options) to block start, e.g. when
         # there are no eligible campaigns.
         self._run_can_start = True
@@ -119,7 +122,7 @@ class AutomationRunScreen(BaseScreen):
     def ready_hint(self) -> str:
         return "Configure the run, then ctrl+r to start."
 
-    def validate(self) -> Optional[str]:
+    def validate(self) -> str | None:
         """Return a one-line confirmation summary, or None if the current
         selection is invalid (after setting an error status). Override."""
         return "Start automation?"
@@ -150,6 +153,28 @@ class AutomationRunScreen(BaseScreen):
         return "Run complete."
 
     # ── start / confirm / run ─────────────────────────────────────────────
+
+    def action_back(self) -> None:
+        """``esc``: cancel an armed confirmation, warn once mid-run, else leave.
+
+        The confirm prompt promises "esc to cancel", so esc while confirming
+        cancels the confirmation. Mid-run, leaving does NOT stop the automation
+        (the worker keeps driving the browser), so the first esc says exactly
+        that and only a second esc leaves.
+        """
+        if self._run_confirming:
+            self._run_confirming = False
+            self._set_status("Cancelled. " + self.ready_hint())
+            return
+        if self._run_active and not self._leave_confirming:
+            self._leave_confirming = True
+            self._set_status(
+                "Run in progress — leaving does not stop it. "
+                "Press esc again to leave anyway.",
+                "warn",
+            )
+            return
+        self.app.pop_screen()
 
     def action_start(self) -> None:
         if (
@@ -189,9 +214,9 @@ class AutomationRunScreen(BaseScreen):
         try:
             result = asyncio.run(self.run_body())
         except Exception as exc:  # any automation failure → friendly stop
-            self._marshal_finish(app, None, exc)
+            self.marshal(app, self._finish, None, exc)
             return
-        self._marshal_finish(app, result, None)
+        self.marshal(app, self._finish, result, None)
 
     # ── progress (worker thread → UI) ─────────────────────────────────────
 
@@ -201,36 +226,17 @@ class AutomationRunScreen(BaseScreen):
         Called from the worker thread; marshals a line into the log on the UI
         thread, and is a silent no-op once the app has stopped.
         """
-        app = self._app_ref
-        if app is None or not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._append_log, str(message))
-        except RuntimeError:
-            return
+        self.marshal(self._app_ref, self._append_log, str(message))
 
     def _append_log(self, message: str) -> None:
-        if not self.is_mounted:
-            return
         self.query_one("#run-log", RichLog).write(message)
 
     # ── finish (worker thread → UI) ───────────────────────────────────────
 
-    def _marshal_finish(
-        self, app: App, result: Optional[dict], exc: Optional[Exception]
-    ) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._finish, result, exc)
-        except RuntimeError:
-            return
-
-    def _finish(self, result: Optional[dict], exc: Optional[Exception]) -> None:
-        if not self.is_mounted:
-            return
+    def _finish(self, result: dict | None, exc: Exception | None) -> None:
         self._run_active = False
         self._run_done = True
+        self._leave_confirming = False
         log = self.query_one("#run-log", RichLog)
         if exc is not None:
             headline, evidence = describe_automation_error(exc, self.ACTION_LABEL)
@@ -253,21 +259,11 @@ class AutomationRunScreen(BaseScreen):
         try:
             data = self.fetch_options()
         except Exception as exc:
-            self._marshal_populate(app, None, f"Error loading options: {exc}")
+            self.marshal(app, self._apply_populate, None, f"Error loading options: {exc}")
             return
-        self._marshal_populate(app, data, None)
+        self.marshal(app, self._apply_populate, data, None)
 
-    def _marshal_populate(self, app: App, data: Any, error: Optional[str]) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._apply_populate, data, error)
-        except RuntimeError:
-            return
-
-    def _apply_populate(self, data: Any, error: Optional[str]) -> None:
-        if not self.is_mounted:
-            return
+    def _apply_populate(self, data: Any, error: str | None) -> None:
         if error is not None:
             self._run_can_start = False
             self._set_status(error, "error")

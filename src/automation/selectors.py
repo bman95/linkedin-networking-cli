@@ -22,11 +22,11 @@ All ``Selector`` methods that touch a page are async and operate on an async
 Playwright ``Page``.
 """
 
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
 
 from automation.diagnostics import capture_error_context
-from utils.logging import get_logger
 from exceptions import SelectorNotFoundException
+from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -79,7 +79,7 @@ class Selector:
                 f"Selector {name!r}: primary_count must be >= 1, got {primary_count}"
             )
         self.name = name
-        self.candidates: List[str] = cleaned
+        self.candidates: list[str] = cleaned
         # Cap at the candidate count so an over-specified primary_count cannot
         # silence a genuine fallback that simply doesn't exist yet.
         self.primary_count = min(primary_count, len(cleaned))
@@ -158,7 +158,7 @@ class Selector:
             await self.fail_loud(page, context=context)
         return None
 
-    async def fail_loud(self, page, *, context=None, timeout: Optional[int] = None):
+    async def fail_loud(self, page, *, context=None, timeout: int | None = None):
         """Capture an evidence bundle and raise. Never returns normally.
 
         Callers that detect a missing element on a path other than

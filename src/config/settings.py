@@ -1,7 +1,7 @@
-from pathlib import Path
-from typing import Any, Dict, Optional
-from zoneinfo import available_timezones, TZPATH
 import os
+from pathlib import Path
+from typing import Any
+from zoneinfo import TZPATH, available_timezones
 
 from utils.logging import get_logger
 
@@ -46,7 +46,7 @@ class AppSettings:
         logger.debug(f"Session path: {self.session_path}")
 
     @property
-    def linkedin_email(self) -> Optional[str]:
+    def linkedin_email(self) -> str | None:
         """Get LinkedIn email from environment"""
         email = os.getenv("LINKEDIN_EMAIL")
         if email:
@@ -56,7 +56,7 @@ class AppSettings:
         return email
 
     @property
-    def linkedin_password(self) -> Optional[str]:
+    def linkedin_password(self) -> str | None:
         """Get LinkedIn password from environment"""
         password = os.getenv("LINKEDIN_PASSWORD")
         if password:
@@ -65,8 +65,20 @@ class AppSettings:
             logger.warning("LINKEDIN_PASSWORD environment variable not set")
         return password
 
+    @property
+    def weekly_invitation_limit(self) -> int:
+        """Proactive weekly invitation budget (env ``WEEKLY_INVITATION_LIMIT``).
+
+        LinkedIn's binding constraint is a rolling ~weekly invitation cap, not
+        the per-day one; without this the weekly limit is only discovered
+        reactively by hitting the limit modal mid-run. Parsed with the same
+        guarded ``_env_int`` helper as ``DAILY_CONNECTION_LIMIT`` so a malformed
+        value degrades to the default (100) instead of crashing startup.
+        """
+        return _env_int("WEEKLY_INVITATION_LIMIT", 100)
+
     @staticmethod
-    def _normalize_timezone(candidate: Optional[str]) -> Optional[str]:
+    def _normalize_timezone(candidate: str | None) -> str | None:
         """Return ``candidate`` only if it is a valid IANA timezone id.
 
         Playwright's ``timezone_id`` must be an IANA name (e.g.
@@ -89,7 +101,7 @@ class AppSettings:
         return candidate if candidate in available_timezones() else None
 
     @staticmethod
-    def _match_localtime_by_bytes() -> Optional[str]:
+    def _match_localtime_by_bytes() -> str | None:
         """Identify the host zone by matching ``/etc/localtime``'s bytes.
 
         Containers (and some distros) ship ``/etc/localtime`` as a *copy* of a
@@ -115,7 +127,7 @@ class AppSettings:
         return None
 
     @classmethod
-    def _detect_host_timezone(cls) -> Optional[str]:
+    def _detect_host_timezone(cls) -> str | None:
         """Best-effort *valid* IANA timezone name for the host, or ``None``.
 
         Reads the host (``TZ``, then ``/etc/localtime``, then ``/etc/timezone``,
@@ -159,7 +171,7 @@ class AppSettings:
         # non-UTC host is not silently flattened.
         return cls._match_localtime_by_bytes()
 
-    def get_browser_settings(self) -> Dict[str, Any]:
+    def get_browser_settings(self) -> dict[str, Any]:
         """Get browser settings"""
         channel_env = os.getenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
         channel = channel_env.strip() if channel_env else None
@@ -219,7 +231,7 @@ class AppSettings:
         )
         return settings
 
-    def get_automation_settings(self) -> Dict[str, Any]:
+    def get_automation_settings(self) -> dict[str, Any]:
         """Get automation settings"""
         settings = {
             "connection_delay_min": _env_int("CONNECTION_DELAY_MIN", 2),
@@ -254,7 +266,7 @@ class AppSettings:
         )
         return settings
 
-    def get_navigation_settings(self) -> Dict[str, Any]:
+    def get_navigation_settings(self) -> dict[str, Any]:
         """Get resilient-navigation tunables (issue #17).
 
         These bound the retry/watchdog layer around the guarded navigation:

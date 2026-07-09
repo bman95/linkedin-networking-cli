@@ -13,20 +13,20 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from automation.interactions import (
-    random_wait,
-    detect_captcha,
-    check_if_connected,
-    get_connection_status,
-    _is_true_limit,
-    human_type,
-    move_to_element,
-    move_to_and_click,
-    scroll_down,
-    dwell,
-    RateLimiter,
-)
 from automation import selectors as sel
+from automation.interactions import (
+    RateLimiter,
+    _is_true_limit,
+    check_if_connected,
+    detect_captcha,
+    dwell,
+    get_connection_status,
+    human_type,
+    move_to_and_click,
+    move_to_element,
+    random_wait,
+    scroll_down,
+)
 
 
 def _element(visible=True, **attrs):
@@ -150,8 +150,11 @@ class TestHumanType:
         box.clear = AsyncMock()
         box.press_sequentially = AsyncMock()
 
-        # Skip the real focus-pause sleep to keep the test fast.
-        with patch("automation.interactions.asyncio.sleep", new=AsyncMock()):
+        # Skip the real sleeps to keep the test fast, but record them: the
+        # inter-keystroke delay is an explicit asyncio.sleep (passing delay=
+        # to a single-character press_sequentially never fires).
+        sleep_mock = AsyncMock()
+        with patch("automation.interactions.asyncio.sleep", new=sleep_mock):
             await human_type(box, "abc", delay_min=10, delay_max=10)
 
         # Field is focused once, then one keystroke call per character.
@@ -159,9 +162,11 @@ class TestHumanType:
         assert box.press_sequentially.await_count == 3
         typed = "".join(call.args[0] for call in box.press_sequentially.await_args_list)
         assert typed == "abc"
-        # Per-key delay is passed through within the configured range.
-        for call in box.press_sequentially.await_args_list:
-            assert call.kwargs["delay"] == 10
+        # One focus pause + one pause per keystroke, each within the
+        # configured range (min == max == 10ms -> exactly 0.01s).
+        assert sleep_mock.await_count == 4
+        for call in sleep_mock.await_args_list[1:]:
+            assert call.args[0] == pytest.approx(0.01)
 
     @pytest.mark.asyncio
     async def test_clears_field_before_typing(self):

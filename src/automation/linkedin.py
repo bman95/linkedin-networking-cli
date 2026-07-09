@@ -1,65 +1,67 @@
 import asyncio
+import builtins
 import os
 import platform
 import random
+import re
 import unicodedata
 import urllib.parse
 import uuid
 from collections import namedtuple
-from datetime import datetime, timezone, date
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Callable
+from typing import Any
+
+import psutil
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
-    async_playwright,
     Playwright,
     TimeoutError,
+    async_playwright,
 )
-from dataclasses import dataclass
 
-import psutil
-
-from database.models import Campaign, Contact
-from database.operations import DatabaseManager
-from config.settings import AppSettings
-from automation.linkedin_mappings import format_ids_for_url
-from automation.interactions import (
-    random_wait,
-    _is_true_limit,
-    human_type,
-    move_to_element,
-    move_to_and_click,
-    scroll_down,
-    dwell,
-    RateLimiter,
-)
+from automation import selectors as sel
 from automation.diagnostics import (
     capture_anomaly_context,
     capture_error_context,
-    snapshot_page,
     reset_diagnostics_run,
+    snapshot_page,
 )
+from automation.interactions import (
+    RateLimiter,
+    _is_true_limit,
+    dwell,
+    human_type,
+    move_to_and_click,
+    move_to_element,
+    random_wait,
+    scroll_down,
+)
+from automation.linkedin_mappings import format_ids_for_url
 from automation.navigation import (
-    navigate_guarded,
+    _is_crash_error,
     confirm_logged_in_dom,
-    verify_listing_rendered,
     landed_on_challenge,
     landed_on_checkpoint,
+    navigate_guarded,
     run_bounded,
-    _is_crash_error,
+    verify_listing_rendered,
 )
-from automation import selectors as sel
-from utils.logging import get_logger
+from config.settings import AppSettings
+from database.models import Campaign, Contact
+from database.operations import DatabaseManager
 from exceptions import (
-    NotAuthenticatedException,
-    LoginFailedException,
-    SelectorNotFoundException,
     CaptchaDetectedException,
+    LoginFailedException,
+    NotAuthenticatedException,
+    SelectorNotFoundException,
     UnexpectedLandingException,
 )
-
+from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -107,7 +109,7 @@ WEBDRIVER_MASK_SCRIPT = (
 _SINGLETON_LOCK_FILES = ("SingletonLock", "SingletonSocket", "SingletonCookie")
 
 
-def _chrome_procs_using_profile(user_data_dir: str) -> List[psutil.Process]:
+def _chrome_procs_using_profile(user_data_dir: str) -> list[psutil.Process]:
     """Return live Chrome/Chromium processes bound to *this* profile.
 
     Matched by the ``--user-data-dir`` flag on each process' command line so a
@@ -116,7 +118,7 @@ def _chrome_procs_using_profile(user_data_dir: str) -> List[psutil.Process]:
     kill utility, so the same code path works on Windows and Linux.
     """
     target = os.path.normcase(os.path.abspath(user_data_dir))
-    matches: List[psutil.Process] = []
+    matches: list[psutil.Process] = []
     for proc in psutil.process_iter(["name", "cmdline"]):
         try:
             name = (proc.info.get("name") or "").lower()
@@ -148,7 +150,7 @@ def _clear_stale_singleton_locks(user_data_dir: Path) -> None:
             logger.debug("Could not remove stale lock %s: %s", lock, exc)
 
 
-def force_close_chrome(user_data_dir: Optional[str] = None) -> None:
+def force_close_chrome(user_data_dir: str | None = None) -> None:
     """Clear whatever would block a clean persistent-profile launch.
 
     The OS dictates *how*. On every platform we first kill any leftover Chrome
@@ -196,9 +198,9 @@ class LinkedInProfile:
 
     name: str
     profile_url: str
-    headline: Optional[str] = None
-    location: Optional[str] = None
-    company: Optional[str] = None
+    headline: str | None = None
+    location: str | None = None
+    company: str | None = None
     mutual_connections: int = 0
 
 
@@ -218,14 +220,14 @@ class LinkedInAutomation:
     def __init__(self, db_manager: DatabaseManager, settings: AppSettings):
         self.db_manager = db_manager
         self.settings = settings
-        self.playwright: Optional[Playwright] = None
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
+        self.playwright: Playwright | None = None
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
         self.is_authenticated = False
         # Sliding-window per-minute action cap, built lazily from settings so
         # an env override applied after construction still takes effect.
-        self._rate_limiter: Optional[RateLimiter] = None
+        self._rate_limiter: RateLimiter | None = None
 
     def _get_rate_limiter(self) -> RateLimiter:
         """Return the action rate limiter, building it from settings once."""
@@ -289,7 +291,7 @@ class LinkedInAutomation:
         """
         return await self._refresh_context()
 
-    def _nav_kwargs(self) -> Dict[str, Any]:
+    def _nav_kwargs(self) -> dict[str, Any]:
         """Resilient-navigation kwargs shared by every ``navigate_guarded`` call.
 
         Bundles the env-tuned retry/watchdog tunables plus the crash-recovery
@@ -342,7 +344,7 @@ class LinkedInAutomation:
         self.playwright = await async_playwright().start()
         browser_settings = self.settings.get_browser_settings()
 
-        launch_kwargs: Dict[str, Any] = {
+        launch_kwargs: dict[str, Any] = {
             "headless": browser_settings["headless"],
             "timeout": 60_000,  # Increased timeout
             "args": list(AUTOMATION_LAUNCH_ARGS),
@@ -360,7 +362,7 @@ class LinkedInAutomation:
         # rather than forcing an incoherent UTC. user_agent is likewise included
         # only when explicitly overridden; the default leaves real Chrome's own
         # (already-consistent) UA untouched.
-        context_options: Dict[str, Any] = {
+        context_options: dict[str, Any] = {
             "viewport": browser_settings["viewport"],
             "locale": browser_settings["locale"],
         }
@@ -372,6 +374,10 @@ class LinkedInAutomation:
         if user_data_dir:
             user_data_path = Path(user_data_dir)
             user_data_path.mkdir(parents=True, exist_ok=True)
+            # The Chrome profile holds live login cookies; keep it — and the
+            # app dir above it — owner-only.
+            self._restrict_permissions(user_data_path, 0o700)
+            self._restrict_permissions(user_data_path.parent, 0o700)
 
             # Check if profile directory exists
             if user_data_path.exists():
@@ -428,7 +434,7 @@ class LinkedInAutomation:
                         logger.debug(
                             "Could not reload reused persistent page: %s", reload_error
                         )
-            except Exception as persistent_error:
+            except Exception:
                 logger.exception(
                     "Failed persistent context, falling back to transient browser…"
                 )
@@ -491,6 +497,28 @@ class LinkedInAutomation:
             self.page = await self.context.new_page()
             logger.info("Created new page for browser context")
 
+    @staticmethod
+    def _restrict_permissions(path: Path, mode: int) -> None:
+        """Best-effort ``chmod``; POSIX modes may be unsupported (Windows/WSL
+        mounts), so failure is logged at debug and never raised."""
+        try:
+            os.chmod(path, mode)
+        except Exception as chmod_error:
+            logger.debug("Could not chmod %s to %o: %s", path, mode, chmod_error)
+
+    async def _write_session_state(self, context: BrowserContext) -> None:
+        """Write ``session.json`` via ``storage_state``, then lock it down.
+
+        ``session.json`` carries the full LinkedIn auth cookies, so it must not
+        be left with default (world-readable) permissions. The containing app
+        dir is tightened alongside it. Raises whatever ``storage_state`` raises;
+        the permission tightening itself is best-effort.
+        """
+        session_path = self.settings.session_path
+        await context.storage_state(path=str(session_path))
+        self._restrict_permissions(session_path, 0o600)
+        self._restrict_permissions(session_path.parent, 0o700)
+
     # Per-step teardown budget (seconds). ``close_browser`` is called during
     # crash recovery against a *wedged* renderer, where an individual close can
     # HANG (not just throw). Each step is bounded on its own so a hung step
@@ -522,17 +550,29 @@ class LinkedInAutomation:
         attempt, and ``stop`` (which frees the driver subprocess) always runs.
         """
         if self.context:
-            await self._close_step(
-                self.context.storage_state(path=str(self.settings.session_path)),
-                "storage_state",
-            )
+            # Only persist session.json when this run actually confirmed an
+            # authenticated session. close_browser also runs on crash recovery
+            # and failed-login teardowns, where the context may be logged out —
+            # writing its storage_state then would clobber a still-good
+            # session.json with a degraded one.
+            if self.is_authenticated:
+                await self._close_step(
+                    self._write_session_state(self.context),
+                    "storage_state",
+                )
+            else:
+                logger.info(
+                    "Skipping session.json write on close: no authenticated "
+                    "session was confirmed this run; preserving the existing "
+                    "session file"
+                )
             await self._close_step(self.context.close(), "context.close")
         if self.browser:
             await self._close_step(self.browser.close(), "browser.close")
         if self.playwright:
             await self._close_step(self.playwright.stop(), "playwright.stop")
 
-    async def login(self, progress_callback: Optional[Callable] = None) -> bool:
+    async def login(self, progress_callback: Callable | None = None) -> bool:
         """Login to LinkedIn with enhanced session detection"""
         try:
             if progress_callback:
@@ -622,9 +662,7 @@ class LinkedInAutomation:
                 if progress_callback:
                     progress_callback("Login completed successfully!")
                 try:
-                    await self.context.storage_state(
-                        path=str(self.settings.session_path)
-                    )
+                    await self._write_session_state(self.context)
                     logger.info("Session state saved successfully")
                 except Exception as save_error:
                     logger.warning("Failed to save session state: %s", save_error)
@@ -713,7 +751,9 @@ class LinkedInAutomation:
                     logger.error(f"Manual login timed out: {wait_error}")
                     if progress_callback:
                         progress_callback("Manual login timed out before confirmation.")
-                    raise LoginFailedException(f"Manual login timed out: {wait_error}")
+                    raise LoginFailedException(
+                        f"Manual login timed out: {wait_error}"
+                    ) from wait_error
 
             self.is_authenticated = True
             if progress_callback:
@@ -721,7 +761,7 @@ class LinkedInAutomation:
 
             # Save session state
             try:
-                await self.context.storage_state(path=str(self.settings.session_path))
+                await self._write_session_state(self.context)
                 logger.info("Session state saved successfully")
             except Exception as save_error:
                 logger.warning("Failed to save session state: %s", save_error)
@@ -746,7 +786,7 @@ class LinkedInAutomation:
             logger.error(f"Login failed: {str(e)}")
             if progress_callback:
                 progress_callback(f"Login failed: {str(e)}")
-            raise LoginFailedException(f"Login failed: {str(e)}")
+            raise LoginFailedException(f"Login failed: {str(e)}") from e
 
     async def _wait_for_login_redirect(self, timeout_ms: int) -> None:
         """Confirm login by URL leaving the login flow *and* a DOM landmark.
@@ -765,8 +805,8 @@ class LinkedInAutomation:
         self,
         campaign: Campaign,
         limit: int = 100,
-        progress_callback: Optional[Callable] = None,
-    ) -> List[LinkedInProfile]:
+        progress_callback: Callable | None = None,
+    ) -> list[LinkedInProfile]:
         """Search for LinkedIn profiles based on campaign criteria"""
 
         if not self.is_authenticated:
@@ -872,7 +912,7 @@ class LinkedInAutomation:
     async def _walk_search_pages(
         self,
         campaign: Campaign,
-        progress_callback: Optional[Callable] = None,
+        progress_callback: Callable | None = None,
     ):
         """Drive the people-search results page-walk, yielding once per ready page.
 
@@ -963,7 +1003,7 @@ class LinkedInAutomation:
                         "search_results_selector_missing: %s",
                         capture_exc,
                     )
-                raise selector_exc
+                raise selector_exc  # noqa: B904 — re-raise the original; capture error already logged
 
             # Record the landed search page into the rolling ring buffer so a
             # later failure can be traced back through how we got here.
@@ -993,8 +1033,8 @@ class LinkedInAutomation:
         self,
         campaign: Campaign,
         limit: int = 100,
-        progress_callback: Optional[Callable] = None,
-    ) -> Dict[str, int]:
+        progress_callback: Callable | None = None,
+    ) -> dict[str, int]:
         """Search and connect from the result cards in a single pass.
 
         The card-first path for issue #25: walk the people-search results **once**
@@ -1032,7 +1072,7 @@ class LinkedInAutomation:
         failed_count = 0
         existing_count = 0
         seen_urls: set = set()
-        fallback_profiles: List[LinkedInProfile] = []
+        fallback_profiles: list[LinkedInProfile] = []
         scan_done = False  # stop walking result pages
         stop_all = False  # also skip the profile-page fallback pass
 
@@ -1076,6 +1116,27 @@ class LinkedInAutomation:
                             progress_callback(
                                 f"Daily connection limit reached "
                                 f"({daily_limit}/{daily_limit} used today)"
+                            )
+                        scan_done = stop_all = True
+                        break
+
+                    # Proactive weekly-invitation budget (see
+                    # send_connection_requests): stop cleanly before the next
+                    # invite once the trailing-7-day total reaches the weekly
+                    # budget, mirroring the daily-full stop for this loop.
+                    weekly_limit = self.settings.weekly_invitation_limit
+                    weekly_count = self.db_manager.get_weekly_connection_count()
+                    if weekly_count >= weekly_limit:
+                        logger.info(
+                            "Weekly invitation budget reached (%d/%d); stopping "
+                            "the run",
+                            weekly_count,
+                            weekly_limit,
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                f"Weekly invitation limit reached "
+                                f"({weekly_count}/{weekly_limit} used this week)"
                             )
                         scan_done = stop_all = True
                         break
@@ -1159,7 +1220,7 @@ class LinkedInAutomation:
                             )
                         scan_done = stop_all = True
                         break
-                    except asyncio.TimeoutError:
+                    except builtins.TimeoutError:
                         # The bounded click+modal wedged (pre-send, so nothing was
                         # delivered); run_bounded refreshed the browser, so the
                         # remaining card handles on this page are stale. Defer THIS
@@ -1329,8 +1390,8 @@ class LinkedInAutomation:
         if last_action_at is None:
             return
         if last_action_at.tzinfo is None:
-            last_action_at = last_action_at.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - last_action_at).total_seconds()
+            last_action_at = last_action_at.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - last_action_at).total_seconds()
         if elapsed < cooldown_seconds:
             remaining = int(cooldown_seconds - elapsed)
             logger.warning(
@@ -1349,9 +1410,9 @@ class LinkedInAutomation:
     async def send_connection_requests(
         self,
         campaign: Campaign,
-        profiles: List[LinkedInProfile],
-        progress_callback: Optional[Callable] = None,
-    ) -> Dict[str, int]:
+        profiles: list[LinkedInProfile],
+        progress_callback: Callable | None = None,
+    ) -> dict[str, int]:
         """Send connection requests to profiles"""
 
         if not self.is_authenticated:
@@ -1418,6 +1479,26 @@ class LinkedInAutomation:
                         )
                     break
 
+                # Proactive weekly-invitation budget: LinkedIn's binding cap is a
+                # rolling ~weekly one, otherwise only discovered reactively by
+                # hitting the limit modal mid-run. Stop cleanly before the next
+                # invite once the trailing-7-day total has reached the budget —
+                # mirroring the daily-full stop (a plain break to the return).
+                weekly_limit = self.settings.weekly_invitation_limit
+                weekly_count = self.db_manager.get_weekly_connection_count()
+                if weekly_count >= weekly_limit:
+                    logger.info(
+                        "Weekly invitation budget reached (%d/%d); stopping the run",
+                        weekly_count,
+                        weekly_limit,
+                    )
+                    if progress_callback:
+                        progress_callback(
+                            f"Weekly invitation limit reached "
+                            f"({weekly_count}/{weekly_limit} used this week)"
+                        )
+                    break
+
                 if progress_callback:
                     progress_callback(
                         f"Processing {profile.name} ({i + 1}/{len(profiles)})"
@@ -1455,12 +1536,14 @@ class LinkedInAutomation:
                 # (caught below). On a recovered crash navigate_guarded returns a
                 # fresh page, and the connect-control lookup uses self.page, so
                 # the helper rebinds self.page before reading it.
+                # The closure reads the CURRENT `profile`; it is awaited within
+                # this same iteration, so the late-binding hazard cannot occur.
                 async def _navigate_and_read():
                     self.page = await navigate_guarded(
                         self.page,
-                        profile.profile_url,
+                        profile.profile_url,  # noqa: B023 — awaited in-iteration
                         check_path=False,
-                        context={"profile_url": profile.profile_url},
+                        context={"profile_url": profile.profile_url},  # noqa: B023
                         **self._nav_kwargs(),
                     )
                     # DOM-level captcha check (an in-page widget on a non-wall
@@ -1473,7 +1556,7 @@ class LinkedInAutomation:
                     # scrolls back to the top to bring the top-card action in view.
                     await scroll_down(self.page)
                     await self._dwell()
-                    button, kind = await self._find_connect_control(profile)
+                    button, kind = await self._find_connect_control(profile)  # noqa: B023
                     return False, button, kind
 
                 await self._throttle_action()
@@ -1623,7 +1706,7 @@ class LinkedInAutomation:
                         "to protect the account"
                     )
                 break
-            except asyncio.TimeoutError:
+            except builtins.TimeoutError:
                 # The interaction watchdog fired: a wedged renderer exceeded the
                 # per-item budget. run_bounded already refreshed the browser
                 # (self.page rebound via the recover callback), so skip just this
@@ -2211,7 +2294,7 @@ class LinkedInAutomation:
                     "location": profile.location,
                     "company": profile.company,
                     "status": "possibly_sent",
-                    "connection_sent_at": datetime.now(timezone.utc),
+                    "connection_sent_at": datetime.now(UTC),
                     # Authoritative post-click outcome: clear the reservation
                     # token so the finalized row carries no stale owner.
                     "reservation_token": None,
@@ -2296,7 +2379,7 @@ class LinkedInAutomation:
                 "location": profile.location,
                 "company": profile.company,
                 "status": "sent",
-                "connection_sent_at": datetime.now(timezone.utc),
+                "connection_sent_at": datetime.now(UTC),
                 # Authoritative post-click outcome: clear the reservation token so
                 # the finalized row carries no stale owner.
                 "reservation_token": None,
@@ -2363,6 +2446,16 @@ class LinkedInAutomation:
             geo_urn = campaign.location
 
         if geo_urn:
+            geo_urn = str(geo_urn).strip()
+            if not (geo_urn.isascii() and geo_urn.isdigit()):
+                # A geoUrn is numeric. Percent-encode anything else so a
+                # malformed campaign value cannot break out of the ["..."]
+                # wrapper or inject extra query params.
+                logger.warning(
+                    "Non-numeric geo_urn %r in campaign; percent-encoding it",
+                    geo_urn,
+                )
+                geo_urn = urllib.parse.quote(geo_urn, safe="")
             # Correct format: geoUrn=["105646813"]
             params.append(f'geoUrn=["{geo_urn}"]')
 
@@ -2381,6 +2474,16 @@ class LinkedInAutomation:
         # Network - use new network field with default
         network = campaign.network if hasattr(campaign, 'network') and campaign.network else '["F","S"]'
         if network:
+            network = str(network).strip()
+            # Expected shape: ["F"] / ["F","S"] — a bracketed list of short
+            # uppercase degree codes. Percent-encode anything else whole so a
+            # malformed campaign value cannot corrupt the URL or inject params.
+            if not re.fullmatch(r'\["[A-Z]{1,2}"(?:,"[A-Z]{1,2}")*\]', network):
+                logger.warning(
+                    "Unexpected network filter %r in campaign; percent-encoding it",
+                    network,
+                )
+                network = urllib.parse.quote(network, safe="")
             params.append(f"network={network}")
 
         # Origin - use FACETED_SEARCH as per LinkedIn's current format
@@ -2388,7 +2491,7 @@ class LinkedInAutomation:
 
         return "&".join(params)
 
-    async def search_location(self, query: str) -> List[Dict[str, str]]:
+    async def search_location(self, query: str) -> list[dict[str, str]]:
         """
         Search for LinkedIn location geoUrn codes.
 
@@ -2422,15 +2525,15 @@ class LinkedInAutomation:
 
     async def _search_location_via_filter_ui(
         self, query: str, max_options: int = 5
-    ) -> List[Dict[str, str]]:
+    ) -> list[dict[str, str]]:
         """Resolve location names to geoUrn codes by driving the search filter UI.
 
         Each suggestion is clicked and applied so its geoUrn appears in the
         results URL, then the page is reset for the next suggestion.
         """
         base_url = f"{self.SEARCH_URL}?origin=FACETED_SEARCH"
-        results: List[Dict[str, str]] = []
-        total_options: Optional[int] = None
+        results: list[dict[str, str]] = []
+        total_options: int | None = None
         index = 0
 
         while total_options is None or index < total_options:
@@ -2497,8 +2600,8 @@ class LinkedInAutomation:
 
     @classmethod
     def _parse_card_profile(
-        cls, href: str, text: Optional[str]
-    ) -> Optional[LinkedInProfile]:
+        cls, href: str, text: str | None
+    ) -> LinkedInProfile | None:
         """Build a :class:`LinkedInProfile` from one card's href + visible text.
 
         Shared by the text-only SDUI extractor (:meth:`_extract_profiles_new_ui`)
@@ -2513,7 +2616,7 @@ class LinkedInAutomation:
         name = lines[0].split("•")[0].strip()
         if not name:
             return None
-        rest = [l for l in lines[1:] if l.lower() not in cls._CARD_ACTION_WORDS]
+        rest = [ln for ln in lines[1:] if ln.lower() not in cls._CARD_ACTION_WORDS]
         return LinkedInProfile(
             name=name,
             profile_url=href,
@@ -2540,7 +2643,7 @@ class LinkedInAutomation:
                 return handles
         return []
 
-    async def _extract_profile_cards(self) -> List[tuple]:
+    async def _extract_profile_cards(self) -> list[tuple]:
         """Harvest ``(LinkedInProfile, card_handle)`` for the current results page.
 
         The handle-returning sibling of :meth:`_extract_profiles_new_ui`: rather
@@ -2551,7 +2654,7 @@ class LinkedInAutomation:
         href, or no usable name are skipped. Handles detach on navigation, so the
         caller must act on them before the page-walk paginates.
         """
-        results: List[tuple] = []
+        results: list[tuple] = []
         seen: set = set()
         for card in await self._enumerate_card_handles():
             try:
@@ -2580,7 +2683,7 @@ class LinkedInAutomation:
             results.append((profile, card))
         return results
 
-    async def _extract_profiles_new_ui(self) -> List[LinkedInProfile]:
+    async def _extract_profiles_new_ui(self) -> list[LinkedInProfile]:
         """Extract search results from LinkedIn's SDUI search layout (2026).
 
         The new layout uses obfuscated class names, so result cards are
@@ -2639,7 +2742,7 @@ class LinkedInAutomation:
         return profiles
 
     @staticmethod
-    def _normalize(text: Optional[str]) -> str:
+    def _normalize(text: str | None) -> str:
         """Casefold, strip accents, and collapse whitespace for comparison."""
         decomposed = unicodedata.normalize("NFKD", text or "")
         no_marks = "".join(c for c in decomposed if not unicodedata.combining(c))
@@ -2664,7 +2767,7 @@ class LinkedInAutomation:
         # the same control exists in both the top card and the scroll-only
         # sticky header, prefer the lower one (the top card), which is never
         # overlapped by the floating "Probar Premium" promo.
-        async def match(keywords) -> Optional[Any]:
+        async def match(keywords) -> Any | None:
             controls = await self.page.query_selector_all(
                 sel.CONNECT_CONTROL.css
             )
@@ -2821,7 +2924,7 @@ class LinkedInAutomation:
 
         return is_true
 
-    async def _extract_profile_info(self, element) -> Optional[LinkedInProfile]:
+    async def _extract_profile_info(self, element) -> LinkedInProfile | None:
         """Extract profile information from search result element"""
         try:
             # Get profile link - LinkedIn profile links contain "/in/"
@@ -2913,7 +3016,7 @@ class LinkedInAutomation:
             return None
 
     async def check_connection_status(
-        self, contacts: List[Contact], progress_callback: Optional[Callable] = None
+        self, contacts: list[Contact], progress_callback: Callable | None = None
     ) -> int:
         """Check status of pending connection requests using enhanced checker"""
         from .checker import check_specific_contacts
@@ -2941,16 +3044,16 @@ class LinkedInAutomation:
         return stats["newly_accepted"]
 
     async def smart_connection_checker(
-        self, campaign_id: int, progress_callback: Optional[Callable] = None
-    ) -> Dict[str, int]:
+        self, campaign_id: int, progress_callback: Callable | None = None
+    ) -> dict[str, int]:
         """Smart checker that monitors LinkedIn connections page for newly accepted connections"""
         from .checker import smart_connection_checker
 
         return await smart_connection_checker(self, campaign_id, progress_callback)
 
     async def extract_detailed_profile(
-        self, profile_url: str, progress_callback: Optional[Callable] = None
-    ) -> Dict[str, Any]:
+        self, profile_url: str, progress_callback: Callable | None = None
+    ) -> dict[str, Any]:
         """Extract comprehensive profile data using enhanced scraping"""
         from .scraping import collect_public_information, get_contact_info, get_open_to_work_status
 
@@ -2959,7 +3062,7 @@ class LinkedInAutomation:
 
         try:
             if progress_callback:
-                progress_callback(f"Extracting detailed profile data...")
+                progress_callback("Extracting detailed profile data...")
 
             await self.page.goto(profile_url, timeout=30000)
             await self.page.wait_for_timeout(2000)
@@ -2981,11 +3084,11 @@ class LinkedInAutomation:
                 "education": education,
                 "contact_info": contact_info,
                 "open_to_work": open_to_work,
-                "extracted_at": datetime.now(timezone.utc),
+                "extracted_at": datetime.now(UTC),
             }
 
             if progress_callback:
-                progress_callback(f"✅ Extracted profile data successfully")
+                progress_callback("✅ Extracted profile data successfully")
 
             return profile_data
 

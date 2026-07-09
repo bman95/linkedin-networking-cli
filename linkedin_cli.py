@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """LinkedIn Networking CLI - interactive menu-driven interface."""
 
+import argparse
+import asyncio
+import sys
+from collections import namedtuple
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+from pathlib import Path
+
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 from InquirerPy.separator import Separator
@@ -10,13 +18,6 @@ from rich.console import Console, Group
 from rich.markup import escape as _rich_escape
 from rich.panel import Panel
 from rich.text import Text
-from collections import namedtuple
-from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
-from pathlib import Path
-import asyncio
-import csv
-import os
 
 # LinkedIn brand blue, used across the welcome banner
 BRAND_BLUE = "#0A66C2"
@@ -62,31 +63,30 @@ from utils.logging import LoggerSetup, get_logger
 LoggerSetup.setup()
 logger = get_logger(__name__)
 
-from database.operations import DatabaseManager
-from database.models import Campaign
-from config.settings import AppSettings
-from automation.linkedin import LinkedInAutomation
 from automation.diagnostics import _artifacts_dir
-from cli.helpers import campaign_get_field, csv_value, mask_email
-from exceptions import (
-    LinkedInAutomationError,
-    CaptchaDetectedException,
-    RateLimitExceededException,
-    NotAuthenticatedException,
-    SelectorNotFoundException,
-    UnexpectedLandingException,
-)
+from automation.linkedin import LinkedInAutomation
 from automation.linkedin_mappings import (
-    get_location_display_names,
-    get_location_urn,
-    get_location_name_from_urn,
-    get_network_display_names,
-    get_network_value,
-    get_network_name_from_value,
     get_industry_display_names,
     get_industry_id,
     get_industry_name_from_id,
+    get_location_display_names,
+    get_location_name_from_urn,
+    get_location_urn,
+    get_network_display_names,
+    get_network_name_from_value,
+    get_network_value,
 )
+from cli.automation_errors import describe_automation_error, evidence_reference
+from cli.helpers import (
+    acceptance_rate,
+    campaign_get_field,
+    contacts_csv_filename,
+    csv_value,
+    mask_email,
+    write_contacts_csv,
+)
+from config.settings import AppSettings
+from database.operations import DatabaseManager
 
 
 class LinkedInCLI:
@@ -120,41 +120,18 @@ class LinkedInCLI:
     def _format_evidence_reference(exc=None):
         """Describe where the saved diagnostics evidence lives, for the user.
 
-        The lower automation layers capture an evidence bundle (screenshot +
-        DOM snapshot) before raising and attach it to the exception as
-        ``exc.evidence`` (the dict from ``capture_error_context``). When those
-        concrete artifact paths are available we point straight at them;
-        otherwise we fall back to the deterministic artifacts directory so the
-        message still tells the user where to look.
+        Delegates to :func:`cli.automation_errors.evidence_reference`, passing
+        the diagnostics layer's ``_artifacts_dir`` (resolved from the module at
+        call time so tests can monkeypatch it) as the directory resolver.
         """
-        evidence = getattr(exc, "evidence", None) if exc is not None else None
-        if isinstance(evidence, dict):
-            paths = [p for p in (evidence.get("screenshot"), evidence.get("dom")) if p]
-            if paths:
-                if len(paths) == 1:
-                    return f"Evidence saved to {paths[0]}"
-                joined = "\n  - ".join(paths)
-                return f"Evidence saved to:\n  - {joined}"
-        # No concrete bundle on the exception: point at the artifacts directory.
-        try:
-            artifacts_dir = _artifacts_dir()
-        except Exception:
-            # Mirror _artifacts_dir's own resolution (env override first) so the
-            # double-fault fallback still honors LINKEDIN_CLI_ARTIFACTS_DIR.
-            override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
-            artifacts_dir = (
-                Path(override)
-                if override
-                else Path.home() / ".linkedin-networking-cli" / "artifacts"
-            )
-        return f"Evidence (screenshot/DOM) saved under {artifacts_dir}"
+        return evidence_reference(exc, artifacts_dir=_artifacts_dir)
 
     def _report_automation_failure(self, exc, action_label):
         """Map an automation failure to a distinct, user-friendly stop message.
 
-        Catches the typed automation exceptions by type, each with its own
-        actionable message plus a pointer to the saved evidence, and falls back
-        to a generic message (still referencing evidence) for anything else.
+        The (headline, evidence-reference) mapping is shared with the TUI via
+        :func:`cli.automation_errors.describe_automation_error`; this method
+        keeps only the CLI's presentation: traceback logging and Rich escaping.
         Prints the message and returns; the caller then hard-stops the run with
         no interactive waiting and no traceback shown to the user.
         """
@@ -165,49 +142,16 @@ class LinkedInCLI:
         logger.info(
             "Automation stopped during %s: %s", action_label, exc, exc_info=True
         )
-        evidence_ref = self._format_evidence_reference(exc)
+        headline, evidence_ref = describe_automation_error(
+            exc, action_label, artifacts_dir=_artifacts_dir
+        )
 
-        if isinstance(exc, CaptchaDetectedException):
-            headline = (
-                "LinkedIn is showing a security checkpoint or CAPTCHA — stopped. "
-                "Complete the verification in a normal browser, then try again."
-            )
-        elif isinstance(exc, RateLimitExceededException):
-            headline = (
-                "LinkedIn rate limit reached — stopped. Wait before sending more "
-                "invitations (limits reset over the following hours/days)."
-            )
-        elif isinstance(exc, NotAuthenticatedException):
-            headline = (
-                "LinkedIn session is no longer authenticated — stopped. "
-                "Log in again to refresh the session, then retry."
-            )
-        elif isinstance(exc, UnexpectedLandingException):
-            headline = (
-                "Navigation landed on an unexpected page — stopped. LinkedIn may "
-                "have changed its layout or redirected the request."
-            )
-        elif isinstance(exc, SelectorNotFoundException):
-            headline = (
-                "A required page element was not found — stopped. LinkedIn's page "
-                "structure may have changed, or the page failed to load."
-            )
-        elif isinstance(exc, LinkedInAutomationError):
-            # Escape the exception text: selector/URL detail can contain
-            # square brackets (e.g. a CSS attribute selector ``a[href]``), which
-            # Rich would otherwise parse as markup tags and silently drop.
-            headline = (
-                f"Automation stopped during {action_label}: {_rich_escape(str(exc))}"
-            )
-        else:
-            headline = (
-                f"Unexpected error during {action_label} — stopped: "
-                f"{_rich_escape(str(exc))}"
-            )
-
-        # The fixed headlines above carry no dynamic content, but evidence_ref
-        # holds filesystem paths that may contain brackets, so escape it too.
-        self.console.print(f"[red]{headline}[/red]")
+        # Escape both lines: the fixed headlines carry no brackets (escaping is
+        # a no-op for them), but the dynamic exception text can contain square
+        # brackets (e.g. a CSS attribute selector ``a[href]``) and evidence_ref
+        # holds filesystem paths — Rich would otherwise parse those as markup
+        # tags and silently drop them.
+        self.console.print(f"[red]{_rich_escape(headline)}[/red]")
         self.console.print(f"[yellow]{_rich_escape(evidence_ref)}[/yellow]")
 
     def _welcome_badge(self):
@@ -565,15 +509,11 @@ class LinkedInCLI:
             campaign_choices = []
             for campaign in campaigns:
                 status = "🟢 Active" if campaign.active else "🔴 Inactive"
-                acceptance_rate = (
-                    (campaign.total_accepted / campaign.total_sent * 100)
-                    if campaign.total_sent > 0
-                    else 0
-                )
+                rate = acceptance_rate(campaign.total_sent, campaign.total_accepted)
                 campaign_choices.append(
                     Choice(
                         value=campaign,
-                        name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {acceptance_rate:.1f}% rate)",
+                        name=f"{campaign.name} - {status} ({campaign.total_sent} sent, {rate:.1f}% rate)",
                     )
                 )
 
@@ -827,44 +767,19 @@ class LinkedInCLI:
             )
             return
 
-        safe_name = "".join(
-            c if c.isalnum() or c in ("-", "_") else "_" for c in campaign.name
-        ).strip("_") or "campaign"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = str(Path.cwd() / f"{safe_name}_contacts_{timestamp}.csv")
+        default_path = str(Path.cwd() / contacts_csv_filename(campaign.name))
 
         output_path = inquirer.text(
             message="Save CSV to:",
             default=default_path,
         ).execute()
 
-        fieldnames = [
-            "name",
-            "profile_url",
-            "headline",
-            "location",
-            "company",
-            "status",
-            "connection_sent_at",
-            "connection_accepted_at",
-            "notes",
-        ]
-
         try:
             path = Path(output_path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                for contact in contacts:
-                    writer.writerow(
-                        {
-                            field: self._csv_value(
-                                self._campaign_get_field(contact, field)
-                            )
-                            for field in fieldnames
-                        }
-                    )
+            # Field list and writing logic are shared with the TUI export
+            # (cli.helpers.write_contacts_csv); only the path prompt is ours.
+            write_contacts_csv(path, contacts)
             self.console.print(
                 f"[green]✅ Exported {len(contacts)} contacts to {path}[/green]"
             )
@@ -881,11 +796,7 @@ class LinkedInCLI:
 
     def view_campaign_details(self, campaign):
         """View detailed campaign information"""
-        acceptance_rate = (
-            (campaign.total_accepted / campaign.total_sent * 100)
-            if campaign.total_sent > 0
-            else 0
-        )
+        rate = acceptance_rate(campaign.total_sent, campaign.total_accepted)
 
         self.console.print(
             Panel(
@@ -895,7 +806,7 @@ class LinkedInCLI:
                 f"[cyan]Daily Limit:[/cyan] {campaign.daily_limit}\n\n"
                 f"[cyan]Connections Sent:[/cyan] {campaign.total_sent}\n"
                 f"[cyan]Connections Accepted:[/cyan] {campaign.total_accepted}\n"
-                f"[cyan]Acceptance Rate:[/cyan] {acceptance_rate:.1f}%\n"
+                f"[cyan]Acceptance Rate:[/cyan] {rate:.1f}%\n"
                 f"[cyan]Connections Pending:[/cyan] {campaign.total_sent - campaign.total_accepted}",
                 title=f"Campaign: {campaign.name}",
                 border_style="blue",
@@ -950,13 +861,6 @@ class LinkedInCLI:
                 inquirer.confirm(message="Press Enter to continue...").execute()
                 return
 
-            if isinstance(selected, dict):
-                self.console.print(
-                    "[yellow]Automation is only available when connected to the real database. Switch out of demo mode to run campaigns.[/yellow]"
-                )
-                inquirer.confirm(message="Press Enter to continue...").execute()
-                return
-
             if not self.settings.validate_credentials():
                 self.console.print(
                     "[yellow]LinkedIn credentials env vars not set. We will wait for you to complete login manually in Chrome.[/yellow]"
@@ -969,53 +873,23 @@ class LinkedInCLI:
             def progress_update(message: str) -> None:
                 self.console.print(f"[cyan]{message}[/cyan]")
 
-            async def run_automation():
-                async with LinkedInAutomation(self.db_manager, self.settings) as automation:
-                    progress_update("Launching browser and attaching to Chrome...")
-                    login_ok = await automation.login(progress_update)
-                    if not login_ok:
-                        return {"status": "login_failed"}
-
-                    automation_settings = self.settings.get_automation_settings()
-                    search_limit = automation_settings.get("search_limit", 100)
-                    progress_update(
-                        f"Searching for up to {search_limit} targeted profiles..."
-                    )
-                    # Card-first connect: send invitations straight from the
-                    # search-result cards where possible, falling back to the
-                    # profile-page path only for cards with no Connect control
-                    # (issue #25). Search and connect are interleaved in one pass.
-                    results = await automation.search_and_connect(
-                        selected, limit=search_limit, progress_callback=progress_update
-                    )
-
-                    if results.get("scanned", 0) == 0:
-                        return {"status": "no_profiles", "profiles": 0}
-
-                    results.update(
-                        {
-                            "status": "success",
-                            "profiles": results.get("scanned", 0),
-                        }
-                    )
-                    return results
+            # The interactive limit stays the campaign-wide search cap; the run
+            # core (shared with the non-interactive `run` subcommand) applies it
+            # and owns all rate-limit/daily-cap/session behavior via the
+            # automation layer. Reading settings here is a side-effect-free peek.
+            search_limit = self.settings.get_automation_settings().get(
+                "search_limit", 100
+            )
 
             try:
-                try:
-                    automation_result = asyncio.run(run_automation())
-                except RuntimeError as runtime_error:
-                    # Only the "asyncio.run() cannot be called from a running
-                    # event loop" case is a benign re-run; any other RuntimeError
-                    # (and any typed automation failure raised inside the fresh
-                    # loop) falls through to the handlers below.
-                    if "asyncio.run()" not in str(runtime_error):
-                        raise
-                    loop = asyncio.new_event_loop()
-                    try:
-                        asyncio.set_event_loop(loop)
-                        automation_result = loop.run_until_complete(run_automation())
-                    finally:
-                        loop.close()
+                # By the time this runs, InquirerPy's prompt loop has finished
+                # and no event loop is running, so a plain asyncio.run is safe —
+                # the same shape connection_checker and extract_profile_data use.
+                automation_result = asyncio.run(
+                    self._run_campaign_automation(
+                        selected, search_limit, progress_update
+                    )
+                )
             except Exception as automation_error:
                 # Hard-stop with evidence: distinct message per typed exception,
                 # generic fallback otherwise. No interactive wait, no traceback.
@@ -1070,6 +944,166 @@ class LinkedInCLI:
             self.console.print("[yellow]Execution cancelled.[/yellow]")
 
         inquirer.confirm(message="Press Enter to continue...").execute()
+
+    async def _run_campaign_automation(self, campaign, search_limit, progress_update):
+        """Run one campaign's search-and-connect pass — the shared run core.
+
+        Both the interactive Execute Campaign flow and the non-interactive
+        ``run`` subcommand call this. It bypasses only the interactive prompts;
+        login, search, and all rate-limit/daily-cap/session behavior stay in the
+        automation layer (card-first connect from the result cards, falling back
+        to the profile-page path for cards with no Connect control — issue #25).
+        Returns the automation result dict with a ``status`` key.
+        """
+        async with LinkedInAutomation(self.db_manager, self.settings) as automation:
+            progress_update("Launching browser and attaching to Chrome...")
+            login_ok = await automation.login(progress_update)
+            if not login_ok:
+                return {"status": "login_failed"}
+
+            progress_update(
+                f"Searching for up to {search_limit} targeted profiles..."
+            )
+            results = await automation.search_and_connect(
+                campaign, limit=search_limit, progress_callback=progress_update
+            )
+
+            if results.get("scanned", 0) == 0:
+                return {"status": "no_profiles", "profiles": 0}
+
+            results.update(
+                {
+                    "status": "success",
+                    "profiles": results.get("scanned", 0),
+                }
+            )
+            return results
+
+    def _resolve_campaign(self, reference):
+        """Resolve a campaign by numeric id or by name.
+
+        A numeric ``reference`` is looked up by id first; otherwise (or if no
+        campaign has that id) it is matched against campaign names, exact match
+        first then case-insensitive. Returns the campaign or ``None``.
+        """
+        ref = str(reference).strip()
+
+        if ref.isdigit():
+            campaign = self.db_manager.get_campaign(int(ref))
+            if campaign is not None:
+                return campaign
+
+        campaigns = self.db_manager.get_campaigns(active_only=False)
+        for campaign in campaigns:
+            if self._campaign_get_field(campaign, "name") == ref:
+                return campaign
+        lowered = ref.lower()
+        for campaign in campaigns:
+            name = self._campaign_get_field(campaign, "name") or ""
+            if name.lower() == lowered:
+                return campaign
+        return None
+
+    def run_noninteractive(self, campaign_reference, max_invites=None):
+        """Execute a campaign without prompts — the ``run`` subcommand path.
+
+        Resolves the campaign by id or name and drives the same automation as
+        the interactive flow via :meth:`_run_campaign_automation`, capped at
+        ``max_invites`` (default: the campaign's ``daily_limit``). Progress goes
+        to stdout; failures print to stderr. Returns a process exit code
+        (0 success, non-zero on any failure).
+        """
+        if not self.db_manager or not self.settings:
+            print(
+                "Error: automation requires database access and app settings.",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Non-interactive runs cannot fall back to a manual browser login, so
+        # configured credentials are mandatory here (unlike the interactive
+        # flow, which only warns and waits for a human).
+        if not self.settings.validate_credentials():
+            print(
+                "Error: LinkedIn credentials are not configured. Set "
+                "LINKEDIN_EMAIL and LINKEDIN_PASSWORD before running.",
+                file=sys.stderr,
+            )
+            return 1
+
+        campaign = self._resolve_campaign(campaign_reference)
+        if campaign is None:
+            print(
+                f"Error: no campaign matching '{campaign_reference}'.",
+                file=sys.stderr,
+            )
+            return 1
+
+        campaign_name = self._campaign_get_field(campaign, "name", "campaign")
+        search_limit = (
+            max_invites
+            if max_invites is not None
+            else self._campaign_get_field(campaign, "daily_limit", 20)
+        )
+
+        def progress_update(message: str) -> None:
+            print(message, flush=True)
+
+        progress_update(
+            f"Starting run for '{campaign_name}' (max {search_limit} invitations)..."
+        )
+
+        try:
+            result = asyncio.run(
+                self._run_campaign_automation(
+                    campaign, search_limit, progress_update
+                )
+            )
+        except Exception as exc:
+            # Keep the traceback in the file logs; the console stays clean.
+            logger.info(
+                "Automation stopped during non-interactive run: %s", exc,
+                exc_info=True,
+            )
+            headline, evidence_ref = describe_automation_error(
+                exc, "campaign execution", artifacts_dir=_artifacts_dir
+            )
+            print(headline, file=sys.stderr)
+            print(evidence_ref, file=sys.stderr)
+            return 1
+
+        status = result.get("status") if result else None
+
+        if status == "success":
+            sent = result.get("sent", 0)
+            possibly_sent = result.get("possibly_sent", 0)
+            failed = result.get("failed", 0)
+            existing = result.get("existing", 0)
+            profiles_found = result.get("profiles", 0)
+            total = result.get(
+                "total_processed", sent + possibly_sent + failed + existing
+            )
+            progress_update(
+                "Run complete — "
+                f"scanned {profiles_found}, sent {sent}, "
+                f"possibly sent {possibly_sent}, already contacted {existing}, "
+                f"failures {failed}, total processed {total}."
+            )
+            return 0
+        if status == "login_failed":
+            print(
+                "Error: login to LinkedIn failed. Verify credentials and any "
+                "multi-factor prompts.",
+                file=sys.stderr,
+            )
+            return 1
+        if status == "no_profiles":
+            progress_update(
+                "No profiles matched the campaign criteria. Review the filters."
+            )
+            return 0
+        print(f"Automation finished with status: {status}", file=sys.stderr)
+        return 1
 
     def show_settings(self):
         """Show application settings"""
@@ -1455,7 +1489,7 @@ class LinkedInCLI:
                             f"[bold]🔍 Connection Check Complete[/bold]\n\n"
                             f"[cyan]Contacts Checked:[/cyan] {checked}\n"
                             f"[cyan]Newly Accepted:[/cyan] {accepted}\n"
-                            f"[cyan]Acceptance Rate:[/cyan] {(accepted/checked*100) if checked > 0 else 0:.1f}%",
+                            f"[cyan]Acceptance Rate:[/cyan] {acceptance_rate(checked, accepted):.1f}%",
                             title="Checker Results",
                             border_style="green",
                         )
@@ -1639,8 +1673,59 @@ class LinkedInCLI:
         inquirer.confirm(message="Press Enter to continue...").execute()
 
 
-def main():
-    """Main entry point"""
+def _build_parser():
+    """Build the top-level argument parser.
+
+    No subcommand keeps the classic interactive menu; the ``run`` subcommand
+    adds a non-interactive path suitable for cron / systemd-timer scheduling.
+    """
+    parser = argparse.ArgumentParser(
+        prog="linkedin-cli",
+        description=(
+            "LinkedIn Networking CLI. With no subcommand, launches the "
+            "interactive menu. Use `run` to execute a campaign non-interactively "
+            "(for scheduled, headless batches)."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Execute a campaign non-interactively (for cron/systemd-timer).",
+        description=(
+            "Run a campaign without prompts, sending a small batch of "
+            "invitations. All rate-limit, daily-cap and session logic is "
+            "respected. Exits 0 on success, non-zero on failure."
+        ),
+    )
+    run_parser.add_argument(
+        "--campaign",
+        required=True,
+        metavar="ID-OR-NAME",
+        help="Campaign to run, given as its numeric id or its name.",
+    )
+    run_parser.add_argument(
+        "--max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Cap on invitations this run (default: the campaign's daily_limit).",
+    )
+    return parser
+
+
+def main(argv=None):
+    """Main entry point.
+
+    Returns a process exit code (``None``/``0`` on the interactive path). With
+    the ``run`` subcommand, dispatches to the non-interactive executor and
+    propagates its exit code.
+    """
+    args = _build_parser().parse_args(argv)
+
+    if getattr(args, "command", None) == "run":
+        return LinkedInCLI().run_noninteractive(args.campaign, args.max)
+
+    # No subcommand: the classic interactive experience, unchanged.
     console = Console()
     try:
         logger.info("LinkedIn CLI application starting")
@@ -1656,4 +1741,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

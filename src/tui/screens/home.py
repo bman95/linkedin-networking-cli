@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -35,15 +34,11 @@ from textual.widgets import Label, ListItem, ListView, Static
 
 from utils.logging import get_logger
 
-from ._mascot import MASCOT
+from ..nav import NAV_ITEMS
+from ._mascot_large import MASCOT_LARGE
+from ._wordmark import WORDMARK_TALL
 from .base import hint_markup
-from .campaigns import CampaignsScreen
-from .check_connections import CheckConnectionsScreen
-from .create_campaign import CreateCampaignScreen
-from .dashboard import DashboardScreen
-from .execute_campaign import ExecuteCampaignScreen
-from .extract_profiles import ExtractProfilesScreen
-from .settings_view import SettingsScreen
+from .workers import WorkerGuardMixin
 
 logger = get_logger(__name__)
 
@@ -52,7 +47,7 @@ logger = get_logger(__name__)
 POINTER = "❯"
 
 # The mascot — "Bit", the LinkedIn-blue robot — is a faithful half-block
-# rendering of the reference sprite, generated into ``_mascot.py`` (see its
+# rendering of the reference sprite, generated into ``_mascot_large.py`` (see its
 # docstring). Imported rather than inlined to keep this module readable.
 #
 # (Real inline-image rendering — painting the bitmap via the Kitty/Sixel graphics
@@ -69,67 +64,67 @@ HINTS = (
 )
 
 
-class HomeScreen(Screen):
+class HomeScreen(WorkerGuardMixin, Screen):
     """Curated home: brand masthead, live summary + keyboard-first navigation."""
 
     BINDINGS = [
         ("q", "app.quit", "Quit"),
-        # Number keys jump straight to a destination (1-indexed over NAV_ITEMS).
-        Binding("1", "open(0)", "Dashboard", show=False),
-        Binding("2", "open(1)", "Campaigns", show=False),
-        Binding("3", "open(2)", "Create Campaign", show=False),
-        Binding("4", "open(3)", "Execute Campaign", show=False),
-        Binding("5", "open(4)", "Check Connections", show=False),
-        Binding("6", "open(5)", "Extract Profile Data", show=False),
-        Binding("7", "open(6)", "Settings", show=False),
+        # Number keys jump straight to a destination (1-indexed over NAV_ITEMS,
+        # the shared registry in ``tui.nav``).
+        *(
+            Binding(str(i + 1), f"open({i})", item.title, show=False)
+            for i, item in enumerate(NAV_ITEMS)
+        ),
     ]
-
-    # (key, title, description). The key doubles as the nav item id suffix and
-    # selects the destination screen on activation.
-    NAV_ITEMS = (
-        ("dashboard", "Dashboard", "Campaign overview, connection stats, recent activity"),
-        ("campaigns", "Campaigns", "Browse, open and manage your outreach campaigns"),
-        ("create", "Create Campaign", "Set up a new outreach campaign"),
-        ("execute", "Execute Campaign", "Run automation: search and send connection requests"),
-        ("check", "Check Connections", "Reconcile which pending invites were accepted"),
-        ("extract", "Extract Profile Data", "Pull detailed public data from profiles"),
-        ("settings", "Settings", "Credentials, browser, rate limits, data locations"),
-    )
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._load_generation = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="home"):
-            # Hero lockup: the mascot beside the wordmark, tagline and the live
-            # workspace summary.
+            # One hero band fills the screen: the full-fidelity mascot on the
+            # left, and on the right a content column — brand lockup (LINKEDIN
+            # eyebrow, big pixel NETWORKING, tagline, live workspace summary)
+            # with the navigation directly beneath it.
             with Horizontal(id="home-hero"):
-                yield Static(MASCOT, id="home-mascot")
+                yield Static(MASCOT_LARGE, id="home-mascot")
                 with Vertical(id="home-heading"):
-                    yield Static("[b]LinkedIn Networking[/]", id="home-wordmark")
+                    yield Static("L I N K E D I N", id="home-eyebrow")
+                    yield Static(WORDMARK_TALL, id="home-wordmark")
+                    # Narrow-terminal stand-in for the pixel type (see
+                    # ``_maybe_narrow``); hidden by default in CSS.
+                    yield Static("[b]N E T W O R K I N G[/]", id="home-wordmark-fallback")
                     yield Static("Outreach, measured.", id="home-tagline")
                     yield Static("Loading workspace…", id="home-status", markup=False)
-            yield Static("NAVIGATE", classes="eyebrow")
-            yield ListView(
-                *(
-                    ListItem(
-                        Horizontal(
-                            Label(POINTER, classes="nav-caret"),
-                            Label(title, classes="nav-title"),
-                            classes="nav-row",
+                    yield Static("NAVIGATE", classes="eyebrow", id="home-nav-eyebrow")
+                    yield ListView(
+                        *(
+                            ListItem(
+                                Horizontal(
+                                    Label(POINTER, classes="nav-caret"),
+                                    Label(item.title, classes="nav-title"),
+                                    classes="nav-row",
+                                ),
+                                Label(item.description, classes="nav-desc"),
+                                id=f"nav-{item.key}",
+                                classes="nav-item",
+                            )
+                            for item in NAV_ITEMS
                         ),
-                        Label(desc, classes="nav-desc"),
-                        id=f"nav-{key}",
-                        classes="nav-item",
+                        id="home-nav",
                     )
-                    for key, title, desc in self.NAV_ITEMS
-                ),
-                id="home-nav",
-            )
         yield Static(hint_markup(HINTS), classes="hint-bar")
 
+    # The hero needs this many columns for the pixel wordmark (padding 4+4,
+    # mascot 45 + its 3-col gap, wordmark 54); below it the art would wrap
+    # into garbage, so a plain-text wordmark stands in.
+    _WORDMARK_MIN_WIDTH = 110
+
+    def _maybe_narrow(self, width: int) -> None:
+        self.set_class(width < self._WORDMARK_MIN_WIDTH, "narrow")
+
+    def on_resize(self, event) -> None:
+        self._maybe_narrow(event.size.width)
+
     def on_mount(self) -> None:
+        self._maybe_narrow(self.app.size.width)
         # Focus the nav so the highlighted first item responds to Enter on the
         # very first launch (a keyboard user shouldn't have to click first).
         self.query_one("#home-nav", ListView).focus()
@@ -150,33 +145,21 @@ class HomeScreen(Screen):
 
     def action_open(self, index: int) -> None:
         """Number-key jump: open the nav item at ``index`` (0-based)."""
-        if 0 <= index < len(self.NAV_ITEMS):
-            self._open_key(self.NAV_ITEMS[index][0])
+        if 0 <= index < len(NAV_ITEMS):
+            NAV_ITEMS[index].push(self.app)
 
     def _open_key(self, key: str) -> None:
-        db = self.app.db_manager
-        if key == "dashboard":
-            self.app.push_screen(DashboardScreen(db))
-        elif key == "campaigns":
-            self.app.push_screen(CampaignsScreen(db))
-        elif key == "create":
-            self.app.push_screen(CreateCampaignScreen(db))
-        elif key == "execute":
-            self.app.push_screen(ExecuteCampaignScreen(db, self.app.settings))
-        elif key == "check":
-            self.app.push_screen(CheckConnectionsScreen(db, self.app.settings))
-        elif key == "extract":
-            self.app.push_screen(ExtractProfilesScreen(db, self.app.settings))
-        elif key == "settings":
-            self.app.push_screen(SettingsScreen(db))
+        for item in NAV_ITEMS:
+            if item.key == key:
+                item.push(self.app)
+                return
 
     # ── workspace summary (threaded load) ─────────────────────────────────
 
     def load_summary(self) -> None:
-        self._load_generation += 1
-        # Capture the app on the UI thread; the deferred worker body must not
-        # resolve self.app itself (see CampaignsScreen for the rationale).
-        self._run_load(self.app, self._load_generation)
+        # begin_load captures the app on the UI thread; the deferred worker body
+        # must not resolve self.app itself (see workers.py for the rationale).
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True)
     def _run_load(self, app: App, generation: int) -> None:
@@ -186,9 +169,9 @@ class HomeScreen(Screen):
             logger.debug("Could not gather home summary", exc_info=True)
             summary = HomeSummary(configured=None, campaigns=None,
                                   used_today=None, daily_limit=None, db_ok=False)
-        self._marshal_populate(app, generation, summary)
+        self.marshal_load(app, generation, self._populate, summary)
 
-    def _gather(self, app: App) -> "HomeSummary":
+    def _gather(self, app: App) -> HomeSummary:
         """Credential status, campaign count and today's quota — off the UI thread.
 
         ``AppSettings()`` writes to disk on construction, so it is built here in
@@ -216,17 +199,7 @@ class HomeScreen(Screen):
             return HomeSummary(configured=configured, campaigns=None,
                               used_today=None, daily_limit=daily_limit, db_ok=False)
 
-    def _marshal_populate(self, app: App, generation: int, summary: "HomeSummary") -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, summary)
-        except RuntimeError:
-            return
-
-    def _populate(self, generation: int, summary: "HomeSummary") -> None:
-        if not self.is_mounted or generation != self._load_generation:
-            return
+    def _populate(self, summary: HomeSummary) -> None:
         self.query_one("#home-status", Static).update(summary.line())
 
 
@@ -234,10 +207,10 @@ class HomeScreen(Screen):
 class HomeSummary:
     """Immutable workspace snapshot handed from the worker to the UI thread."""
 
-    configured: Optional[bool]
-    campaigns: Optional[int]
-    used_today: Optional[int]
-    daily_limit: Optional[int]
+    configured: bool | None
+    campaigns: int | None
+    used_today: int | None
+    daily_limit: int | None
     db_ok: bool
 
     def line(self) -> str:

@@ -15,7 +15,6 @@ import threading
 from pathlib import Path
 
 import pytest
-
 from textual.widgets import DataTable, ListView, Static
 
 from database.operations import DatabaseManager
@@ -191,7 +190,7 @@ async def test_quit_while_load_in_flight_does_not_error(db_manager: DatabaseMana
     # step after exit (it captured the app reference before quitting); the guard
     # must skip call_from_thread rather than raise/hang.
     assert not app.is_running
-    screen._marshal_populate(app, screen._load_generation, [], None)  # silent no-op
+    screen.marshal_load(app, screen._load_generation, screen._populate, [], None)  # silent no-op
     release.set()
 
 
@@ -277,11 +276,12 @@ async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
         assert table.row_count == 2
 
         current = screen._load_generation
-        # A late result from a superseded load (older token) is dropped.
-        screen._populate(current - 1, [], None)
+        # A late result from a superseded load (older token) is dropped by the
+        # mixin's generation gate before _populate runs.
+        screen._apply_if_current(current - 1, screen._populate, [], None)
         assert table.row_count == 2
         # The current generation applies normally.
-        screen._populate(current, [], "Database unavailable.")
+        screen._apply_if_current(current, screen._populate, [], "Database unavailable.")
         assert table.row_count == 0
         assert "Database unavailable" in str(
             screen.query_one("#campaigns-status", Static).render()

@@ -21,8 +21,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from automation.selectors import Selector
 import automation.selectors as selectors
+from automation.selectors import Selector
 from exceptions import SelectorNotFoundException
 
 

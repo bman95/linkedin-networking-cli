@@ -224,3 +224,144 @@ Per-step findings:
 Full suite re-run by reviewer: **742 passed** in ~58s (matches self-report). Pre-existing
 dirty/mascot work (`src/tui/screens/_mascot.py`, `docs/*.png`, `tools/`, tui home/tcss)
 was left untouched, as claimed.
+
+---
+
+# 2026-07-06 audit fixes — deep re-audit + remediation
+
+A fresh full-repo audit (four parallel subagent readers over automation, data/config,
+both UIs, and tests/tooling) went beyond the 2026-07-01 pass and surfaced concrete
+bugs, security gaps, data-layer concurrency problems, and design-level rethinks. All
+**safe** items were implemented across eight parallel subagents on disjoint file sets;
+strategic items needing a live account or a product decision were written up in
+`DESIGN-PROPOSALS.md` instead of implemented blind.
+
+**Baseline → result:** 742 → **778 passed**, coverage 72% → **73%** (CI floor set to
+65%). Nothing committed.
+
+## Bugs (verified in source, fixed)
+
+- **checker.py** — `page.is_visible(timeout=)` doesn't wait in Playwright's async API
+  (misreported acceptances); replaced with `wait_for_selector(state="visible")` and made
+  the connection indicators bilingual (ES/EN). Tab leak in `_update_accepted_connection`
+  wrapped in try/finally. Unbounded scroll in `_check_connections_page` given a
+  `max_scroll_rounds` guard. +3 regression tests (one reproduced the hang).
+- **interactions.py** — keystroke humanization was a no-op (`press_sequentially(char,
+  delay=)` never applies per single char); now an explicit randomized `asyncio.sleep`
+  between keystrokes. `_human_mouse_move` interpolated from viewport origin (a
+  fingerprintable straight line); now interpolates from the last cursor position.
+- **scraping.py** — `get_open_to_work_status` matched the whole serialized DOM (false
+  positives); now scoped to visible badge elements.
+- **linkedin_cli.py** — removed the dead closed-loop `asyncio` fallback (left a closed
+  loop installed as current) and the unreachable `isinstance(selected, dict)` branch.
+- **linkedin.py** — `_build_search_params` f-string-injected `geo_urn`/`network`
+  unencoded; now validated + percent-encoded (byte-identical URLs for valid input).
+
+## Security / privacy
+
+- `session.json` (full auth cookies) now written 0600 via a single `_write_session_state`
+  helper, app/profile dirs 0700; `close_browser` no longer overwrites a good session from
+  an unauthenticated context (gated on `is_authenticated`).
+- diagnostics artifacts (screenshots + DOM dumps) chmod 0600/0700 and pruned to the 20
+  newest bundles.
+- Dockerfile rewritten: deps layer cached before source copy, chromium in the cached
+  layer, non-root `appuser`, `CMD ["linkedin-cli"]`; `.dockerignore` extended.
+
+## Data layer
+
+- **SQLite concurrency**: engine now sets `journal_mode=WAL`, `busy_timeout=5000`,
+  `foreign_keys=ON` per connection (via a `connect` event) + explicit
+  `check_same_thread=False` — the reservation/upsert machinery is finally backed by a DB
+  configured for the two-process/many-thread access it assumes.
+- `delete_campaign` now bulk-deletes contacts **and** the previously-orphaned Analytics
+  rows.
+- All writes standardized on timezone-aware UTC (was mixed naive/aware in the same
+  columns).
+- Dashboard/campaign stats rewritten from full-table Python scans to SQL `GROUP BY`.
+- `ContactStatus` str-enum + single-source `SENT_STATUSES`/`PENDING_STATUSES`/
+  `ACCEPTED_STATUSES` groupings replace scattered string-set literals (stored value stays
+  the plain string).
+
+## Two-UI de-duplication (net −148 lines)
+
+Extracted the duplicated presentation-adjacent logic into one home so both UIs consume
+it: `acceptance_rate` (was in 5 places), `write_contacts_csv`/`CONTACT_CSV_FIELDS`/
+`contacts_csv_filename` (CSV export was duplicated + divergent), `mask_email` (TUI copy
+removed), and `describe_automation_error` (new `src/cli/automation_errors.py`, CLI keeps
+only its Rich-escaping/traceback presentation). Fixed the TUI empty-states that told
+users to "use the classic CLI" for a feature the TUI has, and the extract-profiles
+mode-toggle showing both widgets at once.
+
+## New capability (additive, safe; live send path validated manually per convention)
+
+- **Proactive weekly-invite budget** — `WEEKLY_INVITATION_LIMIT` (default 100) +
+  `get_weekly_connection_count()` (trailing-7-day sum of the existing per-day rows) +
+  a pre-send stop at the same orchestration level as the daily cap. The tool now paces
+  to the *weekly* wall instead of discovering it reactively via LinkedIn's modal.
+- **Non-interactive `linkedin-cli run --campaign X [--max N]`** for cron/systemd-timer
+  scheduling of small randomized-cadence batches; reuses the existing automation (no
+  reimplementation). No-arg `linkedin-cli` is unchanged.
+
+## Tooling
+
+- ruff + mypy added (deps + `[tool.ruff]`/`[tool.mypy]` config); both *run* (549 / 124
+  pre-existing legacy findings surfaced, not auto-fixed — matching existing style). CI
+  gains a non-blocking lint step and a `--cov-fail-under=65` floor. `tests/README.md`
+  numbers corrected (was 12× stale); two dead autouse conftest fixtures removed.
+
+## Mascot work finished
+
+The pre-existing uncommitted mascot work was completed: redundant `tools/mascot/
+generate.py` deleted (its only target was the removed `_mascot.py`), `generate_wordmark.py`
+no longer emits the unused `WORDMARK`, dead splash CSS block removed from `app.tcss`,
+orphan `.pyc`s deleted, stale docstrings/comments fixed.
+
+## Not done autonomously — see `DESIGN-PROPOSALS.md`
+
+UI cutover (needs per-flow sign-off), Voyager-API extraction (needs live payloads),
+Sent-Invitations-diff checker rework (needs live DOM), `scraping.py` SDUI selector
+rewrite (needs live DOM), analytics-as-event-log + migration versioning (invasive; want
+a populated DB to test against), and the state-machine/`linkedin.py` split. The
+2026-07-06 pass implemented the safe subset of the weekly-budget, `run`-command, and
+status-enum proposals; the doc marks those partial.
+
+**Final verification:** `uv run pytest -q` → **778 passed**, 73% coverage; `ruff`/`mypy`
+run; `import linkedin_cli`/`linkedin_tui` OK; `linkedin-cli run --help` exit 0. Work
+spread across eight subagents on disjoint file sets, full suite re-run green after each
+wave.
+
+---
+
+## 2026-07-07 — §10 TUI refactors + location-search port (pre-cutover)
+
+Implements `DESIGN-PROPOSALS.md` §10 (both deferred TUI refactors) and closes the
+last §1 parity gap, unblocking the single-UI cutover pending per-flow sign-off.
+
+- **Worker-guard mixin.** The copy-pasted threaded-worker race discipline
+  (generation token, capture-app-at-schedule-time, `is_running`+`RuntimeError`+
+  `is_mounted` guards) now lives once in `tui/screens/workers.py`
+  (`WorkerGuardMixin`: `begin_load` / `marshal` / `marshal_load`), inherited via
+  `BaseScreen` and mixed into `HomeScreen`. Seven screens migrated; per-screen
+  `_marshal_*` methods and guard boilerplate deleted. Tests that drove the guards
+  directly were updated to the mixin API; `docs/tui-migration.md` §"State design"
+  rewritten to match.
+- **Single-source navigation.** `tui/nav.py` `NAV_ITEMS` (key, title, description,
+  push) now drives the home list, the home number-key bindings, and the command
+  palette (`commands.py`); the four hand-synced lists and home's eager screen
+  imports are gone. Screen imports stay lazy inside each `push`.
+- **Online location search + custom geoUrn (last §1 parity gap).** Ported the
+  classic "🔎 Search location online" / "Other (enter custom geoUrn)" flows to the
+  shared campaign form. New `CampaignFormScreen` base (Create/Edit inherit): the
+  Location select gains two sentinel options revealing an inline query input
+  (Playwright login + `search_location` in a thread worker;
+  `perform_location_search` is the test seam, mirroring `run_body`) or the
+  geoUrn/name inputs; a picked result becomes a first-class select option backed
+  by a display-name → geoUrn override map. `fill_form` uses the same map to
+  preserve a stored non-curated location on Edit — previously it silently reset
+  to "Any" and dropped the campaign's geoUrn on the next save (parity bug, now
+  regression-tested). 8 new tests in `tests/test_tui_location_search.py`; TUI
+  states verified visually via headless Pilot screenshots. The live search path
+  (real browser + login) was validated manually by the owner on 2026-07-07, per
+  convention — every classic flow now has a TUI equivalent at validated parity.
+
+**Final verification:** `uv run pytest -q` → **786 passed**, 73% coverage.

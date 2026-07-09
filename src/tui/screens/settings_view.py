@@ -14,34 +14,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Optional
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.widgets import Static
 
+from cli.helpers import mask_email
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
 from .base import BaseScreen
 
 logger = get_logger(__name__)
-
-
-def mask_email(email: Optional[str]) -> str:
-    """Mask an email for display, e.g. ``joh***@example.com``.
-
-    Identical algorithm to the classic CLI's ``_mask_email`` (kept local rather
-    than importing ``linkedin_cli`` so the TUI has no dependency on it).
-    """
-    if not email:
-        return "Not set"
-    if "@" in email:
-        local, domain = email.split("@", 1)
-        prefix = local[:3] if len(local) >= 3 else local
-        return f"{prefix}***@{domain}"
-    return f"{email[:3]}***"
 
 
 @dataclass(frozen=True)
@@ -53,7 +38,7 @@ class SettingsData:
     password_state: str
     browser: dict
     automation: dict
-    used_today: Optional[int]
+    used_today: int | None
     paths: dict
 
 
@@ -68,10 +53,9 @@ class SettingsScreen(BaseScreen):
 
     SCREEN_TITLE = "Settings"
 
-    def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
+    def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
         self._db_manager = db_manager
-        self._load_generation = 0
 
     def compose_body(self) -> ComposeResult:
         with Container(id="settings-body"):
@@ -98,17 +82,18 @@ class SettingsScreen(BaseScreen):
         self.load_settings()
 
     def load_settings(self) -> None:
-        self._load_generation += 1
-        self._run_load(self.app, self._load_generation)
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True)
     def _run_load(self, app: App, generation: int) -> None:
         try:
             data = self._gather()
         except Exception as exc:
-            self._marshal_populate(app, generation, None, f"Error loading settings: {exc}")
+            self.marshal_load(
+                app, generation, self._populate, None, f"Error loading settings: {exc}"
+            )
             return
-        self._marshal_populate(app, generation, data, None)
+        self.marshal_load(app, generation, self._populate, data, None)
 
     def _gather(self) -> SettingsData:
         """Build the display-ready snapshot. Reads secrets only to derive flags.
@@ -129,7 +114,7 @@ class SettingsScreen(BaseScreen):
         browser = settings.get_browser_settings()
         automation = settings.get_automation_settings()
 
-        used_today: Optional[int] = None
+        used_today: int | None = None
         if self._db_manager is not None:
             try:
                 used_today = self._db_manager.get_daily_connection_count(
@@ -154,23 +139,7 @@ class SettingsScreen(BaseScreen):
             },
         )
 
-    def _marshal_populate(
-        self, app: App, generation: int, data: Optional[SettingsData], error: Optional[str]
-    ) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, data, error)
-        except RuntimeError:
-            return
-
-    def _populate(
-        self, generation: int, data: Optional[SettingsData], error: Optional[str]
-    ) -> None:
-        if not self.is_mounted:
-            return
-        if generation != self._load_generation:
-            return
+    def _populate(self, data: SettingsData | None, error: str | None) -> None:
         status = self.query_one("#settings-status", Static)
         if error is not None:
             for section_id in ("credentials", "browser", "limits", "data"):
@@ -180,7 +149,7 @@ class SettingsScreen(BaseScreen):
 
         assert data is not None
         self._render_sections(data)
-        status.update("Read-only view.")
+        status.update("Read-only view — values come from environment variables (.env).")
 
     def _render_sections(self, data: SettingsData) -> None:
         self.query_one("#body-credentials", Static).update(
@@ -205,7 +174,8 @@ class SettingsScreen(BaseScreen):
         if data.used_today is not None:
             used_today_line = f"Used Today: {data.used_today}/{daily_limit}\n"
         self.query_one("#body-limits", Static).update(
-            f"Connection Delay: {a.get('connection_delay_min')}-{a.get('connection_delay_max')} seconds\n"
+            f"Connection Delay: {a.get('connection_delay_min')}-"
+            f"{a.get('connection_delay_max')} seconds\n"
             f"Daily Connection Limit: {daily_limit}\n"
             f"{used_today_line}"
             f"Inter-session Cooldown: {a.get('connection_cooldown')} seconds\n"

@@ -4,19 +4,18 @@ Pytest configuration and shared fixtures for LinkedIn Networking CLI tests.
 This module provides fixtures that are available to all test modules.
 """
 
-import os
+# Add src to path for imports
+import sys
 import tempfile
-from datetime import datetime, timezone
+from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Generator, AsyncGenerator
-from unittest.mock import Mock, AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
-# Add src to path for imports
-import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Initialize the shared logger to a throwaway dir with NO file handlers BEFORE
@@ -25,23 +24,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # write test/mock ERROR noise into the user's real
 # ~/.linkedin-networking-cli/logs. Setting _initialized here first wins the race.
 from utils.logging import LoggerSetup
+
 LoggerSetup.setup(
     log_dir=Path(tempfile.gettempdir()) / "linkedin-cli-test-logs",
     file_output=False,
 )
 
-from database.models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
-from database.operations import DatabaseManager
-from config.settings import AppSettings
 from automation import selectors as sel
-
+from config.settings import AppSettings
+from database.models import Analytics, Campaign, Contact, Settings
+from database.operations import DatabaseManager
 
 # ============================================================================
 # Database Fixtures
 # ============================================================================
 
 @pytest.fixture
-def temp_db_path() -> Generator[Path, None, None]:
+def temp_db_path() -> Generator[Path]:
     """Create a temporary database path for testing."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_linkedin.db"
@@ -65,14 +64,14 @@ def in_memory_engine():
 
 
 @pytest.fixture
-def db_session(in_memory_engine) -> Generator[Session, None, None]:
+def db_session(in_memory_engine) -> Generator[Session]:
     """Create a database session for testing."""
     with Session(in_memory_engine) as session:
         yield session
 
 
 @pytest.fixture
-def db_manager(temp_db_path) -> Generator[DatabaseManager, None, None]:
+def db_manager(temp_db_path) -> Generator[DatabaseManager]:
     """Create a DatabaseManager instance for testing."""
     manager = DatabaseManager(str(temp_db_path))
     yield manager
@@ -98,7 +97,7 @@ def sample_campaign() -> Campaign:
         message_template="Hi {name}, I'd like to connect!",
         status="active",
         daily_limit=10,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
 
@@ -113,7 +112,7 @@ def sample_contact() -> Contact:
         location="San Francisco, CA",
         company="Tech Co",
         status="sent",
-        connection_sent_at=datetime.now(timezone.utc),
+        connection_sent_at=datetime.now(UTC),
     )
 
 
@@ -122,7 +121,7 @@ def sample_analytics() -> Analytics:
     """Create sample analytics for testing."""
     return Analytics(
         campaign_id=1,
-        date=datetime.now(timezone.utc).date(),
+        date=datetime.now(UTC).date(),
         profiles_found=100,
         connections_sent=10,
         connections_accepted=3,
@@ -312,7 +311,7 @@ def mock_profile_data():
 def freeze_time():
     """Fixture to freeze time for consistent datetime testing."""
     from freezegun import freeze_time as _freeze_time
-    frozen_time = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    frozen_time = datetime(2025, 1, 15, 12, 0, 0, tzinfo=UTC)
     with _freeze_time(frozen_time):
         yield frozen_time
 
@@ -364,17 +363,3 @@ def isolate_diagnostics_artifacts(tmp_path, monkeypatch):
     except Exception:
         pass
     yield
-
-
-@pytest.fixture(autouse=True)
-def reset_singletons():
-    """Reset singleton instances between tests if needed."""
-    yield
-    # Add cleanup code here if you have singleton patterns
-
-
-@pytest.fixture(autouse=True)
-def cleanup_temp_files():
-    """Cleanup temporary files created during tests."""
-    yield
-    # Cleanup happens automatically with temp directories

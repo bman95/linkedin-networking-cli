@@ -22,9 +22,9 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 from utils.logging import get_logger
 
@@ -46,6 +46,12 @@ _PAGE_RING_SIZE = 10
 # Max anomaly captures per run, so a repeating banner can't flood the dir.
 _MAX_ANOMALY_CAPTURES = 8
 
+# Retention cap: keep only this many error_/anomaly_ bundles on disk. The
+# bundles hold full DOM dumps and screenshots (PII, session markup), so they
+# must not accumulate forever; older ones are pruned whenever a new bundle is
+# written.
+_MAX_BUNDLES = 20
+
 # Mutable run-scoped counter for anomaly rate limiting.
 #
 # Both this counter and the page ring are *process*-global, not bound to a
@@ -63,12 +69,22 @@ _anomaly_capture_count = 0
 _artifact_seq = 0
 
 
+def _restrict_permissions(path: Path, mode: int) -> None:
+    """Best-effort ``chmod``; POSIX modes may be unsupported (Windows/WSL
+    mounts), so failure is logged at debug and never raised."""
+    try:
+        os.chmod(path, mode)
+    except Exception as exc:
+        logger.debug("Could not chmod %s to %o: %s", path, mode, exc)
+
+
 def _artifacts_dir() -> Path:
     """Resolve the artifacts directory, creating it on demand.
 
     Honors ``LINKEDIN_CLI_ARTIFACTS_DIR`` so tests can redirect writes away
     from the real home directory; otherwise sits alongside ``logs/`` and
-    ``browser_data/`` under the app dir.
+    ``browser_data/`` under the app dir. Kept owner-only: the artifacts hold
+    DOM dumps and screenshots of an authenticated session.
     """
     override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
     base = (
@@ -77,7 +93,48 @@ def _artifacts_dir() -> Path:
         else Path.home() / ".linkedin-networking-cli" / "artifacts"
     )
     base.mkdir(parents=True, exist_ok=True)
+    _restrict_permissions(base, 0o700)
     return base
+
+
+def _prune_bundles(base_dir: Path, *, protect_stem: str) -> None:
+    """Keep only the newest ``_MAX_BUNDLES`` error_/anomaly_ bundles.
+
+    A bundle is the ``.png``/``.html`` pair sharing one filename stem; both
+    files of an evicted bundle are removed together. The bundle currently
+    being written (``protect_stem``) is never deleted. Best-effort: never
+    raises, tolerates a missing/concurrently-changing directory.
+    """
+    try:
+        bundles: dict[str, list] = {}
+        for entry in base_dir.iterdir():
+            if entry.is_file() and (
+                entry.name.startswith("error_") or entry.name.startswith("anomaly_")
+            ):
+                bundles.setdefault(entry.stem, []).append(entry)
+
+        if len(bundles) <= _MAX_BUNDLES:
+            return
+
+        def newest_mtime(files) -> float:
+            try:
+                return max(f.stat().st_mtime for f in files)
+            except Exception:
+                return 0.0
+
+        ordered = sorted(
+            bundles.items(), key=lambda kv: newest_mtime(kv[1]), reverse=True
+        )
+        for stem, files in ordered[_MAX_BUNDLES:]:
+            if stem == protect_stem:
+                continue
+            for entry in files:
+                try:
+                    entry.unlink()
+                except Exception as exc:
+                    logger.debug("Could not prune artifact %s: %s", entry.name, exc)
+    except Exception as exc:
+        logger.debug("Artifact retention prune failed: %s", exc)
 
 
 def _slugify(name: str, *, max_len: int = 40) -> str:
@@ -129,6 +186,7 @@ async def _capture_screenshot(page, path: Path) -> bool:
         await page.screenshot(
             path=str(path), full_page=False, timeout=_SCREENSHOT_TIMEOUT_MS
         )
+        _restrict_permissions(path, 0o600)
         return True
     except Exception as exc:
         logger.debug("Screenshot capture failed for %s: %s", path.name, exc)
@@ -146,6 +204,7 @@ async def _capture_dom(page, path: Path) -> bool:
     try:
         html = await asyncio.wait_for(page.content(), timeout=_DOM_TIMEOUT_S)
         path.write_text(html, encoding="utf-8")
+        _restrict_permissions(path, 0o600)
         return True
     except Exception as exc:
         logger.debug("DOM capture failed for %s: %s", path.name, exc)
@@ -158,9 +217,9 @@ async def _capture_bundle(
     name: str,
     severity: int,
     *,
-    exc: Optional[BaseException] = None,
-    context: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    exc: BaseException | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Capture screenshot + DOM + structured log line. Never raises.
 
     Returns a dict describing what was written (artifact paths, captured
@@ -198,6 +257,10 @@ async def _capture_bundle(
 
     screenshot_ok = await _capture_screenshot(page, png_path)
     dom_ok = await _capture_dom(page, html_path)
+
+    # Retention: evict the oldest bundles now that a new one landed, keeping
+    # the one just written (png and html share the same stem).
+    _prune_bundles(base_dir, protect_stem=png_path.stem)
 
     exc_type = type(exc).__name__ if exc is not None else None
     exc_msg = _safe_repr(exc) if exc is not None else None
@@ -261,9 +324,9 @@ async def capture_error_context(
     page,
     name: str,
     *,
-    exc: Optional[BaseException] = None,
-    context: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    exc: BaseException | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Capture an evidence bundle for a fatal failure (logged at ERROR).
 
     Best-effort: never raises, even on a crashed or closed page. Intended to
@@ -285,8 +348,8 @@ async def capture_anomaly_context(
     page,
     name: str,
     *,
-    context: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Capture an evidence bundle for a non-fatal anomaly (logged at WARNING).
 
     Rate-limited to ``_MAX_ANOMALY_CAPTURES`` *successful* captures per run so a
@@ -322,7 +385,7 @@ async def capture_anomaly_context(
     return result
 
 
-async def snapshot_page(page, seq: int) -> Optional[str]:
+async def snapshot_page(page, seq: int) -> str | None:
     """Record a landed page into the rolling ring buffer. Never raises.
 
     Writes ``artifacts/pages/page_<slot>.png`` plus a ``.txt`` sidecar holding
@@ -335,14 +398,16 @@ async def snapshot_page(page, seq: int) -> Optional[str]:
         slot = seq % _PAGE_RING_SIZE
         pages_dir = _artifacts_dir() / "pages"
         pages_dir.mkdir(parents=True, exist_ok=True)
+        _restrict_permissions(pages_dir, 0o700)
 
         png_path = pages_dir / f"page_{slot}.png"
         txt_path = pages_dir / f"page_{slot}.txt"
 
         url = await _safe_url(page)
-        sidecar = f"{datetime.now(timezone.utc).isoformat()}\n{url}\n"
+        sidecar = f"{datetime.now(UTC).isoformat()}\n{url}\n"
         try:
             txt_path.write_text(sidecar, encoding="utf-8")
+            _restrict_permissions(txt_path, 0o600)
         except Exception as exc:
             logger.debug("Page snapshot sidecar failed for slot %d: %s", slot, exc)
 

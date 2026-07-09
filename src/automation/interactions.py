@@ -107,6 +107,10 @@ async def human_type(
     ``press_sequentially`` drives one keystroke at a time, unlike ``fill``
     which sets the value instantly and reads as scripted.
 
+    The inter-keystroke pause is an explicit ``asyncio.sleep``:
+    ``press_sequentially``'s ``delay`` only applies *between* characters of
+    the string it is given, so passing it with a single character is a no-op.
+
     The field is cleared first so any pre-existing value (browser autofill, a
     remembered credential in the persistent profile, or a prior failed
     attempt) is overwritten rather than appended to — matching ``fill``'s
@@ -117,26 +121,46 @@ async def human_type(
     # Brief focus pause before the first keystroke.
     await asyncio.sleep(random.uniform(0.15, 0.4))
     for char in text:
-        await box.press_sequentially(
-            char, delay=random.randint(delay_min, delay_max)
-        )
+        await box.press_sequentially(char)
+        await asyncio.sleep(random.randint(delay_min, delay_max) / 1_000)
 
 
 async def _human_mouse_move(page, x: float, y: float) -> None:
-    """Move the cursor toward (x, y) in a few jittered steps.
+    """Move the cursor from its current position toward (x, y) in a few
+    jittered steps.
 
-    A hand-rolled, slightly noisy path: ``random(5, 10)`` segments toward the
-    target with ±5px jitter per step and a 0.01–0.03s pause between moves, so
-    the trajectory doesn't teleport straight to the element the way a bare
-    ``element.click()`` does.
+    A hand-rolled, slightly noisy path: ``random(5, 10)`` segments from the
+    start point to the target with ±5px jitter per step and a 0.01–0.03s
+    pause between moves, so the trajectory doesn't teleport straight to the
+    element the way a bare ``element.click()`` does.
+
+    Playwright doesn't expose the current mouse position, so the last target
+    is remembered on the page object (``_human_mouse_last_pos``). The first
+    move on a page starts from the viewport center (or the origin when the
+    viewport size is unknown). Interpolating start -> target keeps every move
+    a local hop instead of a straight scaled line from (0, 0).
     """
+    start = getattr(page, "_human_mouse_last_pos", None)
+    if not (isinstance(start, tuple) and len(start) == 2):
+        viewport = getattr(page, "viewport_size", None)
+        if isinstance(viewport, dict):
+            start = (viewport["width"] / 2, viewport["height"] / 2)
+        else:
+            start = (0.0, 0.0)
+    start_x, start_y = start
+
     steps = random.randint(5, 10)
     for i in range(1, steps + 1):
         progress = i / steps
         jitter_x = random.uniform(-5, 5) if i < steps else 0
         jitter_y = random.uniform(-5, 5) if i < steps else 0
-        await page.mouse.move(x * progress + jitter_x, y * progress + jitter_y)
+        await page.mouse.move(
+            start_x + (x - start_x) * progress + jitter_x,
+            start_y + (y - start_y) * progress + jitter_y,
+        )
         await asyncio.sleep(random.uniform(0.01, 0.03))
+
+    page._human_mouse_last_pos = (x, y)
 
 
 async def move_to_element(page, element) -> None:

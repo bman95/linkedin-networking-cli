@@ -32,10 +32,28 @@ class ExtractProfilesScreen(AutomationRunScreen):
             allow_blank=False,
             id="run-mode",
         )
-        yield Static("CAMPAIGN", classes="eyebrow")
+        yield Static("CAMPAIGN", classes="eyebrow", id="run-campaign-label")
         yield Select([], prompt="Loading campaigns…", id="run-campaign")
-        yield Static("PROFILE URL", classes="eyebrow")
+        yield Static("PROFILE URL", classes="eyebrow", id="run-url-label")
         yield Input(placeholder="https://www.linkedin.com/in/…", id="run-url")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        # Only the widgets for the selected mode are shown; start in campaign
+        # mode, matching the Select's initial value.
+        self._show_mode_widgets("campaign")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        # Switching MODE hides the irrelevant input (campaign list vs URL box).
+        if event.select.id == "run-mode" and isinstance(event.value, str):
+            self._show_mode_widgets(event.value)
+
+    def _show_mode_widgets(self, mode: str) -> None:
+        manual = mode == "manual"
+        for selector in ("#run-campaign-label", "#run-campaign"):
+            self.query_one(selector).display = not manual
+        for selector in ("#run-url-label", "#run-url"):
+            self.query_one(selector).display = manual
 
     def ready_hint(self) -> str:
         return "Choose a source, then ctrl+r to start extracting."

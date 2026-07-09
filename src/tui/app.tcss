@@ -15,14 +15,19 @@
 
 Screen {
     background: $surface;
-    /* Thin, muted scrollbars — a quiet thumb that brightens to the accent on
-     * interaction, instead of Textual's bright default. */
+}
+
+/* Thin, muted scrollbars everywhere — a quiet thumb that brightens to the
+ * accent on interaction, instead of Textual's bright default. Applied
+ * universally so nested scrollables (forms, logs, select overlays) don't
+ * regress to the loud default track. */
+* {
     scrollbar-size-vertical: 1;
     scrollbar-size-horizontal: 1;
     scrollbar-background: $surface;
     scrollbar-background-hover: $surface;
     scrollbar-background-active: $surface;
-    scrollbar-color: $text-disabled;
+    scrollbar-color: $panel-lighten-2;
     scrollbar-color-hover: $primary;
     scrollbar-color-active: $secondary;
 }
@@ -92,7 +97,9 @@ DataTable > .datatable--even-row {
 
 #home {
     height: 1fr;
-    padding: 2 4;
+    /* Top/bottom kept to 1: the hero mascot is 21 rows tall, and with the
+     * 7-item nav below the whole home must land inside 40 terminal rows. */
+    padding: 1 4;
 }
 
 /* Hero: the mascot beside the wordmark / tagline / summary. */
@@ -111,17 +118,46 @@ DataTable > .datatable--even-row {
 
 #home-heading {
     width: 1fr;
+    /* Content column beside the mascot: lockup on top, navigation beneath. */
     height: auto;
-    /* Nudge the heading down so it sits a touch below the mascot's top edge. */
-    padding: 1 0 0 0;
 }
 
+/* Space between the lockup's status line and the NAVIGATE eyebrow. */
+#home-nav-eyebrow {
+    margin-top: 1;
+}
+
+/* Letterspaced small-caps brand line above the big wordmark. */
+#home-eyebrow {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+/* Large "NETWORKING" type — half-block pixel art, same language as the
+ * mascot. No bold: synthetic-bold doubles block glyphs (offset + colour
+ * fringing), exactly as on the mascot above. Colour comes inline. */
 #home-wordmark {
-    text-style: bold;
+    text-style: none;
+}
+
+/* Plain-text stand-in shown when the terminal is too narrow for the pixel
+ * type (HomeScreen toggles .narrow on resize). */
+#home-wordmark-fallback {
+    display: none;
+    color: $primary-lighten-2;
+}
+
+HomeScreen.narrow #home-wordmark {
+    display: none;
+}
+
+HomeScreen.narrow #home-wordmark-fallback {
+    display: block;
 }
 
 #home-tagline {
     color: $text-muted;
+    margin-top: 1;
 }
 
 /* Live one-line workspace summary in the hero (worker-populated). */
@@ -177,8 +213,11 @@ DataTable > .datatable--even-row {
     color: $foreground;
 }
 
-/* Description sits under the title, indented past the reserved pointer column. */
+/* Description sits under the title, indented past the reserved pointer column.
+ * Width 1fr (not auto) so it wraps inside the hero's content column instead of
+ * clipping at the screen edge on narrower terminals. */
 .nav-desc {
+    width: 1fr;
     color: $text-muted;
     padding: 0 0 0 2;
 }
@@ -291,24 +330,59 @@ DataTable > .datatable--even-row {
 }
 
 /* Constrain fields to a comfortable measure (matching the home nav width)
- * rather than stretching edge-to-edge on a wide terminal. A quiet round border
- * (calmer than Textual's default heavy `tall` edge) tints to the brand blue on
- * focus, the one place the identity colour earns its keep. */
+ * rather than stretching edge-to-edge on a wide terminal. Fields are *filled*
+ * (elevated panel over the surface — the app's own elevation language), not
+ * outlined boxes: a quiet left accent rule marks the field and lights up
+ * brand-blue on focus, the one place the identity colour earns its keep. */
 #form-body Input,
-#form-body Select {
+#form-body Select,
+#run-body Input,
+#run-body Select {
     width: 76;
-    border: round $panel-lighten-2;
-    background: $surface;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel;
+    padding: 0 1;
+}
+
+/* Compact single-row inputs (the default is a 3-row bordered box; with the
+ * border gone the extra rows just read as dead air). */
+#form-body Input,
+#run-body Input {
+    height: 1;
 }
 #form-body Input:focus,
-#form-body Select:focus {
-    border: round $primary;
+#form-body Select:focus,
+#run-body Input:focus,
+#run-body Select:focus {
+    border-left: thick $primary;
+    background: $panel-lighten-1;
 }
-#form-body Select SelectCurrent {
+Select SelectCurrent {
     border: none;
+    background: transparent;
+    padding: 0;
 }
-#form-body Select SelectOverlay {
+
+/* The dropdown list: an elevated panel that hugs the field (no loud brand
+ * border, no full-width spill), with the same muted selection tint the tables
+ * use — one selection idiom across the app. */
+SelectOverlay {
     background: $panel;
+    border: round $panel-lighten-2;
+    max-height: 14;
+    padding: 0;
+}
+SelectOverlay > .option-list--option-highlighted {
+    background: $primary 25%;
+    color: $foreground;
+    text-style: bold;
+}
+
+/* Location search / custom-geoUrn widgets start hidden; the Location select's
+ * sentinel options reveal them (widget.display toggles inline, which wins). */
+.loc-conditional {
+    display: none;
 }
 
 /* ── Campaign detail screen ───────────────────────────────────────────── */
@@ -325,23 +399,6 @@ DataTable > .datatable--even-row {
     height: 1fr;
     overflow-y: auto;
     padding: 0 4;
-}
-
-#run-body Input,
-#run-body Select {
-    width: 76;
-    border: round $panel-lighten-2;
-    background: $surface;
-}
-#run-body Input:focus,
-#run-body Select:focus {
-    border: round $primary;
-}
-#run-body Select SelectCurrent {
-    border: none;
-}
-#run-body Select SelectOverlay {
-    background: $panel;
 }
 
 /* The streaming progress log — an elevated panel, revealed only once a run

@@ -8,7 +8,6 @@ covered too.
 """
 
 import pytest
-
 from textual.widgets import Input, Select, Static
 
 from automation.linkedin_mappings import get_location_urn, get_network_value

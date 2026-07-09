@@ -5,10 +5,11 @@ Tests AppSettings configuration and environment variable handling.
 """
 
 import os
-import pytest
 from pathlib import Path
 from unittest.mock import patch
-from zoneinfo import available_timezones, TZPATH
+from zoneinfo import TZPATH, available_timezones
+
+import pytest
 
 from config.settings import AppSettings, _env_int
 
@@ -583,6 +584,31 @@ class TestAutomationSettings:
 
         key = env_var.lower()
         assert auto_settings[key] == default_value
+
+
+@pytest.mark.unit
+class TestWeeklyInvitationLimit:
+    """Proactive weekly-invitation budget (env WEEKLY_INVITATION_LIMIT)."""
+
+    def test_default_is_100(self, monkeypatch):
+        monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
+        assert AppSettings().weekly_invitation_limit == 100
+
+    def test_custom_value(self, monkeypatch):
+        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "250")
+        assert AppSettings().weekly_invitation_limit == 250
+
+    def test_malformed_falls_back_to_default(self, monkeypatch, caplog):
+        """A malformed value degrades to the default (guarded _env_int), not a crash."""
+        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "lots")
+        with caplog.at_level("WARNING"):
+            assert AppSettings().weekly_invitation_limit == 100
+        assert any(
+            "WEEKLY_INVITATION_LIMIT" in rec.message for rec in caplog.records
+        )
+
+    def test_returns_int(self, app_settings):
+        assert isinstance(app_settings.weekly_invitation_limit, int)
 
 
 @pytest.mark.unit
