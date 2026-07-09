@@ -354,12 +354,10 @@ class TestLocationSearchHardStop:
 
 
 @pytest.mark.unit
-class TestConnectionCheckerPartialCounts:
-    """The direct checker's summary must report contacts actually visited.
-
-    ``check_connection_status`` returns the checker's real stats (issue #43);
-    a walk cut short by a failure checks fewer contacts than were pending, and
-    the summary must not over-report with ``len(pending_contacts)``.
+class TestConnectionCheckerSmartOnly:
+    """Issue #45: the check flow is zero-config — pick campaign (or all),
+    confirm, and the smart checker runs. No "choose checker method" prompt
+    exists, and the reported stats are the smart checker's own real counts.
     """
 
     def _drive(self, selection):
@@ -385,7 +383,7 @@ class TestConnectionCheckerPartialCounts:
         cli.settings = _real_settings()
 
         class _FakeAutomation:
-            """Checker that fails after visiting 1 of the 3 pending contacts."""
+            """Only exposes the smart checker — no direct-checker fallback."""
 
             def __init__(self, *a, **k):
                 pass
@@ -399,10 +397,10 @@ class TestConnectionCheckerPartialCounts:
             async def login(self, progress_callback=None):
                 return True
 
-            async def check_connection_status(
-                self, contacts, progress_callback=None, stop_event=None
+            async def smart_connection_checker(
+                self, campaign_id, progress_callback=None, stop_event=None
             ):
-                return {"checked": 1, "newly_accepted": 1, "failed": 1}
+                return {"checked": 1, "newly_accepted": 1, "updated": 1}
 
         class _Prompt:
             def __init__(self, value):
@@ -411,22 +409,25 @@ class TestConnectionCheckerPartialCounts:
             def execute(self):
                 return self._value
 
-        # First select -> campaign or "all"; second select -> direct checker.
-        select_values = iter([selection if selection == "all" else campaign, "direct"])
+        select_calls = {"count": 0}
+
+        def fake_select(*a, **k):
+            select_calls["count"] += 1
+            return _Prompt(selection if selection == "all" else campaign)
 
         with patch.object(
-            linkedin_cli.inquirer,
-            "select",
-            side_effect=lambda *a, **k: _Prompt(next(select_values)),
+            linkedin_cli.inquirer, "select", side_effect=fake_select
         ), patch.object(
             linkedin_cli.inquirer, "confirm", side_effect=lambda *a, **k: _Prompt(True)
         ), patch.object(linkedin_cli, "LinkedInAutomation", _FakeAutomation):
             cli.connection_checker()
 
-        return _rendered(cli)
+        return _rendered(cli), select_calls["count"]
 
     @pytest.mark.parametrize("selection", ["single", "all"])
-    def test_summary_reports_visited_count_not_pending_count(self, selection):
-        out = self._drive(selection)
-        assert "Contacts Checked: 1" in out  # the checker's real count…
-        assert "Contacts Checked: 3" not in out  # …never len(pending_contacts)
+    def test_no_checker_type_prompt_and_smart_stats_reported(self, selection):
+        out, select_count = self._drive(selection)
+        # Zero-config: only the campaign-selection prompt fires — never a
+        # "choose checker method" prompt.
+        assert select_count == 1
+        assert "Contacts Checked: 1" in out

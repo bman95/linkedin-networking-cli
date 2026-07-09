@@ -8,20 +8,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from automation.checker import (
     _clean_profile_url,
     _get_connection_limit,
-    check_specific_contacts,
     monitor_pending_connections,
     smart_connection_checker,
 )
 
 
-def _automation(authenticated=True, pending=None, contact=None, is_connected=True):
+def _automation(authenticated=True, pending=None):
     automation = MagicMock()
     automation.is_authenticated = authenticated
 
@@ -31,21 +29,12 @@ def _automation(authenticated=True, pending=None, contact=None, is_connected=Tru
     page.query_selector = AsyncMock(return_value=None)
     page.query_selector_all = AsyncMock(return_value=[])
     page.content = AsyncMock(return_value="")
-    # The connected-check waits for the indicator selector; a timeout means
-    # the profile is not a 1st-degree connection.
-    if is_connected:
-        page.wait_for_selector = AsyncMock()
-    else:
-        page.wait_for_selector = AsyncMock(
-            side_effect=PlaywrightTimeoutError("indicator never visible")
-        )
     page.keyboard = AsyncMock()
     automation.page = page
     automation.context = AsyncMock()
 
     db = MagicMock()
     db.get_contacts_by_status.return_value = pending or []
-    db.get_contact.return_value = contact
     db.update_contact = MagicMock()
     automation.db_manager = db
     return automation
@@ -132,107 +121,10 @@ class TestSmartChecker:
 
 
 @pytest.mark.unit
-class TestCheckSpecificContacts:
-    @pytest.mark.asyncio
-    async def test_not_authenticated_raises(self):
-        automation = _automation(authenticated=False)
-        with pytest.raises(Exception):
-            await check_specific_contacts(automation, [1])
-
-    @pytest.mark.asyncio
-    async def test_accepted_contact_is_updated(self):
-        contact = SimpleNamespace(
-            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/"
-        )
-        automation = _automation(contact=contact, is_connected=True)
-        stats = await check_specific_contacts(automation, [1])
-        assert stats["checked"] == 1
-        assert stats["newly_accepted"] == 1
-        automation.db_manager.update_contact.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_skips_non_sent_contact(self):
-        contact = SimpleNamespace(
-            id=2, name="Bob", status="accepted", profile_url="https://x/in/bob/"
-        )
-        automation = _automation(contact=contact)
-        stats = await check_specific_contacts(automation, [2])
-        assert stats["checked"] == 0
-        automation.db_manager.update_contact.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_not_connected_when_indicator_wait_times_out(self):
-        """A wait_for_selector timeout means not accepted (no false failure)."""
-        contact = SimpleNamespace(
-            id=4, name="Zoe", status="sent", profile_url="https://x/in/zoe/"
-        )
-        automation = _automation(contact=contact, is_connected=False)
-        stats = await check_specific_contacts(automation, [4])
-        assert stats["checked"] == 1
-        assert stats["newly_accepted"] == 0
-        assert stats["failed"] == 0
-        automation.db_manager.update_contact.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_possibly_sent_contact_is_checked(self):
-        """possibly_sent (issue #31) is polled for acceptance like sent."""
-        contact = SimpleNamespace(
-            id=3, name="Ann", status="possibly_sent",
-            profile_url="https://x/in/ann/",
-        )
-        automation = _automation(contact=contact, is_connected=True)
-        stats = await check_specific_contacts(automation, [3])
-        assert stats["checked"] == 1
-        assert stats["newly_accepted"] == 1
-        automation.db_manager.update_contact.assert_called_once()
-
-
-@pytest.mark.unit
 class TestCooperativeStop:
-    """Issue #43: the checkers poll a stop flag between profiles and return
-    partial stats carrying ``stopped: True`` — never a torn per-profile update."""
-
-    @pytest.mark.asyncio
-    async def test_check_specific_contacts_preset_stop(self):
-        import threading
-
-        contact = SimpleNamespace(
-            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/"
-        )
-        automation = _automation(contact=contact, is_connected=True)
-        stop = threading.Event()
-        stop.set()
-
-        stats = await check_specific_contacts(automation, [1], stop_event=stop)
-
-        assert stats.get("stopped") is True
-        assert stats["checked"] == 0
-        automation.page.goto.assert_not_called()
-        automation.db_manager.update_contact.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_check_specific_contacts_stop_between_contacts(self):
-        """A stop set while the first contact is being checked finishes that
-        contact (its DB update lands) and skips the second."""
-        import threading
-
-        contact = SimpleNamespace(
-            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/"
-        )
-        automation = _automation(contact=contact, is_connected=True)
-        stop = threading.Event()
-
-        def progress(message):
-            if "Checking" in str(message):
-                stop.set()  # requested while contact 1 is in flight
-
-        stats = await check_specific_contacts(
-            automation, [1, 2], progress_callback=progress, stop_event=stop
-        )
-
-        assert stats.get("stopped") is True
-        assert stats["checked"] == 1
-        automation.db_manager.update_contact.assert_called_once()
+    """Issue #43: the smart checker polls a stop flag between profiles and
+    returns partial stats carrying ``stopped: True`` — never a torn per-profile
+    update."""
 
     @pytest.mark.asyncio
     async def test_smart_checker_stop_during_scroll_is_responsive(self):
@@ -510,37 +402,3 @@ class TestSmartCheckerWalk:
         )
         assert result.get("truncated") is True
         assert any("maximum scroll rounds" in m.lower() for m in messages)
-
-
-@pytest.mark.unit
-class TestCheckSpecificContactsRich:
-    @pytest.mark.asyncio
-    async def test_collects_contact_info_and_reports(self, monkeypatch):
-        contact = SimpleNamespace(
-            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/",
-        )
-        automation = _automation(contact=contact, is_connected=True)
-        monkeypatch.setattr(
-            "automation.checker.get_contact_info",
-            AsyncMock(return_value={"email": "j@x.com", "phone": "555"}),
-        )
-        messages = []
-        stats = await check_specific_contacts(
-            automation, [1], progress_callback=messages.append
-        )
-        assert stats["newly_accepted"] == 1
-        update = automation.db_manager.update_contact.call_args[0][1]
-        assert update["email"] == "j@x.com"
-        assert update["phone"] == "555"
-        assert any("accepted" in m.lower() for m in messages)
-
-    @pytest.mark.asyncio
-    async def test_navigation_error_counts_as_failed(self):
-        contact = SimpleNamespace(
-            id=2, name="Bob", status="sent", profile_url="https://x/in/bob/",
-        )
-        automation = _automation(contact=contact)
-        automation.page.goto = AsyncMock(side_effect=RuntimeError("boom"))
-        stats = await check_specific_contacts(automation, [2])
-        assert stats["failed"] == 1
-        assert stats["checked"] == 0

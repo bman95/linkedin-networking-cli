@@ -7,8 +7,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
 from utils.logging import get_logger
 
 from .scraping import get_contact_info
@@ -362,104 +360,6 @@ def _clean_profile_url(url: str) -> str:
         url = "https://www.linkedin.com" + url
 
     return url
-
-
-async def check_specific_contacts(
-    automation,
-    contact_ids: list[int],
-    progress_callback: Callable | None = None,
-    stop_event: Any | None = None,
-) -> dict[str, int]:
-    """
-    Check specific contacts by visiting their profiles directly.
-
-    This is an alternative to the smart checker for checking specific contacts.
-    ``stop_event`` (issue #43) is polled between profiles; once set, the loop
-    ends at the next safe point and the partial stats carry ``"stopped": True``.
-    """
-    if not automation.is_authenticated:
-        raise Exception("Not authenticated. Please login first.")
-
-    stats = {"checked": 0, "newly_accepted": 0, "failed": 0}
-
-    for contact_id in contact_ids:
-        # Cooperative cancellation (issue #43): between profiles only.
-        if stop_event is not None and stop_event.is_set():
-            stats["stopped"] = True
-            if progress_callback:
-                progress_callback("Stop requested — ending the check at a safe point")
-            break
-        try:
-            # Get contact from database. "possibly_sent" (issue #31) is an
-            # assumed-sent invite awaiting acceptance, so check it like "sent".
-            contact = automation.db_manager.get_contact(contact_id)
-            if not contact or contact.status not in ("sent", "possibly_sent"):
-                continue
-
-            if progress_callback:
-                progress_callback(f"Checking {contact.name}...")
-
-            # Navigate to profile
-            await automation.page.goto(contact.profile_url, timeout=30000)
-            await automation.page.wait_for_timeout(random.randint(3000, 5000))
-
-            # Check connection status. ``is_visible`` ignores ``timeout`` in
-            # the async API and returns immediately, so a slow-hydrating
-            # profile would be misread as not-connected; ``wait_for_selector``
-            # actually waits (timing out means not connected). The ES/EN text
-            # variants are co-equal locale primaries, mirroring the registry
-            # style in ``selectors.py``.
-            try:
-                await automation.page.wait_for_selector(
-                    "span:has-text('Connected'), "
-                    "span:has-text('Conectado'), "
-                    ".pv-top-card__distance-badge:has-text('1st'), "
-                    ".pv-top-card__distance-badge:has-text('1.º'), "
-                    "button:has-text('Message'), "
-                    "button:has-text('Enviar mensaje')",
-                    timeout=5000,
-                    state="visible",
-                )
-                is_connected = True
-            except PlaywrightTimeoutError:
-                is_connected = False
-
-            stats["checked"] += 1
-
-            if is_connected:
-                # Update as accepted
-                update_data = {
-                    "status": "accepted",
-                    "connection_accepted_at": datetime.now(UTC)
-                }
-
-                # Try to get contact info
-                try:
-                    contact_info = await get_contact_info(automation.page)
-                    if contact_info.get("email"):
-                        update_data["email"] = contact_info["email"]
-                    if contact_info.get("phone"):
-                        update_data["phone"] = contact_info["phone"]
-                except Exception as contact_error:
-                    logger.warning(f"Failed to get contact info for {contact.name}: {contact_error}")
-
-                automation.db_manager.update_contact(contact.id, update_data)
-                stats["newly_accepted"] += 1
-
-                if progress_callback:
-                    progress_callback(f"✅ {contact.name} accepted connection")
-
-            # Random delay between checks — a pure humanization wait, skipped
-            # once a stop was requested (mirrors the send loops, issue #43).
-            if stop_event is None or not stop_event.is_set():
-                await automation.page.wait_for_timeout(random.randint(2000, 4000))
-
-        except Exception as e:
-            logger.error(f"Error checking contact {contact_id}: {e}")
-            stats["failed"] += 1
-            continue
-
-    return stats
 
 
 async def monitor_pending_connections(
