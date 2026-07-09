@@ -1,7 +1,7 @@
 """Home launcher screen (issue #24).
 
 The entry screen sets the tone for the whole TUI: a curated brand masthead, a
-live one-line workspace summary (campaign count, today's quota, readiness), and a
+live one-line workspace summary (campaign count, today's activity, readiness), and a
 keyboard-first navigation list, plus a dim hint bar at the foot. The selection
 idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
@@ -168,36 +168,47 @@ class HomeScreen(WorkerGuardMixin, Screen):
         except Exception:  # never crash the home screen
             logger.debug("Could not gather home summary", exc_info=True)
             summary = HomeSummary(configured=None, campaigns=None,
-                                  used_today=None, daily_limit=None, db_ok=False)
+                                  used_today=None, active_limits=None, db_ok=False)
         self.marshal_load(app, generation, self._populate, summary)
 
     def _gather(self, app: App) -> HomeSummary:
-        """Credential status, campaign count and today's quota — off the UI thread.
+        """Credential status, campaign count and today's activity — off the UI thread.
 
         ``AppSettings()`` writes to disk on construction, so it is built here in
         the worker; any failure degrades to a friendly summary rather than a crash.
         The DB is read off the captured ``app`` (never ``self.app``, which could
         raise if the screen were torn down mid-worker).
         """
+        from cli.helpers import effective_daily_limit
         from config.settings import AppSettings
 
         settings = AppSettings()
         configured = settings.validate_credentials()
-        daily_limit = settings.get_automation_settings().get("daily_connection_limit")
+        # The enforced daily cap is per-campaign (Campaign.daily_limit); the
+        # DAILY_CONNECTION_LIMIT env value is only the fallback for campaigns
+        # without a valid positive limit (issue #46). effective_daily_limit is
+        # the same rule LinkedInAutomation enforces with.
+        fallback_limit = settings.get_automation_settings()["daily_connection_limit"]
 
         db = app.db_manager
         if db is None:
             return HomeSummary(configured=configured, campaigns=None,
-                              used_today=None, daily_limit=daily_limit, db_ok=False)
+                              used_today=None, active_limits=None, db_ok=False)
         try:
-            campaigns = len(db.get_campaigns(active_only=False))
+            campaigns = db.get_campaigns(active_only=False)
+            active_limits = tuple(
+                effective_daily_limit(c.daily_limit, fallback_limit)
+                for c in campaigns
+                if c.active
+            )
             used_today = db.get_daily_connection_count(date.today().isoformat())
-            return HomeSummary(configured=configured, campaigns=campaigns,
-                              used_today=used_today, daily_limit=daily_limit, db_ok=True)
+            return HomeSummary(configured=configured, campaigns=len(campaigns),
+                              used_today=used_today, active_limits=active_limits,
+                              db_ok=True)
         except Exception:
             logger.debug("Could not read home counts", exc_info=True)
             return HomeSummary(configured=configured, campaigns=None,
-                              used_today=None, daily_limit=daily_limit, db_ok=False)
+                              used_today=None, active_limits=None, db_ok=False)
 
     def _populate(self, summary: HomeSummary) -> None:
         self.query_one("#home-status", Static).update(summary.line())
@@ -210,7 +221,10 @@ class HomeSummary:
     configured: bool | None
     campaigns: int | None
     used_today: int | None
-    daily_limit: int | None
+    #: Effective daily limits of the *active* campaigns (per-campaign
+    #: ``daily_limit``, falling back to the env default only when a campaign
+    #: carries no valid positive value). ``None`` when the DB is unavailable.
+    active_limits: tuple[int, ...] | None
     db_ok: bool
 
     def line(self) -> str:
@@ -222,7 +236,21 @@ class HomeSummary:
         if self.campaigns is not None:
             noun = "campaign" if self.campaigns == 1 else "campaigns"
             parts.append(f"{self.campaigns} {noun}")
-        if self.used_today is not None and self.daily_limit is not None:
-            parts.append(f"{self.used_today}/{self.daily_limit} sent today")
+        if self.used_today is not None:
+            # The binding daily cap is per-campaign — never the env fallback
+            # (issue #46). The count itself is global (the day counter has no
+            # campaign key), so a limit is quoted only when exactly one
+            # campaign is active and the pairing is unambiguous; with several,
+            # any aggregate (e.g. "80+20") would misread as a combined budget
+            # the global counter cannot honor. Per-campaign caps live on the
+            # Campaigns and Execute screens.
+            parts.append(f"{self.used_today} sent today")
+            if self.active_limits is not None and len(self.active_limits) == 1:
+                limit = self.active_limits[0]
+                # Enforcement compares the global day count against this limit
+                # (used >= limit), so the exhausted state can be called out
+                # honestly here — a run started now would stop immediately.
+                reached = " — daily limit reached" if self.used_today >= limit else ""
+                parts.append(f"limit {limit} (1 active campaign){reached}")
         parts.append("ready" if self.db_ok else "database unavailable")
         return "  ·  ".join(parts)

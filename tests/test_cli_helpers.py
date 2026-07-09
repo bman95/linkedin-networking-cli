@@ -13,7 +13,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from cli.helpers import campaign_get_field, csv_value, mask_email
+from cli.helpers import (
+    campaign_get_field,
+    csv_value,
+    effective_daily_limit,
+    mask_email,
+)
 from linkedin_cli import LinkedInCLI
 
 
@@ -76,3 +81,29 @@ class TestCampaignGetField:
         assert LinkedInCLI._campaign_get_field(data, "name") == campaign_get_field(
             data, "name"
         )
+
+
+@pytest.mark.unit
+class TestEffectiveDailyLimit:
+    """The shared rule (issue #46): the campaign's own positive limit binds;
+    anything else falls back to the env default."""
+
+    def test_positive_campaign_limit_is_authoritative(self):
+        assert effective_daily_limit(80, 20) == 80
+
+    @pytest.mark.parametrize("invalid", [None, 0, -5, True, "10", 3.5])
+    def test_invalid_values_fall_back(self, invalid):
+        assert effective_daily_limit(invalid, 20) == 20
+
+    @pytest.mark.parametrize("stored", [80, 0, None])
+    def test_matches_automation_enforcement(self, stored):
+        """Display surfaces and enforcement must share one rule — the
+        automation's _effective_daily_limit delegates to this helper, on the
+        binding case and on the fallback (invalid/unset) cases alike."""
+        from automation.linkedin import LinkedInAutomation
+
+        campaign = SimpleNamespace(daily_limit=stored)
+        settings = {"daily_connection_limit": 20}
+        assert LinkedInAutomation._effective_daily_limit(
+            campaign, settings
+        ) == effective_daily_limit(stored, 20)

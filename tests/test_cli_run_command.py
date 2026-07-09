@@ -302,6 +302,33 @@ class TestRunNoninteractive:
             campaign, 50, ANY, max_sends=12
         )
 
+    def test_defaults_max_through_shared_rule_when_limit_invalid(self):
+        """An invalid campaign daily_limit falls back to the env default via
+        the shared effective_daily_limit rule (issue #46) — never a 0/None cap
+        that would silently send nothing."""
+        campaign = SimpleNamespace(id=7, name="Growth", daily_limit=0)
+        cli = _bare_cli()
+        cli.db_manager = _FakeDB([campaign])
+        cli.settings = SimpleNamespace(
+            validate_credentials=lambda: True,
+            get_automation_settings=lambda: {
+                "search_limit": 50,
+                "daily_connection_limit": 25,
+            },
+        )
+
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        with patch.object(
+            linkedin_cli.asyncio, "run", side_effect=lambda coro: {"status": "success"}
+        ):
+            rc = cli.run_noninteractive("7")  # no --max
+
+        assert rc == 0
+        cli._run_campaign_automation.assert_called_once_with(
+            campaign, 50, ANY, max_sends=25
+        )
+
     def test_safety_stop_exits_nonzero(self, capsys):
         """A protective CAPTCHA/challenge stop must fail the scheduled run —
         never exit 0 as if it were a clean 'no profiles' outcome."""

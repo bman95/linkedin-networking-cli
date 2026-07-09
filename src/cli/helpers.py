@@ -42,6 +42,25 @@ def acceptance_rate(sent: int, accepted: int) -> float:
     return (accepted / sent * 100) if sent > 0 else 0.0
 
 
+def effective_daily_limit(campaign_limit: Any, fallback: int) -> int:
+    """The daily invitation cap actually enforced for a campaign run.
+
+    The per-campaign ``daily_limit`` — the value shown and edited in the CLI —
+    is authoritative. It falls back to the ``DAILY_CONNECTION_LIMIT``
+    setting/env default only when the campaign carries no valid positive value
+    (so an unset/zeroed campaign still gets a sane cap). Shared by the
+    automation enforcement and every display surface so copy can never drift
+    from what a run actually enforces (issue #46).
+    """
+    if (
+        isinstance(campaign_limit, int)
+        and not isinstance(campaign_limit, bool)
+        and campaign_limit > 0
+    ):
+        return campaign_limit
+    return fallback
+
+
 # Contact CSV export columns, shared by the classic CLI and the TUI so both
 # produce the same file shape.
 CONTACT_CSV_FIELDS = (

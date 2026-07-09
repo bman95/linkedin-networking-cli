@@ -57,8 +57,8 @@ side effects); write and automation flows follow.
 
 | Classic flow | TUI screen | Data / deps | Side effects | Status |
 | --- | --- | --- | --- | --- |
-| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_daily_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
-| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count` | none (read-only) | **done (this PR)** |
+| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_weekly_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
+| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `ExecuteCampaignScreen` | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (user-initiated run) |
@@ -134,7 +134,9 @@ per-flow parity checklist:
   - Settings: "Status: Configured/Not configured", masked email
     (`joh***@example.com`), "Password: Set/Not set", "Channel", "Executable",
     "Headless Mode", "Viewport", "User Data Dir", "Connection Delay",
-    "Daily Connection Limit", "Used Today", "Inter-session Cooldown",
+    "Default Daily Limit (fallback when a campaign sets none)",
+    "Weekly Invitation Limit", "Used Today", "Used This Week",
+    "Inter-session Cooldown",
     "Search Limit", "App Directory", "Database", "Session Data", "Browser Data".
 - **Behavior parity.** Each migrated flow does what its classic counterpart
   does, including the demo/degraded fallbacks.
@@ -163,7 +165,7 @@ low-contrast on dark. Screens reference **semantic tokens** (`$primary`,
 | `primary` | `#0A66C2` | brand identity: solid fills, focus, active row, accent rule |
 | `secondary` / `accent` | `#4D9FFF` | brighter blue: text accents/links legible on dark |
 | `success` | `#4FB477` | healthy/active states, positive rates |
-| `warning` | `#E0A65B` | amber — quota at/over the daily cap |
+| `warning` | `#E0A65B` | amber — usage at/over the weekly invitation budget |
 | `error` | `#E5615B` | soft red — error / degraded states |
 | `background` / `surface` / `panel` | `#11151A` / `#161B22` / `#1C222B` | deep, cool, calm elevation |
 | `foreground` / `text-muted` | `#E4E9F0` / `#8A95A6` | body text / captions |
@@ -228,7 +230,7 @@ toward a calm, modern terminal surface.
   (`overflow-y: auto`), never the whole screen, so the header/footer stay fixed.
 - **Keyboard-first navigation.** The home is a curated launcher: the **"Bit"
   mascot** beside the wordmark + tagline, a **live one-line workspace summary** (worker-loaded — credential status for onboarding, else campaign
-  count / today's quota / readiness), and a focused nav list of rich rows
+  count / today's activity / readiness), and a focused nav list of rich rows
   (title + description) whose selection is a `❯` pointer and an accent-recoloured
   title — not a loud full-width bar. Navigation is fast: `↑`/`↓` + `enter`, and
   the number keys **`1`–`4` jump** straight to a destination. Textual's command
