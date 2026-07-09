@@ -146,6 +146,35 @@ class TestResolveCampaign:
         cli = self._cli_with_campaigns([c1])
         assert cli._resolve_campaign("nope") is None
 
+    def test_duplicate_names_raise_instead_of_picking_first(self):
+        """Campaign.name is not unique: an ambiguous name must never silently
+        run whichever row came back first (wrong audience from a scheduler)."""
+        c1 = SimpleNamespace(id=1, name="Growth", daily_limit=20)
+        c2 = SimpleNamespace(id=2, name="Growth", daily_limit=15)
+        cli = self._cli_with_campaigns([c1, c2])
+        with pytest.raises(ValueError, match="ambiguous"):
+            cli._resolve_campaign("Growth")
+
+    def test_duplicate_case_insensitive_names_raise(self):
+        c1 = SimpleNamespace(id=1, name="Growth", daily_limit=20)
+        c2 = SimpleNamespace(id=2, name="GROWTH", daily_limit=15)
+        cli = self._cli_with_campaigns([c1, c2])
+        with pytest.raises(ValueError, match="ambiguous"):
+            cli._resolve_campaign("growth")
+
+    def test_exact_match_wins_over_case_insensitive_duplicates(self):
+        """One exact match is unambiguous even if other casings exist."""
+        c1 = SimpleNamespace(id=1, name="Growth", daily_limit=20)
+        c2 = SimpleNamespace(id=2, name="GROWTH", daily_limit=15)
+        cli = self._cli_with_campaigns([c1, c2])
+        assert cli._resolve_campaign("Growth") is c1
+
+    def test_id_resolution_unaffected_by_duplicate_names(self):
+        c1 = SimpleNamespace(id=1, name="Growth", daily_limit=20)
+        c2 = SimpleNamespace(id=2, name="Growth", daily_limit=15)
+        cli = self._cli_with_campaigns([c1, c2])
+        assert cli._resolve_campaign("2") is c2
+
 
 # ---------------------------------------------------------------------------
 # run_noninteractive — credential validation and automation invocation
@@ -172,6 +201,39 @@ class TestRunNoninteractive:
         cli.settings = _settings(valid=True)
         rc = cli.run_noninteractive("ghost")
         assert rc != 0
+
+    def test_inactive_campaign_exits_nonzero(self, capsys):
+        """A deactivated campaign must not keep sending from cron — the
+        interactive/TUI flows only ever offer active campaigns."""
+        campaign = SimpleNamespace(
+            id=1, name="Paused", daily_limit=20, active=False
+        )
+        cli = _bare_cli()
+        cli.db_manager = _FakeDB([campaign])
+        cli.settings = _settings(valid=True)
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        rc = cli.run_noninteractive("1")
+
+        assert rc != 0
+        assert "inactive" in capsys.readouterr().err
+        cli._run_campaign_automation.assert_not_called()
+
+    def test_ambiguous_name_exits_nonzero(self, capsys):
+        campaigns = [
+            SimpleNamespace(id=1, name="Growth", daily_limit=20, active=True),
+            SimpleNamespace(id=2, name="Growth", daily_limit=15, active=True),
+        ]
+        cli = _bare_cli()
+        cli.db_manager = _FakeDB(campaigns)
+        cli.settings = _settings(valid=True)
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        rc = cli.run_noninteractive("Growth")
+
+        assert rc != 0
+        assert "ambiguous" in capsys.readouterr().err
+        cli._run_campaign_automation.assert_not_called()
 
     def test_invokes_core_with_campaign_and_explicit_max(self):
         """--max caps invitations SENT (max_sends); the scan budget stays the

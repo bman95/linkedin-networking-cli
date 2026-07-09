@@ -1014,6 +1014,11 @@ class LinkedInCLI:
         A numeric ``reference`` is looked up by id first; otherwise (or if no
         campaign has that id) it is matched against campaign names, exact match
         first then case-insensitive. Returns the campaign or ``None``.
+
+        ``Campaign.name`` is not unique in the schema, so a name matching more
+        than one campaign raises :class:`ValueError` (naming the candidate ids)
+        instead of silently running whichever row came back first — an
+        unattended scheduler must never target the wrong audience.
         """
         ref = str(reference).strip()
 
@@ -1022,15 +1027,33 @@ class LinkedInCLI:
             if campaign is not None:
                 return campaign
 
+        def _ambiguous(matches):
+            ids = ", ".join(
+                str(self._campaign_get_field(c, "id", "?")) for c in matches
+            )
+            return ValueError(
+                f"campaign name '{ref}' is ambiguous (ids: {ids}); "
+                "use --campaign <id> instead."
+            )
+
         campaigns = self.db_manager.get_campaigns(active_only=False)
-        for campaign in campaigns:
-            if self._campaign_get_field(campaign, "name") == ref:
-                return campaign
+        exact = [
+            c for c in campaigns if self._campaign_get_field(c, "name") == ref
+        ]
+        if len(exact) > 1:
+            raise _ambiguous(exact)
+        if exact:
+            return exact[0]
         lowered = ref.lower()
-        for campaign in campaigns:
-            name = self._campaign_get_field(campaign, "name") or ""
-            if name.lower() == lowered:
-                return campaign
+        loose = [
+            c
+            for c in campaigns
+            if (self._campaign_get_field(c, "name") or "").lower() == lowered
+        ]
+        if len(loose) > 1:
+            raise _ambiguous(loose)
+        if loose:
+            return loose[0]
         return None
 
     def run_noninteractive(self, campaign_reference, max_invites=None):
@@ -1062,7 +1085,11 @@ class LinkedInCLI:
             )
             return 1
 
-        campaign = self._resolve_campaign(campaign_reference)
+        try:
+            campaign = self._resolve_campaign(campaign_reference)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         if campaign is None:
             print(
                 f"Error: no campaign matching '{campaign_reference}'.",
@@ -1071,6 +1098,17 @@ class LinkedInCLI:
             return 1
 
         campaign_name = self._campaign_get_field(campaign, "name", "campaign")
+
+        # An unattended run must respect deactivation: the interactive/TUI
+        # flows only ever offer active campaigns, so a paused campaign must not
+        # keep sending from cron either.
+        if not self._campaign_get_field(campaign, "active", True):
+            print(
+                f"Error: campaign '{campaign_name}' is inactive. Reactivate it "
+                "before scheduling runs.",
+                file=sys.stderr,
+            )
+            return 1
         # --max caps invitations SENT; the scan budget stays the interactive
         # flow's search_limit setting so repeat runs can skip past
         # already-contacted results instead of burning the cap on them.
