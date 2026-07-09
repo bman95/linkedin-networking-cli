@@ -1074,16 +1074,19 @@ class LinkedInCLI:
             )
             return 1
 
-        # Non-interactive runs cannot fall back to a manual browser login, so
-        # configured credentials are mandatory here (unlike the interactive
-        # flow, which only warns and waits for a human).
+        # Missing credentials only warn: login() resumes a saved session
+        # (session.json or the persistent Chrome profile) without them, which
+        # is a primary unattended workflow — log in once interactively, then
+        # schedule `run`. If no valid session remains either, the login step
+        # fails *bounded* (headless raises immediately; otherwise the manual-
+        # login wait times out) and the run exits non-zero below.
         if not self.settings.validate_credentials():
             print(
-                "Error: LinkedIn credentials are not configured. Set "
-                "LINKEDIN_EMAIL and LINKEDIN_PASSWORD before running.",
+                "Warning: LINKEDIN_EMAIL/LINKEDIN_PASSWORD are not set. The "
+                "run will reuse a saved LinkedIn session if one is still "
+                "valid; otherwise it will fail.",
                 file=sys.stderr,
             )
-            return 1
 
         try:
             campaign = self._resolve_campaign(campaign_reference)

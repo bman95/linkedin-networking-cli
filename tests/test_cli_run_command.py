@@ -188,11 +188,38 @@ class TestRunNoninteractive:
         rc = cli.run_noninteractive("1")
         assert rc != 0
 
-    def test_missing_credentials_exits_nonzero(self):
+    def test_missing_credentials_warns_but_reuses_saved_session(self, capsys):
+        """No credentials is a warning, not a hard stop: login() can resume a
+        saved session (session.json / persistent profile) without them, which
+        is the log-in-once-then-schedule workflow. A dead session still fails
+        the run through the login step (bounded, non-zero)."""
         cli = _bare_cli()
         cli.db_manager = _FakeDB([SimpleNamespace(id=1, name="Alpha", daily_limit=20)])
         cli.settings = _settings(valid=False)
-        rc = cli.run_noninteractive("1")
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        with patch.object(
+            linkedin_cli.asyncio, "run", side_effect=lambda coro: {"status": "success"}
+        ):
+            rc = cli.run_noninteractive("1")
+
+        assert rc == 0
+        cli._run_campaign_automation.assert_called_once()
+        assert "saved LinkedIn session" in capsys.readouterr().err
+
+    def test_missing_credentials_and_failed_login_exits_nonzero(self):
+        cli = _bare_cli()
+        cli.db_manager = _FakeDB([SimpleNamespace(id=1, name="Alpha", daily_limit=20)])
+        cli.settings = _settings(valid=False)
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        with patch.object(
+            linkedin_cli.asyncio,
+            "run",
+            side_effect=lambda coro: {"status": "login_failed"},
+        ):
+            rc = cli.run_noninteractive("1")
+
         assert rc != 0
 
     def test_unknown_campaign_exits_nonzero(self):

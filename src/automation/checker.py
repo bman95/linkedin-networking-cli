@@ -116,24 +116,36 @@ async def _check_connections_page(
     # Create a lookup dict for faster searching
     pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
 
-    # Without a limit_url stop marker the loop has no natural end on long
-    # connection lists (>=10 cards keep loading forever), so cap the scroll
-    # rounds — mirrors ``_walk_search_pages``'s ``max_pages`` guard.
+    # Every profile URL processed so far. A scroll round that surfaces no NEW
+    # profile is the true end of the list (whether the DOM accumulates cards
+    # or recycles them), giving the walk a natural terminator alongside the
+    # limit_url marker — and sparing already-updated contacts a duplicate pass.
+    seen_urls: set[str] = set()
+
+    # Backstop only: the natural terminators are the limit_url marker, the
+    # no-new-profiles detection above, and the short-page heuristic below. The
+    # cap exists so a pathological page that keeps feeding cards can't scroll
+    # forever; it is generous enough (hundreds of cards) that a real
+    # reconciliation reaches its marker or the list end first. A cap hit is
+    # flagged in the returned stats (``truncated``) so callers can tell it
+    # apart from a complete check.
     scroll_rounds = 0
-    max_scroll_rounds = 10  # Limit to prevent infinite loops
+    max_scroll_rounds = 40
 
     while not finish_process:
         if scroll_rounds >= max_scroll_rounds:
             logger.warning(
-                "Connections walk hit the max scroll rounds guard (%d) "
-                "without reaching a stop marker; stopping to avoid an "
-                "infinite scroll",
+                "Connections walk hit the max scroll rounds backstop (%d) "
+                "without reaching a stop marker or the end of the list; "
+                "results may be incomplete",
                 max_scroll_rounds,
             )
             if progress_callback:
                 progress_callback(
-                    "Reached maximum scroll rounds, stopping checker"
+                    "Reached maximum scroll rounds — stopping; the check may "
+                    "be incomplete"
                 )
+            stats["truncated"] = True
             break
         scroll_rounds += 1
 
@@ -156,6 +168,7 @@ async def _check_connections_page(
                 progress_callback("No connections found on page, stopping...")
             break
 
+        new_this_round = 0
         for connection in connections:
             try:
                 # Get profile element
@@ -169,6 +182,13 @@ async def _check_connections_page(
 
                 # Clean the URL to match database format
                 profile_url = _clean_profile_url(profile_url)
+
+                # Already handled in an earlier round (the DOM keeps loaded
+                # cards around) — skip the duplicate pass.
+                if profile_url in seen_urls:
+                    continue
+                seen_urls.add(profile_url)
+                new_this_round += 1
 
                 # Check if this is a pending contact we're tracking
                 if profile_url in pending_lookup:
@@ -193,6 +213,12 @@ async def _check_connections_page(
             except Exception as e:
                 logger.warning(f"Error processing connection element: {e}")
                 continue
+
+        if not finish_process and new_this_round == 0:
+            # A whole scroll round surfaced nothing new: the end of the list.
+            if progress_callback:
+                progress_callback("Reached end of connections list")
+            break
 
         if not finish_process and len(connections) < 10:
             # If we got fewer than 10 connections, we might be at the end

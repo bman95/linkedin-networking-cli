@@ -365,10 +365,11 @@ class TestSmartCheckerWalk:
         automation.db_manager.update_contact.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_walk_without_limit_terminates_via_scroll_guard(self):
-        """With no stop marker and a full page of cards (>=10) every round,
-        the max-scroll-rounds guard must end the walk (it looped forever
-        before the guard existed)."""
+    async def test_walk_without_limit_terminates_at_end_of_list(self):
+        """With no stop marker and the same full page of cards every round,
+        the no-new-profiles detection ends the walk after one repeat round
+        (it looped forever before the guards existed) — and the result is NOT
+        flagged as truncated: the whole list was seen."""
         contact = SimpleNamespace(
             id=1, name="Jane", status="sent",
             profile_url="https://www.linkedin.com/in/jane/",
@@ -387,6 +388,38 @@ class TestSmartCheckerWalk:
             automation, 1, progress_callback=messages.append
         )
         assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
+        assert "truncated" not in result
+        assert any("end of connections list" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_walk_pathological_feed_hits_scroll_backstop(self):
+        """A page that keeps feeding NEW cards forever trips the scroll-rounds
+        backstop, and the result is flagged truncated so callers can tell an
+        incomplete check from a complete one."""
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+
+        calls = {"n": 0}
+
+        async def _fresh_cards(_selector):
+            calls["n"] += 1
+            base = calls["n"] * 100
+            return [
+                _connection_el(f"https://www.linkedin.com/in/other{base + i}/")
+                for i in range(10)
+            ]
+
+        automation.page.query_selector_all = AsyncMock(side_effect=_fresh_cards)
+        messages = []
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=messages.append
+        )
+        assert result.get("truncated") is True
         assert any("maximum scroll rounds" in m.lower() for m in messages)
 
 
