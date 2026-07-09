@@ -188,6 +188,71 @@ class TestCheckSpecificContacts:
 
 
 @pytest.mark.unit
+class TestCooperativeStop:
+    """Issue #43: the checkers poll a stop flag between profiles and return
+    partial stats carrying ``stopped: True`` — never a torn per-profile update."""
+
+    @pytest.mark.asyncio
+    async def test_check_specific_contacts_preset_stop(self):
+        import threading
+
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/"
+        )
+        automation = _automation(contact=contact, is_connected=True)
+        stop = threading.Event()
+        stop.set()
+
+        stats = await check_specific_contacts(automation, [1], stop_event=stop)
+
+        assert stats.get("stopped") is True
+        assert stats["checked"] == 0
+        automation.page.goto.assert_not_called()
+        automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_check_specific_contacts_stop_between_contacts(self):
+        """A stop set while the first contact is being checked finishes that
+        contact (its DB update lands) and skips the second."""
+        import threading
+
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent", profile_url="https://x/in/jane/"
+        )
+        automation = _automation(contact=contact, is_connected=True)
+        stop = threading.Event()
+
+        def progress(message):
+            if "Checking" in str(message):
+                stop.set()  # requested while contact 1 is in flight
+
+        stats = await check_specific_contacts(
+            automation, [1, 2], progress_callback=progress, stop_event=stop
+        )
+
+        assert stats.get("stopped") is True
+        assert stats["checked"] == 1
+        automation.db_manager.update_contact.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_smart_checker_preset_stop_returns_partial_stats(self):
+        import threading
+
+        pending = [SimpleNamespace(id=1, name="Jane", profile_url="https://x/in/jane/")]
+        automation = _automation(pending=pending)
+        _set_limit(automation, None)
+        stop = threading.Event()
+        stop.set()
+
+        stats = await smart_connection_checker(automation, 1, stop_event=stop)
+
+        assert stats.get("stopped") is True
+        assert stats["checked"] == 0
+        # The walk ended before any scrolling round drove the keyboard.
+        automation.page.keyboard.press.assert_not_called()
+
+
+@pytest.mark.unit
 class TestMonitor:
     @pytest.mark.asyncio
     async def test_stops_when_no_pending(self):

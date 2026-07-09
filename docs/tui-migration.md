@@ -104,9 +104,13 @@ side effects); write and automation flows follow.
    runs until a campaign/mode is selected and confirmed with a *second* `ctrl+r`.
    `run_body` is the single seam tests override to exercise the
    run/log/summary/error pipeline without a browser; the live run itself is
-   validated manually (it sends real invites). Cancellation mid-run is not
-   offered — the automation methods take no cancel token — so the screen says
-   "keep this open until it finishes"; `esc` after completion returns.
+   validated manually (it sends real invites). Cooperative cancellation
+   (issue #43): the engine loops take a `threading.Event`-style `stop_event`
+   polled **between profiles** (never mid-send), and the run surface shows a
+   focusable "Stop after current profile" button (focused while running, so
+   Enter stops; `s` is the accelerator) that returns a normal partial summary
+   with `status: "cancelled"`. Leaving the screen still does *not* stop the
+   run; `esc` after completion returns.
 4. **Cutover.** Once every flow has a TUI equivalent at parity, drop InquirerPy.
    Every classic main-menu flow now has a TUI equivalent, including the
    browser-bound online location search / custom geoUrn entry in Create/Edit;

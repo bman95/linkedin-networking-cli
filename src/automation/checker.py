@@ -20,11 +20,16 @@ async def smart_connection_checker(
     automation,  # LinkedInAutomation instance
     campaign_id: int,
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """
     Smart checker that monitors LinkedIn connections page to find newly accepted connections.
 
     This is the main function that should be called from your CLI.
+
+    ``stop_event`` (a ``threading.Event``-like flag, issue #43) is polled
+    between profiles; once set, the walk ends at the next safe point and the
+    partial stats carry ``"stopped": True``.
 
     Returns:
         Dict with counts: {"checked": int, "newly_accepted": int, "updated": int}
@@ -85,7 +90,8 @@ async def smart_connection_checker(
             automation,
             pending_contacts,
             limit_url,
-            progress_callback
+            progress_callback,
+            stop_event=stop_event,
         )
 
         if progress_callback:
@@ -107,11 +113,22 @@ async def _check_connections_page(
     pending_contacts: list,
     limit_url: str | None,
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """Check the connections page and update database for newly accepted connections."""
 
     stats = {"checked": 0, "newly_accepted": 0, "updated": 0}
     finish_process = False
+
+    def _stop_requested() -> bool:
+        # Cooperative cancellation (issue #43): polled between profiles and at
+        # round boundaries only, so a per-profile DB update never tears mid-way.
+        if stop_event is not None and stop_event.is_set():
+            stats["stopped"] = True
+            if progress_callback:
+                progress_callback("Stop requested — ending the check at a safe point")
+            return True
+        return False
 
     # Create a lookup dict for faster searching
     pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
@@ -133,6 +150,8 @@ async def _check_connections_page(
     max_scroll_rounds = 40
 
     while not finish_process:
+        if _stop_requested():
+            break
         if scroll_rounds >= max_scroll_rounds:
             logger.warning(
                 "Connections walk hit the max scroll rounds backstop (%d) "
@@ -170,6 +189,9 @@ async def _check_connections_page(
 
         new_this_round = 0
         for connection in connections:
+            if _stop_requested():
+                finish_process = True
+                break
             try:
                 # Get profile element
                 profile = await connection.query_selector('[data-view-name="connections-profile"]')
@@ -325,11 +347,14 @@ async def check_specific_contacts(
     automation,
     contact_ids: list[int],
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """
     Check specific contacts by visiting their profiles directly.
 
     This is an alternative to the smart checker for checking specific contacts.
+    ``stop_event`` (issue #43) is polled between profiles; once set, the loop
+    ends at the next safe point and the partial stats carry ``"stopped": True``.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -337,6 +362,12 @@ async def check_specific_contacts(
     stats = {"checked": 0, "newly_accepted": 0, "failed": 0}
 
     for contact_id in contact_ids:
+        # Cooperative cancellation (issue #43): between profiles only.
+        if stop_event is not None and stop_event.is_set():
+            stats["stopped"] = True
+            if progress_callback:
+                progress_callback("Stop requested — ending the check at a safe point")
+            break
         try:
             # Get contact from database. "possibly_sent" (issue #31) is an
             # assumed-sent invite awaiting acceptance, so check it like "sent".

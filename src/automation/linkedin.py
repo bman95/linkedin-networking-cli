@@ -1035,6 +1035,7 @@ class LinkedInAutomation:
         limit: int = 100,
         progress_callback: Callable | None = None,
         max_sends: int | None = None,
+        stop_event: Any | None = None,
     ) -> dict[str, int]:
         """Search and connect from the result cards in a single pass.
 
@@ -1065,8 +1066,16 @@ class LinkedInAutomation:
         Returns the same aggregate shape as :meth:`send_connection_requests`, plus
         ``scanned`` (unique cards seen across the result pages) and
         ``stopped_reason`` (``"captcha"``/``"challenge"`` when the run was cut
-        short by an account-safety stop, else ``None``) so callers can tell a
-        protective stop apart from a clean empty result.
+        short by an account-safety stop, ``"cancelled"`` on a user stop request,
+        else ``None``) so callers can tell a protective stop apart from a clean
+        empty result.
+
+        ``stop_event``, when given, is a ``threading.Event``-like flag (anything
+        with ``is_set()``) polled **between profiles** — never inside
+        :meth:`_attempt_connect`, so the irreversible reserve→click→send tail
+        (issues #31/#39) always completes for the profile in flight. Once set,
+        the run stops at the next safe point (the fallback pass included) and
+        returns the normal partial summary with ``stopped_reason="cancelled"``.
         """
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
@@ -1094,6 +1103,16 @@ class LinkedInAutomation:
 
         try:
             async for _page in self._walk_search_pages(campaign, progress_callback):
+                # Page boundary is also a safe stop point (issue #43) — without
+                # this, a run of card-less result pages would delay the stop.
+                if stop_event is not None and stop_event.is_set():
+                    if progress_callback:
+                        progress_callback(
+                            "Stop requested — ending the run at a safe point"
+                        )
+                    stopped_reason = "cancelled"
+                    stop_all = True
+                    break
                 # Inline CAPTCHA can render on the results page without a URL
                 # bounce (the landing guard only catches URL-level challenges).
                 # Mirror the profile path's per-navigation detect_captcha.
@@ -1110,6 +1129,17 @@ class LinkedInAutomation:
                 # Card handles are valid only until the walk paginates, so act on
                 # every card on this page before letting the loop advance.
                 for profile, card in await self._extract_profile_cards():
+                    # Cooperative cancellation (issue #43): checked between
+                    # profiles only, so the profile in flight always finishes
+                    # its irreversible send tail before the run winds down.
+                    if stop_event is not None and stop_event.is_set():
+                        if progress_callback:
+                            progress_callback(
+                                "Stop requested — ending the run at a safe point"
+                            )
+                        stopped_reason = "cancelled"
+                        scan_done = stop_all = True
+                        break
                     url = profile.profile_url
                     # Requested per-run send cap (the `run` subcommand's --max):
                     # counts confirmed + ambiguous sends, NOT cards scanned, so
@@ -1368,6 +1398,7 @@ class LinkedInAutomation:
                     fallback_profiles,
                     progress_callback,
                     max_sends=remaining_sends,
+                    stop_event=stop_event,
                 )
                 sent_count += fb["sent"]
                 possibly_sent_count += fb.get("possibly_sent", 0)
@@ -1463,6 +1494,7 @@ class LinkedInAutomation:
         profiles: list[LinkedInProfile],
         progress_callback: Callable | None = None,
         max_sends: int | None = None,
+        stop_event: Any | None = None,
     ) -> dict[str, int]:
         """Send connection requests to profiles.
 
@@ -1470,7 +1502,12 @@ class LinkedInAutomation:
         (confirmed + ambiguous sends) on top of the persisted daily/weekly
         limits. The returned dict carries ``stopped_reason``
         (``"captcha"``/``"challenge"`` when the run was cut short to protect
-        the account, else ``None``).
+        the account, ``"cancelled"`` on a user stop request, else ``None``).
+
+        ``stop_event``, when given, is a ``threading.Event``-like flag polled
+        **between profiles** — never inside :meth:`_attempt_connect` — so a
+        stop request lets the in-flight send finish and returns the normal
+        partial summary (issue #43).
         """
 
         if not self.is_authenticated:
@@ -1525,6 +1562,15 @@ class LinkedInAutomation:
         backoff_cap_seconds = 300
 
         for i, profile in enumerate(profiles):
+            # Cooperative cancellation (issue #43): between profiles only, so
+            # the in-flight reserve→click→send tail is never interrupted.
+            if stop_event is not None and stop_event.is_set():
+                if progress_callback:
+                    progress_callback(
+                        "Stop requested — ending the run at a safe point"
+                    )
+                stopped_reason = "cancelled"
+                break
             today = date.today().isoformat()
             try:
                 # Requested per-run send cap (see search_and_connect): counts
@@ -3102,7 +3148,10 @@ class LinkedInAutomation:
             return None
 
     async def check_connection_status(
-        self, contacts: list[Contact], progress_callback: Callable | None = None
+        self,
+        contacts: list[Contact],
+        progress_callback: Callable | None = None,
+        stop_event: Any | None = None,
     ) -> int:
         """Check status of pending connection requests using enhanced checker"""
         from .checker import check_specific_contacts
@@ -3126,16 +3175,23 @@ class LinkedInAutomation:
             return 0
 
         # Use the enhanced checker
-        stats = await check_specific_contacts(self, contact_ids, progress_callback)
+        stats = await check_specific_contacts(
+            self, contact_ids, progress_callback, stop_event=stop_event
+        )
         return stats["newly_accepted"]
 
     async def smart_connection_checker(
-        self, campaign_id: int, progress_callback: Callable | None = None
+        self,
+        campaign_id: int,
+        progress_callback: Callable | None = None,
+        stop_event: Any | None = None,
     ) -> dict[str, int]:
         """Smart checker that monitors LinkedIn connections page for newly accepted connections"""
         from .checker import smart_connection_checker
 
-        return await smart_connection_checker(self, campaign_id, progress_callback)
+        return await smart_connection_checker(
+            self, campaign_id, progress_callback, stop_event=stop_event
+        )
 
     async def extract_detailed_profile(
         self, profile_url: str, progress_callback: Callable | None = None

@@ -6,8 +6,11 @@ run → summary/error pipeline (via a browser-free fake that overrides the singl
 ``run_body`` seam), and each real screen's gating / selection / validation.
 """
 
+import asyncio
+import time
+
 import pytest
-from textual.widgets import Input, RichLog, Select, Static
+from textual.widgets import Button, Input, RichLog, Select, Static
 
 from database.operations import DatabaseManager
 from exceptions import (
@@ -171,7 +174,8 @@ async def test_execute_automate_maps_stopped_reason_to_safety_stop(
     def _fake_automation(scanned):
         class _Fake:
             async def search_and_connect(
-                self, campaign, limit, progress_callback=None, max_sends=None
+                self, campaign, limit, progress_callback=None, max_sends=None,
+                stop_event=None,
             ):
                 return {
                     "sent": 1 if scanned else 0, "possibly_sent": 0,
@@ -191,6 +195,206 @@ async def test_execute_automate_maps_stopped_reason_to_safety_stop(
         text = screen.render_result(result)
         assert "CAPTCHA" in text
         assert "No profiles matched" not in text
+
+
+# ── cooperative cancellation (issue #43) ────────────────────────────────────
+
+
+class _FakeStoppableRunScreen(AutomationRunScreen):
+    """A slow, browser-free run body honoring the stop flag between 'profiles'.
+
+    Mirrors the engine contract: the flag is polled between iterations only, the
+    in-flight step always completes, and a stop returns the normal partial
+    summary with status ``cancelled``.
+    """
+
+    SCREEN_TITLE = "Fake Stoppable Run"
+    ACTION_LABEL = "fake stoppable run"
+
+    async def run_body(self) -> dict:
+        done = 0
+        for i in range(40):
+            if self._stop_event is not None and self._stop_event.is_set():
+                return {"status": "cancelled", "n": done}
+            self.progress(f"profile {i + 1}")
+            await asyncio.sleep(0.12)
+            done += 1
+        return {"status": "success", "n": done}
+
+    def render_result(self, result: dict) -> str:
+        return f"summary: n={result.get('n')}"
+
+
+async def wait_text_timed(pilot, status_id: str, needle: str, timeout=8.0) -> str:
+    """Like wait_text, but on wall-clock time — the stoppable fake sleeps for
+    real, so a fixed number of pauses is not enough."""
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        await pilot.pause()
+        try:
+            node = pilot.app.screen.query_one(status_id, Static)
+        except Exception:
+            continue
+        last = str(node.render())
+        if needle in last:
+            return last
+        await asyncio.sleep(0.02)
+    return last
+
+
+async def _wait_log(pilot, screen, needle: str, timeout=8.0) -> str:
+    deadline = time.monotonic() + timeout
+    text = ""
+    while time.monotonic() < deadline:
+        await pilot.pause()
+        text = log_text(screen)
+        if needle in text:
+            return text
+        await asyncio.sleep(0.02)
+    return text
+
+
+async def _start_stoppable(pilot, app):
+    app.push_screen(_FakeStoppableRunScreen(app.db_manager, _DummySettings()))
+    await pilot.pause()
+    await pilot.press("ctrl+r")  # arm confirmation
+    await wait_text(pilot, "#run-status", "ctrl+r again")
+    await pilot.press("ctrl+r")  # start
+    await pilot.pause()
+    return app.screen
+
+
+@pytest.mark.unit
+async def test_stop_control_hidden_until_run_starts(db_manager: DatabaseManager):
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(_FakeStoppableRunScreen(app.db_manager, _DummySettings()))
+        await pilot.pause()
+        assert app.screen.query_one("#run-stop", Button).display is False
+
+
+@pytest.mark.unit
+async def test_stop_via_enter_yields_partial_summary_and_reenables(
+    db_manager: DatabaseManager,
+):
+    """The owner interaction rule and the issue's e2e criterion in one pass:
+    focus lands on the visible Stop button when the run starts (so a bare
+    Enter stops it), a mid-run stop shows 'Stopping…', and the run ends with a
+    partial summary rendered like a completion — after which the screen is
+    re-enabled (single esc leaves)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _start_stoppable(pilot, app)
+        stop = screen.query_one("#run-stop", Button)
+        assert stop.display is True
+        assert app.focused is stop  # focus lands on the Stop control
+        await _wait_log(pilot, screen, "profile 1")
+
+        await pilot.press("enter")
+        status = await wait_text_timed(pilot, "#run-status", "Stopped at your request")
+        assert "Stopped at your request" in status
+        # The stop acknowledgement was logged when the request was made (the
+        # "Stopping…" status itself is transient — see the dedicated test).
+        assert "Stop requested — finishing the current profile" in log_text(screen)
+
+        # The partial summary renders like a normal completion (not an error)
+        # and its count matches the work actually done before the stop.
+        text = log_text(screen)
+        assert "summary: n=" in text
+        n = int(text.split("summary: n=")[1].split()[0])
+        assert n == text.count("profile ")
+        assert 0 < n < 40
+
+        # Screen re-enabled: run over, control hidden, a single esc leaves.
+        assert screen._run_done and not screen._run_active
+        assert stop.display is False
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is not screen
+
+
+@pytest.mark.unit
+async def test_request_stop_shows_stopping_status_and_disables_button(
+    db_manager: DatabaseManager,
+):
+    """The moment a stop is requested, the status flips to 'Stopping…' and the
+    button goes disabled (idempotent request) — read synchronously on the UI
+    thread, since the running loop replaces the status as soon as it observes
+    the flag."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _start_stoppable(pilot, app)
+        screen._request_stop()  # what Enter on the button and 's' dispatch to
+        status = str(screen.query_one("#run-status", Static).render())
+        assert "Stopping" in status
+        assert screen.query_one("#run-stop", Button).disabled is True
+        await wait_text_timed(pilot, "#run-status", "Stopped at your request")
+
+
+@pytest.mark.unit
+async def test_stop_via_s_accelerator(db_manager: DatabaseManager):
+    """The optional 's' accelerator requests the same stop as the button."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _start_stoppable(pilot, app)
+        await _wait_log(pilot, screen, "profile 1")
+        await pilot.press("s")
+        status = await wait_text_timed(pilot, "#run-status", "Stopped at your request")
+        assert "Stopped at your request" in status
+        assert "summary: n=" in log_text(screen)
+
+
+@pytest.mark.unit
+async def test_midrun_esc_warning_mentions_stop_control(
+    db_manager: DatabaseManager,
+):
+    """The first mid-run esc still warns that leaving does not stop the run,
+    and now points at the stop control (issue #43 acceptance criterion)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await _start_stoppable(pilot, app)
+        await pilot.press("escape")
+        status = await wait_text(pilot, "#run-status", "leaving does not stop it")
+        assert "leaving does not stop it" in status
+        assert "Stop" in status and "s)" in status
+        assert app.screen is screen  # first esc warns, does not leave
+
+
+@pytest.mark.unit
+async def test_execute_automate_maps_cancelled_to_partial_completion(
+    db_manager: DatabaseManager,
+):
+    """A 'cancelled' stopped_reason maps to the cancelled status and renders as
+    a partial completion — never the CAPTCHA safety-stop copy."""
+
+    class _Settings:
+        def get_automation_settings(self):
+            return {"search_limit": 10}
+
+    class _Fake:
+        async def search_and_connect(
+            self, campaign, limit, progress_callback=None, max_sends=None,
+            stop_event=None,
+        ):
+            return {
+                "sent": 2, "possibly_sent": 0, "failed": 0, "existing": 1,
+                "total_processed": 3, "scanned": 5, "stopped_reason": "cancelled",
+            }
+
+    screen = ExecuteCampaignScreen(db_manager, _Settings())
+    screen._selected = make_campaign(db_manager, name="Exec cancel")
+    result = await screen.automate(_Fake())
+    assert result["status"] == "cancelled"
+    text = screen.render_result(result)
+    assert "stopped at your request" in text
+    assert "Invites sent: 2" in text
+    assert "CAPTCHA" not in text
 
 
 # ── gating / selection on the real screens ──────────────────────────────────
