@@ -1,9 +1,9 @@
-"""Pure helper functions extracted from ``linkedin_cli.py``.
+"""Pure helper functions, shared by the TUI and the ``linkedin-run`` entry point.
 
-These have no dependency on an interactive terminal, a database, or a browser,
-so they are trivially unit-testable and covered under ``source = ["src"]``.
-``linkedin_cli.LinkedInCLI`` keeps thin static-method delegators to these so
-its existing call sites and public surface are unchanged.
+Originally extracted from the classic InquirerPy ``linkedin_cli.py`` (retired
+in the issue #47 cutover). These have no dependency on an interactive
+terminal, a database, or a browser, so they are trivially unit-testable and
+covered under ``source = ["src"]``.
 """
 
 import csv

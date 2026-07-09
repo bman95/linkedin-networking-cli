@@ -23,9 +23,9 @@ from __future__ import annotations
 
 from textual.theme import Theme
 
-# LinkedIn brand blue — the same constant the classic InquirerPy CLI brands with
-# (``BRAND_BLUE`` in ``linkedin_cli.py``). Kept identical for cross-surface
-# coherence, and pinned by ``test_brand_theme_is_active``.
+# LinkedIn brand blue — the same constant the classic InquirerPy CLI (retired,
+# issue #47) branded with (``BRAND_BLUE`` in the removed ``linkedin_cli.py``).
+# Kept identical for continuity, and pinned by ``test_brand_theme_is_active``.
 BRAND_BLUE = "#0A66C2"
 
 # One calm, dark theme. A light variant is an explicit later decision (see

@@ -12,7 +12,16 @@ Each item states **why**, a concrete **approach**, the **risk**, and the
 
 ---
 
-## 1. Cut over to a single UI (drop InquirerPy + `linkedin_cli.py`)
+## 1. Cut over to a single UI (drop InquirerPy + `linkedin_cli.py`)  ✅ *done (issue #47)*
+
+**Status.** Implemented: `linkedin_cli.py` and the InquirerPy dependency are
+gone; the TUI (`linkedin-tui`) is the sole interactive UI, and the
+non-interactive `run` path survives as its own `linkedin-run` entry point
+(`linkedin_run.py` / `src/cli/runner.py`). Two minor classic-only
+conveniences — the Check Connections "check all campaigns" loop and the
+standalone Settings location-lookup utility — were dropped rather than
+ported, each judged redundant with an equivalent already in the TUI; see
+`docs/tui-migration.md` §3/§4/§5 for the reasoning.
 
 **Why.** The migration doc's own cutover gate — every classic flow has a TUI
 equivalent at parity — is met. Each week both UIs coexist, behaviour drifts because
@@ -20,7 +29,8 @@ parity is maintained by hand-copying. The 2026-07-06 pass extracted the shared l
 (acceptance-rate, CSV, email masking, error mapping) into `src/cli/`, so the
 *duplication* is gone, but two presentation layers still have to be kept in step.
 
-**Approach.** Now that both UIs consume one shared core, the cutover is mechanical:
+**Approach** (as originally planned and then executed — see **Status** above).
+Now that both UIs consume one shared core, the cutover is mechanical:
 per flow, confirm the TUI screen matches the classic behaviour (the last known gap —
 the browser-bound online location search / custom-geoUrn entry in Create/Edit — was
 ported on 2026-07-07, see `campaign_form.py` + `tests/test_tui_location_search.py`),

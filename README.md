@@ -54,25 +54,39 @@ Automating interactions with LinkedIn may violate [LinkedIn's User Agreement and
 
 ## Usage
 
-Run the application:
+Launch the full-screen TUI:
 
 ```bash
-uv run linkedin_cli.py
+uv run linkedin_tui.py
 # or, via the installed entry point
-linkedin-cli
+linkedin-tui
 ```
 
-Navigate with the **arrow keys**, press **Enter** to select, and **Ctrl+C** to exit.
+Navigate with the **arrow keys**, press **Enter** to select, and **Esc** to go back (**q** to quit). The number keys **1**–**4** jump straight to a destination from the home screen, and `Ctrl+P` opens the command palette.
 
-From the main menu you can:
+From the home screen you can:
 
 - **Dashboard** – view aggregate campaign statistics and analytics.
 - **Create Campaign** – set up targeting (keywords, location, industry, connection degree).
-- **Manage Campaigns** – view details, toggle active/inactive, edit settings, or delete a campaign (all changes persisted to SQLite).
-- **Execute Campaign** – run the Playwright automation with rate limiting.
-- **Check Connections** – monitor pending and accepted connection status.
-- **Extract Profile Data** – pull detailed profile information.
+- **Manage Campaigns** – view a campaign's details and, per campaign, run the automation, check connection acceptances, edit settings, toggle active/inactive, export contacts to CSV, or delete it (all changes persisted to SQLite).
 - **Settings** – inspect credentials, browser, and rate-limit configuration.
+
+### Scheduled / headless runs
+
+For cron or a systemd timer, use the non-interactive entry point instead — it
+runs one campaign's search-and-connect pass without any prompts and exits with
+a process exit code a scheduler can alert on:
+
+```bash
+uv run linkedin_run.py --campaign "Tech Leads" [--max 5]
+# or, via the installed entry point
+linkedin-run --campaign "Tech Leads" [--max 5]
+```
+
+`--campaign` accepts either the campaign's numeric id or its name. `--max`
+caps invitations *sent* this run (default: the campaign's daily limit). All
+rate-limit, daily-cap and session logic is respected, and the command exits
+non-zero on failure — including a protective CAPTCHA/challenge stop.
 
 > **Note on connection messages:** LinkedIn restricts *personalized* invitation
 > notes to Premium accounts (free accounts get only a small monthly quota). When

@@ -1,8 +1,8 @@
 """Full-screen Textual TUI for the LinkedIn networking CLI.
 
-This is the new presentation layer (issue #24), built as a vertical slice that
-coexists with the existing InquirerPy ``linkedin_cli.py``. It reuses the
-UI-agnostic business logic under ``src/`` (database, config) as-is.
+This is the presentation layer (issue #24), the sole interactive UI since the
+issue #47 cutover retired the classic InquirerPy ``linkedin_cli.py``. It
+reuses the UI-agnostic business logic under ``src/`` (database, config) as-is.
 
 ``LinkedInTUI`` is exposed lazily (PEP 562): importing the package must NOT pull
 in ``.app`` eagerly. Both entry points (``linkedin_tui.py`` and ``python -m

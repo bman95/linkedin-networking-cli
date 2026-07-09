@@ -28,4 +28,4 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 # LINKEDIN_EMAIL and LINKEDIN_PASSWORD are read from the environment at runtime, e.g.:
 #   docker run --rm -it -e LINKEDIN_EMAIL=... -e LINKEDIN_PASSWORD=... linkedin-networking-cli
-CMD ["linkedin-cli"]
+CMD ["linkedin-tui"]

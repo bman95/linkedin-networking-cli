@@ -21,7 +21,6 @@ dependencies = [
     "sqlmodel>=0.0.14",
     "rich>=13.7.0",
     "pydantic>=2.5.0",
-    "inquirerpy>=0.3.4",
     "psutil>=5.9.0",
     "textual>=8.2.7",
 ]
@@ -43,8 +42,8 @@ dev = [
 ]
 
 [project.scripts]
-linkedin-cli = "linkedin_cli:main"
 linkedin-tui = "linkedin_tui:main"
+linkedin-run = "linkedin_run:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -54,7 +53,7 @@ build-backend = "hatchling.build"
 # The runtime modules live under src/ and are imported as top-level packages
 # (database, automation, config, utils, exceptions, tui). Map src/ to the wheel
 # root and ship the top-level entry points alongside them.
-only-include = ["src", "linkedin_cli.py", "linkedin_tui.py"]
+only-include = ["src", "linkedin_tui.py", "linkedin_run.py"]
 
 [tool.hatch.build.targets.wheel.sources]
 "src" = ""
@@ -69,7 +68,6 @@ addopts = [
     "-v",
     "--strict-markers",
     "--cov=src",
-    "--cov=linkedin_cli",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",
@@ -81,7 +79,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["src", "linkedin_cli"]
+source = ["src"]
 omit = [
     "*/tests/*",
     "*/__init__.py",
@@ -96,12 +94,10 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501", "F841", "B017"]
-# Legacy classic CLI: imports after logger setup + long lines. Retires with the
-# single-UI cutover (issue #47).
-"linkedin_cli.py" = ["E402", "E501"]
 # Logging must be configured before the app package imports (module docstrings).
 "src/tui/__main__.py" = ["E402"]
 "linkedin_tui.py" = ["E402"]
+"linkedin_run.py" = ["E402"]
 "tests/conftest.py" = ["E402"]
 # Generated half-block art data — single-line row strings by construction.
 "src/tui/screens/_mascot_large.py" = ["E501"]

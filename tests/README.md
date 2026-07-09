@@ -30,7 +30,9 @@ This test suite provides comprehensive coverage of the LinkedIn Networking CLI a
 - `test_settings.py` - Tests for application settings and configuration
 - `test_linkedin_automation.py` - Tests for LinkedIn automation with mocked Playwright
 - `test_navigation.py`, `test_interactions.py`, `test_selectors.py`, `test_scraping.py`, `test_diagnostics.py`, `test_checker.py` - Tests for automation sub-modules
-- `test_cli_helpers.py`, `test_cli_run_loops.py` - Tests for CLI helpers and run loops
+- `test_cli_helpers.py` - Tests for pure CLI helpers shared by the TUI and `linkedin-run`
+- `test_cli_automation_errors.py` - Tests for the shared typed-error mapping (`cli.automation_errors`)
+- `test_cli_run_command.py` - Tests for the non-interactive `linkedin-run` entry point
 - `test_tui*.py` - Tests for the Textual TUI screens
 - `conftest.py` - Shared fixtures and test configuration
 
@@ -127,8 +129,9 @@ tests/
 ├── __init__.py                      # Package initialization
 ├── conftest.py                      # Shared fixtures and configuration
 ├── test_checker.py                  # ~360 LOC, 24 tests
-├── test_cli_helpers.py              # ~80 LOC, 12 tests
-├── test_cli_run_loops.py            # ~350 LOC, 22 tests
+├── test_cli_automation_errors.py    # ~135 LOC, 16 tests
+├── test_cli_helpers.py              # ~90 LOC, 19 tests
+├── test_cli_run_command.py          # ~400 LOC, 28 tests
 ├── test_database_operations.py     # ~1,400 LOC, 88 tests
 ├── test_diagnostics.py              # ~570 LOC, 33 tests
 ├── test_interactions.py             # ~420 LOC, 25 tests

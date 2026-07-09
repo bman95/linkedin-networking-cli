@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a LinkedIn networking automation CLI built with Python. The application uses Playwright for web automation, SQLModel for database operations, and ships two coexisting user interfaces: the main InquirerPy-based CLI (`linkedin_cli.py`) and a full-screen Textual TUI (`src/tui/`, entry point `linkedin-tui`).
+This is a LinkedIn networking automation CLI built with Python. The application uses Playwright for web automation, SQLModel for database operations, and ships one interactive interface: a full-screen Textual TUI (`src/tui/`, entry point `linkedin-tui`). A separate non-interactive entry point (`linkedin_run.py`, installed as `linkedin-run`) runs a single campaign headlessly for cron/systemd-timer scheduling. The classic InquirerPy-based `linkedin_cli.py` menu was retired in the issue #47 single-UI cutover once every flow reached TUI parity.
 
 ## Essential Commands
 
@@ -23,11 +23,13 @@ export LINKEDIN_PASSWORD="your-password"
 
 ### Running the Application
 ```bash
-# Main InquirerPy-based CLI
-uv run linkedin_cli.py
+# Full-screen TUI
+uv run linkedin_tui.py
+# or, via the installed entry point
+linkedin-tui
 
-# Project script
-linkedin-cli
+# Non-interactive, single-campaign run (cron/systemd-timer)
+linkedin-run --campaign <id-or-name> [--max N]
 ```
 
 ## Architecture Overview
@@ -45,8 +47,8 @@ linkedin-cli
 - Implements rate limiting, profile searching, and connection request automation
 
 **UI Layer**:
-- `linkedin_cli.py` - **Main application**: InquirerPy-based CLI with rich interactive menus
-- `src/tui/` - Full-screen **Textual** presentation layer (issue #24), entry point `linkedin-tui`. Coexists with the classic CLI and reuses the same business logic read-only. Design tokens live in `theme.py`, layout in `app.tcss`, screens under `screens/`. See `docs/tui-migration.md` for the migration plan and architecture invariants.
+- `src/tui/` - **Main application**: full-screen **Textual** presentation layer (issue #24), entry point `linkedin-tui`. The sole interactive UI (issue #47 retired the classic InquirerPy CLI once every flow reached parity). Design tokens live in `theme.py`, layout in `app.tcss`, screens under `screens/`. See `docs/tui-migration.md` for the migration history and architecture invariants.
+- `linkedin_run.py` / `src/cli/runner.py` - Non-interactive `linkedin-run` entry point: runs one campaign's search-and-connect pass without prompts, for cron/systemd-timer scheduling. `src/cli/` also holds `helpers.py`/`automation_errors.py`, pure logic shared with the TUI.
 
 **Configuration (`src/config/`)**:
 - `settings.py` - AppSettings class managing environment variables and app configuration
@@ -54,21 +56,21 @@ linkedin-cli
 
 ### Data Flow
 
-1. **Campaign Creation**: Users create campaigns with targeting criteria through InquirerPy forms
+1. **Campaign Creation**: Users create campaigns with targeting criteria through the TUI's forms
 2. **Automation Execution**: LinkedInAutomation class processes campaigns using Playwright
 3. **Data Storage**: All campaign data, contacts, and analytics stored in SQLite via SQLModel
-4. **Progress Tracking**: Real-time updates through InquirerPy interface with rich formatting
+4. **Progress Tracking**: Real-time updates streamed into the TUI's run log (or stdout for `linkedin-run`)
 
 ### Key Design Patterns
 
 - **Async Context Managers**: LinkedInAutomation uses `async with` pattern for resource management
-- **Menu-based Navigation**: InquirerPy menus for intuitive CLI interaction
+- **Keyboard-first Navigation**: Textual screens/lists/command palette for full-screen TUI interaction
 - **Database Sessions**: SQLModel sessions with proper cleanup using context managers
 - **Environment-based Configuration**: Settings loaded from environment variables with fallbacks
 
 ### Dependencies
 
-- **InquirerPy**: Primary CLI framework for interactive menus and forms
+- **Textual**: Full-screen TUI framework for the interactive presentation layer
 - **Playwright**: Web automation for LinkedIn interaction
 - **SQLModel**: Type-safe database operations with SQLite
 - **Rich**: Terminal formatting and progress display
@@ -114,5 +116,6 @@ teardowns), so a logged-out context never clobbers a still-good `session.json`.
 
 ### File Structure Context
 
-- `linkedin_cli.py` - Main entry point with InquirerPy-based CLI interface
+- `linkedin_tui.py` - Main entry point, launches the full-screen Textual TUI
+- `linkedin_run.py` - Non-interactive entry point for a single scheduled campaign run
 - Application data stored in user home directory under `.linkedin-networking-cli/`
