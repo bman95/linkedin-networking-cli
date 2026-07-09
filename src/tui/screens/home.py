@@ -246,6 +246,11 @@ class HomeSummary:
             # Campaigns and Execute screens.
             parts.append(f"{self.used_today} sent today")
             if self.active_limits is not None and len(self.active_limits) == 1:
-                parts.append(f"limit {self.active_limits[0]} (1 active campaign)")
+                limit = self.active_limits[0]
+                # Enforcement compares the global day count against this limit
+                # (used >= limit), so the exhausted state can be called out
+                # honestly here — a run started now would stop immediately.
+                reached = " — daily limit reached" if self.used_today >= limit else ""
+                parts.append(f"limit {limit} (1 active campaign){reached}")
         parts.append("ready" if self.db_ok else "database unavailable")
         return "  ·  ".join(parts)

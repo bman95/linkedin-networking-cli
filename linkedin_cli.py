@@ -82,6 +82,7 @@ from cli.helpers import (
     campaign_get_field,
     contacts_csv_filename,
     csv_value,
+    effective_daily_limit,
     mask_email,
     write_contacts_csv,
 )
@@ -1115,14 +1116,20 @@ class LinkedInCLI:
         # --max caps invitations SENT; the scan budget stays the interactive
         # flow's search_limit setting so repeat runs can skip past
         # already-contacted results instead of burning the cap on them.
+        automation_settings = self.settings.get_automation_settings()
+        # Default the cap through the shared effective-daily-limit rule — the
+        # same one in-run enforcement uses — so a campaign with an invalid
+        # daily_limit gets the env fallback rather than a 0/None cap that would
+        # silently send nothing (issue #46).
         max_sends = (
             max_invites
             if max_invites is not None
-            else self._campaign_get_field(campaign, "daily_limit", 20)
+            else effective_daily_limit(
+                self._campaign_get_field(campaign, "daily_limit", None),
+                automation_settings.get("daily_connection_limit", 20),
+            )
         )
-        search_limit = self.settings.get_automation_settings().get(
-            "search_limit", 100
-        )
+        search_limit = automation_settings.get("search_limit", 100)
 
         def progress_update(message: str) -> None:
             print(message, flush=True)

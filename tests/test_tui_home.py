@@ -61,6 +61,19 @@ def test_home_summary_line_single_active_campaign():
     ).line()
     assert "4 sent today" in line
     assert "limit 80 (1 active campaign)" in line
+    assert "daily limit reached" not in line
+
+
+@pytest.mark.unit
+def test_home_summary_line_single_active_campaign_at_cap():
+    """At/over the single active campaign's cap the exhausted state is called
+    out — enforcement (used >= limit) would stop a run started now."""
+    line = HomeSummary(
+        configured=True, campaigns=1, used_today=20,
+        active_limits=(20,), db_ok=True,
+    ).line()
+    assert "20 sent today" in line
+    assert "limit 20 (1 active campaign) — daily limit reached" in line
 
 
 @pytest.mark.unit
