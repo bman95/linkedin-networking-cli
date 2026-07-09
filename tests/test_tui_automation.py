@@ -17,7 +17,7 @@ import threading
 import time
 
 import pytest
-from textual.widgets import Button, Input, ListView, RichLog, Select, Static
+from textual.widgets import Button, ListView, RichLog, Static
 
 from database.operations import DatabaseManager
 from exceptions import (
@@ -26,7 +26,7 @@ from exceptions import (
     RateLimitExceededException,
     SelectorNotFoundException,
 )
-from tui.app import CampaignDetailScreen, ExtractProfilesScreen, LinkedInTUI
+from tui.app import CampaignDetailScreen, LinkedInTUI
 from tui.screens.automation_errors import describe_automation_error
 from tui.screens.automation_run import AutomationRunScreen
 from tui.screens.campaign_detail import (
@@ -1080,32 +1080,16 @@ async def test_detail_connect_automate_maps_and_uses_search_limit(
         assert result["status"] == "success"
 
 
-# ── gating / selection on the remaining standalone screen (Extract) ─────────
+# ── gating on the standalone screen base (issue #44 removed the last
+# concrete example, ExtractProfilesScreen; the gate itself is generic to
+# AutomationRunScreen, so it's exercised via the _FakeRunScreen double) ──────
 
 
 @pytest.mark.unit
-async def test_extract_degraded_without_settings(db_manager: DatabaseManager):
+async def test_run_screen_degraded_without_settings(db_manager: DatabaseManager):
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app.push_screen(ExtractProfilesScreen(db_manager, None))
+        app.push_screen(_FakeRunScreen(db_manager, None))
         text = await wait_text(pilot, "#run-status", "unavailable")
         assert "unavailable" in text
-
-
-@pytest.mark.unit
-async def test_extract_manual_url_validation(db_manager: DatabaseManager):
-    app = LinkedInTUI(db_manager=db_manager)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app.push_screen(ExtractProfilesScreen(db_manager, _DummySettings()))
-        await wait_text(pilot, "#run-status", "Start")
-        screen = app.screen
-        screen.query_one("#run-mode", Select).value = "manual"
-
-        screen.query_one("#run-url", Input).value = "not-a-url"
-        assert screen.validate() is None  # rejected
-
-        screen.query_one("#run-url", Input).value = "https://www.linkedin.com/in/jane"
-        summary = screen.validate()
-        assert summary is not None and "profile" in summary.lower()
