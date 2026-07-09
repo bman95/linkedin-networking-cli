@@ -260,37 +260,51 @@ async def test_dashboard_recent_orders_and_truncates(db_manager: DatabaseManager
 
 
 @pytest.mark.unit
-async def test_dashboard_used_today_states(db_manager: DatabaseManager, monkeypatch):
-    """The 'Used Today' card colours by quota and degrades to — when missing."""
+async def test_dashboard_week_usage_states(db_manager: DatabaseManager, monkeypatch):
+    """The 'Used This Week' card colours by the weekly budget and degrades to —.
+
+    The tile tracks the weekly invitation budget — LinkedIn's actually-binding
+    constraint — not the DAILY_CONNECTION_LIMIT env fallback (issue #46).
+    """
     from textual.widgets import Static
 
+    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         await open_menu_item(pilot, "dashboard")
         screen = app.screen
         await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
-        used = screen.query_one("#value-used-today", Static)
-        # Default limit is 20 and usage is 0 -> "0/20", not warned.
-        assert card_value(screen, "used-today") == "0/20"
+        used = screen.query_one("#value-week-usage", Static)
+        # Default weekly budget is 100 and usage is 0 -> "0/100", not warned.
+        assert card_value(screen, "week-usage") == "0/100"
         assert "-warn" not in used.classes
 
-        # Simulate at-cap: re-populate with used == limit and assert the warn class.
+        # Simulate at-cap: re-populate with used == budget and assert the warn class.
         from tui.screens.dashboard import DashboardData
 
         screen._populate(
-            DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=20, daily_limit=20),
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=100, weekly_limit=100),
             None,
         )
-        assert card_value(screen, "used-today") == "20/20"
+        assert card_value(screen, "week-usage") == "100/100"
         assert "-warn" in used.classes
 
-        # Quota unavailable -> blank dash, neutral.
+        # A non-positive budget blocks every run (enforcement is used >= limit),
+        # so it must warn rather than render neutral.
         screen._populate(
-            DashboardData(stats={"total_campaigns": 1}, recent=[], used_today=None, daily_limit=None),
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=0, weekly_limit=0),
             None,
         )
-        assert card_value(screen, "used-today") == "—"
+        assert card_value(screen, "week-usage") == "0/0"
+        assert "-warn" in used.classes
+
+        # Budget unavailable -> blank dash, neutral.
+        screen._populate(
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=None, weekly_limit=None),
+            None,
+        )
+        assert card_value(screen, "week-usage") == "—"
         assert "-warn" not in used.classes
 
 
@@ -491,8 +505,11 @@ async def test_settings_status_not_configured(db_manager: DatabaseManager, monke
 
 
 @pytest.mark.unit
-async def test_settings_renders_rate_limiting_parity(db_manager: DatabaseManager):
+async def test_settings_renders_rate_limiting_parity(
+    db_manager: DatabaseManager, monkeypatch
+):
     """Rate-limiting labels match the classic CLI vocabulary."""
+    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -501,8 +518,14 @@ async def test_settings_renders_rate_limiting_parity(db_manager: DatabaseManager
         await wait_for_status(pilot, screen, "#settings-status", "Read-only")
         limits = str(screen.query_one("#body-limits", Static).render())
         assert "Connection Delay:" in limits
-        assert "Daily Connection Limit:" in limits
-        assert "Used Today:" in limits  # db_manager present -> usage line shown
+        # The env value is only the per-campaign fallback and must be labelled
+        # as such; the weekly budget is the binding constraint (issue #46).
+        assert "Default Daily Limit (fallback when a campaign sets none):" in limits
+        assert "Daily Connection Limit:" not in limits
+        assert "Weekly Invitation Limit: 100" in limits
+        assert "Used Today: 0" in limits  # db_manager present -> usage shown
+        assert "Used This Week: 0/100" in limits
+        assert "Used Today: 0/" not in limits  # never "used/env-fallback"
         assert "Search Limit:" in limits
 
 

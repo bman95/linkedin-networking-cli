@@ -16,7 +16,7 @@ populate step bails if the screen was detached.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 
 from rich.text import Text
 from textual import work
@@ -47,8 +47,8 @@ class DashboardData:
 
     stats: dict
     recent: list[tuple]  # (name: Text, status, sent, accepted, rate) — ready for add_row
-    used_today: int | None
-    daily_limit: int | None
+    used_week: int | None
+    weekly_limit: int | None
 
 
 class DashboardScreen(BaseScreen):
@@ -80,7 +80,10 @@ class DashboardScreen(BaseScreen):
         ("success-rate", "Success Rate"),
         ("total-contacts", "Total Contacts"),
         ("pending", "Pending"),
-        ("used-today", "Used Today"),
+        # The weekly invitation budget is LinkedIn's actually-binding rate
+        # constraint; the daily cap is per-campaign, so a single global
+        # "used/limit" tile can only be honest at the weekly level (issue #46).
+        ("week-usage", "Used This Week"),
     )
 
     def __init__(self, db_manager: DatabaseManager | None) -> None:
@@ -126,7 +129,7 @@ class DashboardScreen(BaseScreen):
             stats = self._db_manager.get_dashboard_stats()
             campaigns = self._db_manager.get_campaigns(active_only=False)
             contacts = self._db_manager.get_contacts()
-            used_today, daily_limit = self._load_quota()
+            used_week, weekly_limit = self._load_week_budget()
         except Exception as exc:  # surface in-place, never crash the UI
             self.marshal_load(
                 app, generation, self._populate, None, f"Error loading dashboard: {exc}"
@@ -135,28 +138,29 @@ class DashboardScreen(BaseScreen):
 
         recent = self._recent_rows(campaigns, contacts)
         data = DashboardData(
-            stats=stats, recent=recent, used_today=used_today, daily_limit=daily_limit
+            stats=stats, recent=recent, used_week=used_week, weekly_limit=weekly_limit
         )
         self.marshal_load(app, generation, self._populate, data, None)
 
-    def _load_quota(self) -> tuple[int | None, int | None]:
-        """Today's connection usage and the configured daily limit.
+    def _load_week_budget(self) -> tuple[int | None, int | None]:
+        """This week's invitation usage and the weekly budget (issue #46).
 
-        ``AppSettings()`` touches the filesystem (it creates the app dir), so a
-        read-only/sandboxed home can fail; degrade to ``None`` rather than
-        crashing the whole dashboard, consistent with the app's startup posture.
-        Imported lazily so this module stays cheap to import.
+        The weekly budget is the actually-binding LinkedIn constraint
+        (DESIGN-PROPOSALS.md §4); the env daily value is only a per-campaign
+        fallback, so it is never shown as "the" limit. ``AppSettings()`` touches
+        the filesystem (it creates the app dir), so a read-only/sandboxed home
+        can fail; degrade to ``None`` rather than crashing the whole dashboard,
+        consistent with the app's startup posture. Imported lazily so this
+        module stays cheap to import.
         """
         try:
             from config.settings import AppSettings
 
-            used_today = self._db_manager.get_daily_connection_count(
-                date.today().isoformat()
-            )
-            daily_limit = AppSettings().get_automation_settings()["daily_connection_limit"]
-            return used_today, daily_limit
+            used_week = self._db_manager.get_weekly_connection_count()
+            weekly_limit = AppSettings().weekly_invitation_limit
+            return used_week, weekly_limit
         except Exception:
-            logger.debug("Could not resolve daily quota; omitting", exc_info=True)
+            logger.debug("Could not resolve weekly budget; omitting", exc_info=True)
             return None, None
 
     @staticmethod
@@ -254,15 +258,17 @@ class DashboardScreen(BaseScreen):
         self._value("total-contacts").update(str(s.get("total_contacts", 0)))
         self._value("pending").update(str(s.get("total_pending", 0)))
 
-        used_value = self._value("used-today")
-        if data.used_today is None or data.daily_limit is None:
-            used_value.update("—")
-            used_value.set_classes("stat-value")
+        week_value = self._value("week-usage")
+        if data.used_week is None or data.weekly_limit is None:
+            week_value.update("—")
+            week_value.set_classes("stat-value")
         else:
-            used_value.update(f"{data.used_today}/{data.daily_limit}")
-            # Warn when at/over the configured daily cap.
-            at_cap = data.daily_limit > 0 and data.used_today >= data.daily_limit
-            used_value.set_classes("stat-value -warn" if at_cap else "stat-value")
+            week_value.update(f"{data.used_week}/{data.weekly_limit}")
+            # Warn when at/over the weekly invitation budget — same comparison
+            # the automation enforces (used >= limit), so a non-positive budget
+            # (which blocks every run) warns instead of rendering neutral.
+            at_cap = data.used_week >= data.weekly_limit
+            week_value.set_classes("stat-value -warn" if at_cap else "stat-value")
 
     def _fill_recent(self, rows: list[tuple]) -> None:
         table = self.query_one("#dashboard-recent", DataTable)

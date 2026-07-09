@@ -38,7 +38,9 @@ class SettingsData:
     password_state: str
     browser: dict
     automation: dict
+    weekly_limit: int
     used_today: int | None
+    used_week: int | None
     paths: dict
 
 
@@ -115,14 +117,17 @@ class SettingsScreen(BaseScreen):
         automation = settings.get_automation_settings()
 
         used_today: int | None = None
+        used_week: int | None = None
         if self._db_manager is not None:
             try:
                 used_today = self._db_manager.get_daily_connection_count(
                     date.today().isoformat()
                 )
+                used_week = self._db_manager.get_weekly_connection_count()
             except Exception:
-                logger.debug("Could not read today's connection count", exc_info=True)
+                logger.debug("Could not read connection counts", exc_info=True)
                 used_today = None
+                used_week = None
 
         return SettingsData(
             credentials_status="Configured" if configured else "Not configured",
@@ -130,7 +135,9 @@ class SettingsScreen(BaseScreen):
             password_state="Set" if has_password else "Not set",
             browser=browser,
             automation=automation,
+            weekly_limit=settings.weekly_invitation_limit,
             used_today=used_today,
+            used_week=used_week,
             paths={
                 "app_dir": str(settings.app_dir),
                 "db_path": str(settings.db_path),
@@ -169,15 +176,22 @@ class SettingsScreen(BaseScreen):
         )
 
         a = data.automation
-        daily_limit = a.get("daily_connection_limit")
-        used_today_line = ""
+        # The per-campaign daily_limit is the enforced daily cap; the env value
+        # is only its fallback, so it is labelled as such and today's usage is
+        # never shown against it (issue #46). The weekly budget is LinkedIn's
+        # actually-binding constraint (DESIGN-PROPOSALS.md §4).
+        usage_lines = ""
         if data.used_today is not None:
-            used_today_line = f"Used Today: {data.used_today}/{daily_limit}\n"
+            usage_lines = f"Used Today: {data.used_today}\n"
+        if data.used_week is not None:
+            usage_lines += f"Used This Week: {data.used_week}/{data.weekly_limit}\n"
         self.query_one("#body-limits", Static).update(
             f"Connection Delay: {a.get('connection_delay_min')}-"
             f"{a.get('connection_delay_max')} seconds\n"
-            f"Daily Connection Limit: {daily_limit}\n"
-            f"{used_today_line}"
+            f"Default Daily Limit (fallback when a campaign sets none): "
+            f"{a.get('daily_connection_limit')}\n"
+            f"Weekly Invitation Limit: {data.weekly_limit}\n"
+            f"{usage_lines}"
             f"Inter-session Cooldown: {a.get('connection_cooldown')} seconds\n"
             f"Search Limit: {a.get('search_limit')}"
         )
