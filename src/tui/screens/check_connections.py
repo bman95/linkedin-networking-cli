@@ -106,17 +106,14 @@ class CheckConnectionsScreen(AutomationRunScreen):
                 contacts = self._db_manager.get_contacts_by_status(
                     cid, "sent"
                 ) + self._db_manager.get_contacts_by_status(cid, "possibly_sent")
-                newly = await automation.check_connection_status(
+                stats = await automation.check_connection_status(
                     contacts, self.progress, stop_event=self._stop_event
                 )
-                total_checked += len(contacts)
-                total_new += newly
-        # The direct checker reports only a count, so a stop during the LAST
-        # campaign's batch would otherwise read as a clean success — the flag
-        # itself is the source of truth for "the user asked to stop".
-        stopped = stopped or (
-            self._stop_event is not None and self._stop_event.is_set()
-        )
+                # Real per-contact counts, so a stopped batch reports only the
+                # contacts actually visited — never the whole worklist.
+                total_checked += stats.get("checked", 0)
+                total_new += stats.get("newly_accepted", 0)
+                stopped = stopped or bool(stats.get("stopped"))
         return {
             "status": "cancelled" if stopped else "success",
             "checked": total_checked,

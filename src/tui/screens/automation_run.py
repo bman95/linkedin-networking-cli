@@ -260,6 +260,9 @@ class AutomationRunScreen(BaseScreen):
         if not self._run_active or self._stop_requested or self._stop_event is None:
             return
         self._stop_requested = True
+        # A stop supersedes a pending leave warning: the status line it wrote
+        # is replaced below, so the armed second-esc must not survive it.
+        self._leave_confirming = False
         self._stop_event.set()
         stop = self.query_one("#run-stop", Button)
         stop.disabled = True
@@ -305,6 +308,13 @@ class AutomationRunScreen(BaseScreen):
             self._set_status("Stopped. Press esc to return.", "error")
             return
         status = (result or {}).get("status")
+        # A stop requested during the final profile can race the loop's own
+        # flag check: the work finishes before the flag is observed and the
+        # body reports success. The user still asked to stop and saw
+        # "Stopping…", so honor the request — one policy for every screen.
+        if status == "success" and self._stop_requested:
+            result = dict(result or {}, status="cancelled")
+            status = "cancelled"
         if status == "login_failed":
             log.write("Login to LinkedIn failed — could not start the run.")
             self._set_status("Login failed. Press esc to return.", "error")

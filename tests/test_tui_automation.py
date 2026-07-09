@@ -367,6 +367,65 @@ async def test_midrun_esc_warning_mentions_stop_control(
 
 
 @pytest.mark.unit
+async def test_stop_racing_natural_completion_still_reports_cancelled(
+    db_manager: DatabaseManager,
+):
+    """A stop requested during the final profile can lose the race with the
+    loop's flag check — the body then reports success. The user asked to stop
+    and saw 'Stopping…', so _finish honors the request (one policy for every
+    run screen)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(_FakeStoppableRunScreen(app.db_manager, _DummySettings()))
+        await pilot.pause()
+        screen = app.screen
+        # A running screen mid-stop: the log is visible (as _begin_run leaves
+        # it) and the stop was requested but not observed by the loop.
+        screen.query_one("#run-log", RichLog).display = True
+        screen._run_active = True
+        screen._stop_requested = True
+        screen._finish({"status": "success", "n": 3}, None)
+        status = str(screen.query_one("#run-status", Static).render())
+        assert "Stopped at your request" in status
+        await pilot.pause()  # let the RichLog render the summary line
+        assert "summary: n=3" in log_text(screen)
+
+
+@pytest.mark.unit
+async def test_check_automate_direct_mode_uses_real_partial_counts(
+    db_manager: DatabaseManager,
+):
+    """Direct mode sums the checker's real per-contact counts, so a stopped
+    batch reports only the contacts actually visited — not the worklist size —
+    and maps the checker's stopped flag to the cancelled status."""
+    campaign = make_campaign(db_manager, name="Direct check")
+    for i in range(5):
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": f"Pending {i}",
+            "profile_url": f"https://www.linkedin.com/in/pending{i}/",
+            "status": "sent",
+        })
+
+    class _Fake:
+        async def check_connection_status(
+            self, contacts, progress_callback=None, stop_event=None
+        ):
+            assert len(contacts) == 5  # the whole worklist was handed over…
+            return {"checked": 2, "newly_accepted": 1, "failed": 0, "stopped": True}
+
+    screen = CheckConnectionsScreen(db_manager, _DummySettings())
+    screen._mode = "direct"
+    screen._target_ids = [campaign.id]
+    result = await screen.automate(_Fake())
+    assert result["status"] == "cancelled"
+    assert result["checked"] == 2  # …but only the visited count is reported
+    assert result["newly_accepted"] == 1
+    assert "stopped at your request" in screen.render_result(result)
+
+
+@pytest.mark.unit
 async def test_execute_automate_maps_cancelled_to_partial_completion(
     db_manager: DatabaseManager,
 ):

@@ -1333,15 +1333,18 @@ class LinkedInAutomation:
                             possibly_sent_count += 1
                         # Random delay between connections (mirrors the profile path).
                         # A possibly_sent may have refreshed the browser, so its
-                        # delay is a page-independent wall-clock sleep.
-                        delay = random.randint(
-                            automation_settings["connection_delay_min"],
-                            automation_settings["connection_delay_max"],
-                        )
-                        if result.outcome == "sent":
-                            await self.page.wait_for_timeout(delay * 1000)
-                        else:
-                            await asyncio.sleep(delay)
+                        # delay is a page-independent wall-clock sleep. Skipped
+                        # once a stop was requested: the wait only humanizes the
+                        # NEXT action, which the stop cancels anyway (issue #43).
+                        if stop_event is None or not stop_event.is_set():
+                            delay = random.randint(
+                                automation_settings["connection_delay_min"],
+                                automation_settings["connection_delay_max"],
+                            )
+                            if result.outcome == "sent":
+                                await self.page.wait_for_timeout(delay * 1000)
+                            else:
+                                await asyncio.sleep(delay)
                         if (
                             result.total_today is not None
                             and result.total_today >= daily_limit
@@ -1786,14 +1789,17 @@ class LinkedInAutomation:
                     # the inter-connection delay is a wall-clock pause, so use
                     # asyncio.sleep when the page may be mid-refresh and
                     # page.wait_for_timeout otherwise (keeps existing behavior).
-                    delay = random.randint(
-                        automation_settings["connection_delay_min"],
-                        automation_settings["connection_delay_max"],
-                    )
-                    if result.outcome == "sent":
-                        await self.page.wait_for_timeout(delay * 1000)
-                    else:
-                        await asyncio.sleep(delay)
+                    # Skipped once a stop was requested: the wait only humanizes
+                    # the NEXT action, which the stop cancels anyway (issue #43).
+                    if stop_event is None or not stop_event.is_set():
+                        delay = random.randint(
+                            automation_settings["connection_delay_min"],
+                            automation_settings["connection_delay_max"],
+                        )
+                        if result.outcome == "sent":
+                            await self.page.wait_for_timeout(delay * 1000)
+                        else:
+                            await asyncio.sleep(delay)
                     # Check the persisted daily limit (cumulative across restarts).
                     if (
                         result.total_today is not None
@@ -1900,8 +1906,11 @@ class LinkedInAutomation:
                     # it never depends on a live page. A crash-shaped failure
                     # above may have left self.page None (a failed refresh), and
                     # the old page-based sleep would then throw AttributeError
-                    # out of this handler and abort the whole run.
-                    await asyncio.sleep(wait_seconds)
+                    # out of this handler and abort the whole run. Skipped once
+                    # a stop was requested — the backoff protects the NEXT
+                    # attempt, which the stop cancels anyway (issue #43).
+                    if stop_event is None or not stop_event.is_set():
+                        await asyncio.sleep(wait_seconds)
                 continue
 
         # Update campaign statistics
@@ -3152,8 +3161,13 @@ class LinkedInAutomation:
         contacts: list[Contact],
         progress_callback: Callable | None = None,
         stop_event: Any | None = None,
-    ) -> int:
-        """Check status of pending connection requests using enhanced checker"""
+    ) -> dict[str, int]:
+        """Check status of pending connection requests using enhanced checker.
+
+        Returns the checker's stats dict (``checked`` / ``newly_accepted`` /
+        ``failed``, plus ``stopped: True`` when a ``stop_event`` cut the walk
+        short — issue #43) so callers can report partial progress honestly.
+        """
         from .checker import check_specific_contacts
 
         if not self.is_authenticated:
@@ -3172,13 +3186,12 @@ class LinkedInAutomation:
         if not contact_ids:
             if progress_callback:
                 progress_callback("No pending connections to check")
-            return 0
+            return {"checked": 0, "newly_accepted": 0, "failed": 0}
 
         # Use the enhanced checker
-        stats = await check_specific_contacts(
+        return await check_specific_contacts(
             self, contact_ids, progress_callback, stop_event=stop_event
         )
-        return stats["newly_accepted"]
 
     async def smart_connection_checker(
         self,

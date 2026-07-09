@@ -1542,10 +1542,15 @@ class LinkedInCLI:
                                     self.db_manager.get_contacts_by_status(campaign.id, "sent")
                                     + self.db_manager.get_contacts_by_status(campaign.id, "possibly_sent")
                                 )
-                                stats = await automation.check_connection_status(
+                                checker_stats = await automation.check_connection_status(
                                     pending_contacts, progress_update
                                 )
-                                stats = {"checked": len(pending_contacts), "newly_accepted": stats}
+                                stats = {
+                                    "checked": len(pending_contacts),
+                                    "newly_accepted": checker_stats.get(
+                                        "newly_accepted", 0
+                                    ),
+                                }
 
                             total_stats["total_checked"] += stats.get("checked", 0)
                             total_stats["total_newly_accepted"] += stats.get("newly_accepted", 0)
@@ -1561,10 +1566,15 @@ class LinkedInCLI:
                                 self.db_manager.get_contacts_by_status(selected.id, "sent")
                                 + self.db_manager.get_contacts_by_status(selected.id, "possibly_sent")
                             )
-                            newly_accepted = await automation.check_connection_status(
+                            checker_stats = await automation.check_connection_status(
                                 pending_contacts, progress_update
                             )
-                            stats = {"checked": len(pending_contacts), "newly_accepted": newly_accepted}
+                            stats = {
+                                "checked": len(pending_contacts),
+                                "newly_accepted": checker_stats.get(
+                                    "newly_accepted", 0
+                                ),
+                            }
 
                         return {"status": "success", **stats}
 
