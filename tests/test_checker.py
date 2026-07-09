@@ -235,6 +235,30 @@ class TestCooperativeStop:
         automation.db_manager.update_contact.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_smart_checker_stop_during_scroll_is_responsive(self):
+        """A stop landing mid-scroll ends the walk within one scroll step —
+        the loading phase must not run out its full tens-of-seconds round."""
+        import threading
+
+        pending = [SimpleNamespace(id=1, name="Jane", profile_url="https://x/in/jane/")]
+        automation = _automation(pending=pending)
+        _set_limit(automation, None)
+        stop = threading.Event()
+
+        async def _press(key):
+            stop.set()  # the user presses Stop during the scroll phase
+
+        automation.page.keyboard.press = AsyncMock(side_effect=_press)
+
+        stats = await smart_connection_checker(automation, 1, stop_event=stop)
+
+        assert stats.get("stopped") is True
+        assert stats["checked"] == 0
+        # The very next poll observed the flag: one keypress, no card harvest.
+        assert automation.page.keyboard.press.await_count == 1
+        automation.page.query_selector_all.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_smart_checker_preset_stop_returns_partial_stats(self):
         import threading
 

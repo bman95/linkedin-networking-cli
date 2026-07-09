@@ -125,12 +125,17 @@ async def _check_connections_page(
     finish_process = False
 
     def _stop_requested() -> bool:
-        # Cooperative cancellation (issue #43): polled between profiles and at
-        # round boundaries only, so a per-profile DB update never tears mid-way.
+        # Cooperative cancellation (issue #43): polled between profiles, at
+        # round boundaries and between scroll steps — never inside a
+        # per-profile DB update, so contact writes never tear mid-way. The
+        # acknowledgement is emitted once, however often the poll runs.
         if stop_event is not None and stop_event.is_set():
-            stats["stopped"] = True
-            if progress_callback:
-                progress_callback("Stop requested — ending the check at a safe point")
+            if not stats.get("stopped"):
+                stats["stopped"] = True
+                if progress_callback:
+                    progress_callback(
+                        "Stop requested — ending the check at a safe point"
+                    )
             return True
         return False
 
@@ -172,16 +177,28 @@ async def _check_connections_page(
             break
         scroll_rounds += 1
 
-        # Scroll down to load more connections
+        # Scroll down to load more connections. A full scroll phase takes tens
+        # of seconds, and it is pure loading — no DB writes — so the stop flag
+        # is polled between keypresses and waits to keep cancellation
+        # responsive here too (issue #43); abandoning it mid-scroll tears
+        # nothing.
         for _ in range(random.randint(4, 6)):
+            if _stop_requested():
+                break
             if progress_callback:
                 progress_callback("Scrolling to load more connections...")
 
             for _ in range(random.randint(18, 24)):
+                if _stop_requested():
+                    break
                 await automation.page.keyboard.press("ArrowDown")
                 await automation.page.wait_for_timeout(random.randint(20, 40))
 
+            if _stop_requested():
+                break
             await automation.page.wait_for_timeout(random.randint(2000, 4000))
+        if _stop_requested():
+            break
 
         # Get connection elements
         connections = await automation.page.query_selector_all('[data-view-name="connections-list"]')
