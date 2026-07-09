@@ -1,7 +1,7 @@
 """Home launcher screen (issue #24).
 
 The entry screen sets the tone for the whole TUI: a curated brand masthead, a
-live one-line workspace summary (campaign count, today's quota, readiness), and a
+live one-line workspace summary (campaign count, today's activity, readiness), and a
 keyboard-first navigation list, plus a dim hint bar at the foot. The selection
 idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
@@ -172,22 +172,23 @@ class HomeScreen(WorkerGuardMixin, Screen):
         self.marshal_load(app, generation, self._populate, summary)
 
     def _gather(self, app: App) -> HomeSummary:
-        """Credential status, campaign count and today's quota — off the UI thread.
+        """Credential status, campaign count and today's activity — off the UI thread.
 
         ``AppSettings()`` writes to disk on construction, so it is built here in
         the worker; any failure degrades to a friendly summary rather than a crash.
         The DB is read off the captured ``app`` (never ``self.app``, which could
         raise if the screen were torn down mid-worker).
         """
+        from cli.helpers import effective_daily_limit
         from config.settings import AppSettings
 
         settings = AppSettings()
         configured = settings.validate_credentials()
         # The enforced daily cap is per-campaign (Campaign.daily_limit); the
         # DAILY_CONNECTION_LIMIT env value is only the fallback for campaigns
-        # without a valid positive limit (issue #46). Mirror the enforcement
-        # rule in LinkedInAutomation._effective_daily_limit.
-        fallback_limit = settings.get_automation_settings().get("daily_connection_limit")
+        # without a valid positive limit (issue #46). effective_daily_limit is
+        # the same rule LinkedInAutomation enforces with.
+        fallback_limit = settings.get_automation_settings()["daily_connection_limit"]
 
         db = app.db_manager
         if db is None:
@@ -196,11 +197,7 @@ class HomeScreen(WorkerGuardMixin, Screen):
         try:
             campaigns = db.get_campaigns(active_only=False)
             active_limits = tuple(
-                c.daily_limit
-                if isinstance(c.daily_limit, int)
-                and not isinstance(c.daily_limit, bool)
-                and c.daily_limit > 0
-                else fallback_limit
+                effective_daily_limit(c.daily_limit, fallback_limit)
                 for c in campaigns
                 if c.active
             )
@@ -240,17 +237,15 @@ class HomeSummary:
             noun = "campaign" if self.campaigns == 1 else "campaigns"
             parts.append(f"{self.campaigns} {noun}")
         if self.used_today is not None:
-            # The binding daily cap is per-campaign, so usage is shown against
-            # the active campaigns' limits — never the env fallback (issue #46).
+            # The binding daily cap is per-campaign — never the env fallback
+            # (issue #46). The count itself is global (the day counter has no
+            # campaign key), so a limit is quoted only when exactly one
+            # campaign is active and the pairing is unambiguous; with several,
+            # any aggregate (e.g. "80+20") would misread as a combined budget
+            # the global counter cannot honor. Per-campaign caps live on the
+            # Campaigns and Execute screens.
             parts.append(f"{self.used_today} sent today")
-            if self.active_limits:
-                limits = "+".join(str(limit) for limit in self.active_limits)
-                if len(self.active_limits) == 1:
-                    parts.append(f"limit {limits} (1 active campaign)")
-                else:
-                    parts.append(
-                        f"limits {limits} across "
-                        f"{len(self.active_limits)} active campaigns"
-                    )
+            if self.active_limits is not None and len(self.active_limits) == 1:
+                parts.append(f"limit {self.active_limits[0]} (1 active campaign)")
         parts.append("ready" if self.db_ok else "database unavailable")
         return "  ·  ".join(parts)

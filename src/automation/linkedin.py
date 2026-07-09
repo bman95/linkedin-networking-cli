@@ -51,6 +51,7 @@ from automation.navigation import (
     run_bounded,
     verify_listing_rendered,
 )
+from cli.helpers import effective_daily_limit
 from config.settings import AppSettings
 from database.models import Campaign, Contact, ContactStatus
 from database.operations import DatabaseManager
@@ -1414,15 +1415,14 @@ class LinkedInAutomation:
     def _effective_daily_limit(campaign, automation_settings) -> int:
         """The daily invitation cap actually enforced for this run.
 
-        The per-campaign ``daily_limit`` — the value shown and edited in the CLI —
-        is authoritative. It falls back to the ``DAILY_CONNECTION_LIMIT``
-        setting/env default only when the campaign carries no valid positive value
-        (so an unset/zeroed campaign still gets a sane cap).
+        Delegates to the shared ``cli.helpers.effective_daily_limit`` rule —
+        the same one display surfaces use — so what a run enforces can never
+        drift from what the UI shows (issue #46).
         """
-        campaign_limit = getattr(campaign, "daily_limit", None)
-        if isinstance(campaign_limit, int) and not isinstance(campaign_limit, bool) and campaign_limit > 0:
-            return campaign_limit
-        return automation_settings["daily_connection_limit"]
+        return effective_daily_limit(
+            getattr(campaign, "daily_limit", None),
+            automation_settings["daily_connection_limit"],
+        )
 
     def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
         """Warn (advisory only) when a prior run sent within the configured

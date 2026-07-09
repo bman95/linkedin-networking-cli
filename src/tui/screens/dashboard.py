@@ -83,7 +83,7 @@ class DashboardScreen(BaseScreen):
         # The weekly invitation budget is LinkedIn's actually-binding rate
         # constraint; the daily cap is per-campaign, so a single global
         # "used/limit" tile can only be honest at the weekly level (issue #46).
-        ("week-usage", "Sent This Week"),
+        ("week-usage", "Used This Week"),
     )
 
     def __init__(self, db_manager: DatabaseManager | None) -> None:
@@ -264,8 +264,10 @@ class DashboardScreen(BaseScreen):
             week_value.set_classes("stat-value")
         else:
             week_value.update(f"{data.used_week}/{data.weekly_limit}")
-            # Warn when at/over the weekly invitation budget.
-            at_cap = data.weekly_limit > 0 and data.used_week >= data.weekly_limit
+            # Warn when at/over the weekly invitation budget — same comparison
+            # the automation enforces (used >= limit), so a non-positive budget
+            # (which blocks every run) warns instead of rendering neutral.
+            at_cap = data.used_week >= data.weekly_limit
             week_value.set_classes("stat-value -warn" if at_cap else "stat-value")
 
     def _fill_recent(self, rows: list[tuple]) -> None:

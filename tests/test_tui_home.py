@@ -38,14 +38,17 @@ def test_home_summary_line_unconfigured():
 
 
 @pytest.mark.unit
-def test_home_summary_line_shows_active_campaign_limits():
+def test_home_summary_line_multiple_active_campaigns():
+    """With several active campaigns no limit is quoted: the day counter is
+    global, so any aggregate of per-campaign caps would misread as a combined
+    budget enforcement cannot honor."""
     line = HomeSummary(
         configured=True, campaigns=3, used_today=7,
         active_limits=(80, 20), db_ok=True,
     ).line()
     assert "3 campaigns" in line
     assert "7 sent today" in line
-    assert "limits 80+20 across 2 active campaigns" in line
+    assert "limit" not in line
     assert "ready" in line
     assert "7/" not in line  # never "used/env-fallback"
 

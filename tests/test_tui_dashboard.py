@@ -261,13 +261,14 @@ async def test_dashboard_recent_orders_and_truncates(db_manager: DatabaseManager
 
 @pytest.mark.unit
 async def test_dashboard_week_usage_states(db_manager: DatabaseManager, monkeypatch):
-    """The 'Sent This Week' card colours by the weekly budget and degrades to —.
+    """The 'Used This Week' card colours by the weekly budget and degrades to —.
 
     The tile tracks the weekly invitation budget — LinkedIn's actually-binding
     constraint — not the DAILY_CONNECTION_LIMIT env fallback (issue #46).
     """
     from textual.widgets import Static
 
+    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -287,6 +288,15 @@ async def test_dashboard_week_usage_states(db_manager: DatabaseManager, monkeypa
             None,
         )
         assert card_value(screen, "week-usage") == "100/100"
+        assert "-warn" in used.classes
+
+        # A non-positive budget blocks every run (enforcement is used >= limit),
+        # so it must warn rather than render neutral.
+        screen._populate(
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=0, weekly_limit=0),
+            None,
+        )
+        assert card_value(screen, "week-usage") == "0/0"
         assert "-warn" in used.classes
 
         # Budget unavailable -> blank dash, neutral.
@@ -495,8 +505,11 @@ async def test_settings_status_not_configured(db_manager: DatabaseManager, monke
 
 
 @pytest.mark.unit
-async def test_settings_renders_rate_limiting_parity(db_manager: DatabaseManager):
+async def test_settings_renders_rate_limiting_parity(
+    db_manager: DatabaseManager, monkeypatch
+):
     """Rate-limiting labels match the classic CLI vocabulary."""
+    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
