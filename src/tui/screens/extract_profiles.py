@@ -114,8 +114,14 @@ class ExtractProfilesScreen(AutomationRunScreen):
 
         extracted = 0
         failed = 0
+        stopped = False
         total = len(urls)
         for index, url in enumerate(urls):
+            # Cooperative cancellation (issue #43): between profiles only.
+            if self._stop_event is not None and self._stop_event.is_set():
+                self.progress("Stop requested — ending the extraction here.")
+                stopped = True
+                break
             self.progress(f"Extracting profile {index + 1}/{total}…")
             try:
                 data = await automation.extract_detailed_profile(url, self.progress)
@@ -127,7 +133,11 @@ class ExtractProfilesScreen(AutomationRunScreen):
                 extracted += 1
             else:
                 failed += 1
-        return {"status": "success", "extracted": extracted, "failed": failed}
+        return {
+            "status": "cancelled" if stopped else "success",
+            "extracted": extracted,
+            "failed": failed,
+        }
 
     def render_result(self, result: dict) -> str:
         if result.get("status") == "no_profiles":
@@ -136,8 +146,13 @@ class ExtractProfilesScreen(AutomationRunScreen):
         failed = result.get("failed", 0)
         total = extracted + failed
         rate = (extracted / total * 100) if total else 0.0
+        headline = (
+            "Extraction stopped at your request — partial results."
+            if result.get("status") == "cancelled"
+            else "Extraction complete."
+        )
         return (
-            "Extraction complete.\n"
+            f"{headline}\n"
             f"Profiles extracted: {extracted}\n"
             f"Failed: {failed}\n"
             f"Success rate: {rate:.1f}%"

@@ -20,14 +20,21 @@ async def smart_connection_checker(
     automation,  # LinkedInAutomation instance
     campaign_id: int,
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """
     Smart checker that monitors LinkedIn connections page to find newly accepted connections.
 
     This is the main function that should be called from your CLI.
 
+    ``stop_event`` (a ``threading.Event``-like flag, issue #43) is polled
+    between profiles; once set, the walk ends at the next safe point and the
+    partial stats carry ``"stopped": True``.
+
     Returns:
-        Dict with counts: {"checked": int, "newly_accepted": int, "updated": int}
+        Dict with counts: {"checked": int, "newly_accepted": int, "updated": int},
+        plus ``stopped: True`` after a stop request and ``truncated: True`` when
+        the scroll-rounds backstop cut the walk short.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -85,10 +92,13 @@ async def smart_connection_checker(
             automation,
             pending_contacts,
             limit_url,
-            progress_callback
+            progress_callback,
+            stop_event=stop_event,
         )
 
-        if progress_callback:
+        # A stopped walk already announced itself; a "completed" line on top
+        # would contradict the stop acknowledgement in the progress stream.
+        if progress_callback and not stats.get("stopped"):
             progress_callback(
                 f"Checker completed: {stats['newly_accepted']} newly accepted connections found"
             )
@@ -107,11 +117,27 @@ async def _check_connections_page(
     pending_contacts: list,
     limit_url: str | None,
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """Check the connections page and update database for newly accepted connections."""
 
     stats = {"checked": 0, "newly_accepted": 0, "updated": 0}
     finish_process = False
+
+    def _stop_requested() -> bool:
+        # Cooperative cancellation (issue #43): polled between profiles, at
+        # round boundaries and between scroll steps — never inside a
+        # per-profile DB update, so contact writes never tear mid-way. The
+        # acknowledgement is emitted once, however often the poll runs.
+        if stop_event is not None and stop_event.is_set():
+            if not stats.get("stopped"):
+                stats["stopped"] = True
+                if progress_callback:
+                    progress_callback(
+                        "Stop requested — ending the check at a safe point"
+                    )
+            return True
+        return False
 
     # Create a lookup dict for faster searching
     pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
@@ -133,6 +159,8 @@ async def _check_connections_page(
     max_scroll_rounds = 40
 
     while not finish_process:
+        if _stop_requested():
+            break
         if scroll_rounds >= max_scroll_rounds:
             logger.warning(
                 "Connections walk hit the max scroll rounds backstop (%d) "
@@ -149,16 +177,28 @@ async def _check_connections_page(
             break
         scroll_rounds += 1
 
-        # Scroll down to load more connections
+        # Scroll down to load more connections. A full scroll phase takes tens
+        # of seconds, and it is pure loading — no DB writes — so the stop flag
+        # is polled between keypresses and waits to keep cancellation
+        # responsive here too (issue #43); abandoning it mid-scroll tears
+        # nothing.
         for _ in range(random.randint(4, 6)):
+            if _stop_requested():
+                break
             if progress_callback:
                 progress_callback("Scrolling to load more connections...")
 
             for _ in range(random.randint(18, 24)):
+                if _stop_requested():
+                    break
                 await automation.page.keyboard.press("ArrowDown")
                 await automation.page.wait_for_timeout(random.randint(20, 40))
 
+            if _stop_requested():
+                break
             await automation.page.wait_for_timeout(random.randint(2000, 4000))
+        if _stop_requested():
+            break
 
         # Get connection elements
         connections = await automation.page.query_selector_all('[data-view-name="connections-list"]')
@@ -170,6 +210,9 @@ async def _check_connections_page(
 
         new_this_round = 0
         for connection in connections:
+            if _stop_requested():
+                finish_process = True
+                break
             try:
                 # Get profile element
                 profile = await connection.query_selector('[data-view-name="connections-profile"]')
@@ -325,11 +368,14 @@ async def check_specific_contacts(
     automation,
     contact_ids: list[int],
     progress_callback: Callable | None = None,
+    stop_event: Any | None = None,
 ) -> dict[str, int]:
     """
     Check specific contacts by visiting their profiles directly.
 
     This is an alternative to the smart checker for checking specific contacts.
+    ``stop_event`` (issue #43) is polled between profiles; once set, the loop
+    ends at the next safe point and the partial stats carry ``"stopped": True``.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -337,6 +383,12 @@ async def check_specific_contacts(
     stats = {"checked": 0, "newly_accepted": 0, "failed": 0}
 
     for contact_id in contact_ids:
+        # Cooperative cancellation (issue #43): between profiles only.
+        if stop_event is not None and stop_event.is_set():
+            stats["stopped"] = True
+            if progress_callback:
+                progress_callback("Stop requested — ending the check at a safe point")
+            break
         try:
             # Get contact from database. "possibly_sent" (issue #31) is an
             # assumed-sent invite awaiting acceptance, so check it like "sent".
@@ -397,8 +449,10 @@ async def check_specific_contacts(
                 if progress_callback:
                     progress_callback(f"✅ {contact.name} accepted connection")
 
-            # Random delay between checks
-            await automation.page.wait_for_timeout(random.randint(2000, 4000))
+            # Random delay between checks — a pure humanization wait, skipped
+            # once a stop was requested (mirrors the send loops, issue #43).
+            if stop_event is None or not stop_event.is_set():
+                await automation.page.wait_for_timeout(random.randint(2000, 4000))
 
         except Exception as e:
             logger.error(f"Error checking contact {contact_id}: {e}")

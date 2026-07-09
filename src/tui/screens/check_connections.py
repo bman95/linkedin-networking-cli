@@ -88,26 +88,49 @@ class CheckConnectionsScreen(AutomationRunScreen):
     async def automate(self, automation) -> dict:
         total_checked = 0
         total_new = 0
+        stopped = False
         for cid in self._target_ids:
+            # Cooperative cancellation (issue #43): the campaign boundary is a
+            # safe point too, and the checkers poll the same flag per profile.
+            if self._stop_event is not None and self._stop_event.is_set():
+                stopped = True
+                break
             if self._mode == "smart":
-                stats = await automation.smart_connection_checker(cid, self.progress)
+                stats = await automation.smart_connection_checker(
+                    cid, self.progress, stop_event=self._stop_event
+                )
                 total_checked += stats.get("checked", 0)
                 total_new += stats.get("newly_accepted", 0)
+                stopped = stopped or bool(stats.get("stopped"))
             else:
                 contacts = self._db_manager.get_contacts_by_status(
                     cid, "sent"
                 ) + self._db_manager.get_contacts_by_status(cid, "possibly_sent")
-                newly = await automation.check_connection_status(contacts, self.progress)
-                total_checked += len(contacts)
-                total_new += newly
-        return {"status": "success", "checked": total_checked, "newly_accepted": total_new}
+                stats = await automation.check_connection_status(
+                    contacts, self.progress, stop_event=self._stop_event
+                )
+                # Real per-contact counts, so a stopped batch reports only the
+                # contacts actually visited — never the whole worklist.
+                total_checked += stats.get("checked", 0)
+                total_new += stats.get("newly_accepted", 0)
+                stopped = stopped or bool(stats.get("stopped"))
+        return {
+            "status": "cancelled" if stopped else "success",
+            "checked": total_checked,
+            "newly_accepted": total_new,
+        }
 
     def render_result(self, result: dict) -> str:
         checked = result.get("checked", 0)
         accepted = result.get("newly_accepted", 0)
         rate = (accepted / checked * 100) if checked else 0.0
+        headline = (
+            "Connection check stopped at your request — partial results."
+            if result.get("status") == "cancelled"
+            else "Connection check complete."
+        )
         return (
-            "Connection check complete.\n"
+            f"{headline}\n"
             f"Contacts checked: {checked}\n"
             f"Newly accepted: {accepted}\n"
             f"Acceptance rate: {rate:.1f}%"

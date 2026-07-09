@@ -5,6 +5,7 @@ Tests LinkedInAutomation class with mocked Playwright interactions.
 """
 
 import asyncio
+import threading
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -3892,6 +3893,225 @@ class TestSearchAndConnect:
 
         with pytest.raises(RuntimeError, match="boom"):
             await auto.search_and_connect(campaign, limit=10)
+
+
+@pytest.mark.unit
+class TestCooperativeCancellation:
+    """Issue #43: a stop request ends the run between profiles — the in-flight
+    send always completes, the loop stops at the next safe point, and the
+    normal partial summary comes back with ``stopped_reason == "cancelled"``
+    (daily counters and contact statuses stay consistent)."""
+
+    # Reuse the established harnesses rather than re-wiring them here.
+    _profiles = TestPersistedDailyCap._profiles
+    _wire_success_page = TestPersistedDailyCap._wire_success_page
+    _profile = staticmethod(TestSearchAndConnect._profile)
+    _wire = TestSearchAndConnect._wire
+
+    @pytest.mark.asyncio
+    async def test_preset_stop_sends_nothing(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A stop set before the loop starts sends nothing and never drives
+        the browser, but still returns the normal (all-zero) summary."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+        stop.set()
+        messages = []
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(3),
+                progress_callback=messages.append,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 0
+        assert result["total_processed"] == 0
+        assert result["stopped_reason"] == "cancelled"
+        assert not mock_linkedin_automation.page.goto.called
+        assert db.get_daily_connection_count(date.today().isoformat()) == 0
+        assert any("Stop requested" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_stop_between_profiles_returns_partial_summary(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A stop requested mid-run lets the in-flight send finish: with the
+        flag set during the 2nd send, exactly 2 go out, the persisted daily
+        count matches the summary, and the run reports 'cancelled'."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+        messages = []
+
+        def progress(message):
+            messages.append(str(message))
+            # The 2nd successful send reports "2/20 used today" — request the
+            # stop while that profile is still the one in flight.
+            if "2/20 used today" in str(message):
+                stop.set()
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(5),
+                progress_callback=progress,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 2
+        assert result["stopped_reason"] == "cancelled"
+        # DB consistent with the partial summary: exactly the sends that
+        # happened are counted, and nothing was rolled back or over-counted.
+        assert db.get_daily_connection_count(date.today().isoformat()) == 2
+        assert any("Stop requested" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_stop_skips_post_send_humanization_delay(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """Once the stop is requested, the post-send humanization delay is
+        skipped — it only shields the next action, which the stop cancels."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "77")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "77")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+
+        def progress(message):
+            # The 1st send reports "1/20 used today" from inside the attempt —
+            # the stop request lands before the post-send delay would run.
+            if "1/20 used today" in str(message):
+                stop.set()
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(3),
+                progress_callback=progress,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 1
+        assert result["stopped_reason"] == "cancelled"
+        # The 77s inter-connection wait (77000 ms) was never awaited.
+        delays = [
+            call.args[0]
+            for call in mock_linkedin_automation.page.wait_for_timeout.call_args_list
+        ]
+        assert 77000 not in delays
+
+    @pytest.mark.asyncio
+    async def test_cancellable_delay_ends_early_when_stop_lands_mid_wait(
+        self, mock_linkedin_automation
+    ):
+        """A stop landing while the wait is already running ends it within a
+        slice — the 300s failure backoff must never be waited out."""
+        stop = threading.Event()
+        task = asyncio.create_task(
+            mock_linkedin_automation._cancellable_delay(300, stop, page_based=False)
+        )
+        await asyncio.sleep(0.1)  # the wait is underway…
+        stop.set()  # …when the stop request lands
+        await asyncio.wait_for(task, timeout=5)  # returns promptly, not at 300s
+
+    @pytest.mark.asyncio
+    async def test_stop_mid_post_send_delay_ends_the_wait_early(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A stop landing during the post-send humanization sleep ends the
+        wait after the current slice instead of running out the full delay."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "77")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "77")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+
+        async def _wait(ms):
+            # The first 500ms slice of the sent-path delay is where the user's
+            # stop lands; every other wait in the flow passes through.
+            if ms == 500.0:
+                stop.set()
+
+        mock_linkedin_automation.page.wait_for_timeout = AsyncMock(side_effect=_wait)
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(3),
+                progress_callback=None,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 1
+        assert result["stopped_reason"] == "cancelled"
+        slices = [
+            call.args[0]
+            for call in mock_linkedin_automation.page.wait_for_timeout.call_args_list
+            if call.args and call.args[0] == 500.0
+        ]
+        assert len(slices) == 1  # one slice, then the flag ended the wait
+
+    @pytest.mark.asyncio
+    async def test_stop_ends_card_pass_and_skips_fallback(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """In search_and_connect, a stop set while the first card's send is in
+        flight ends the card pass before the next card and skips the
+        profile-page fallback — reported as 'cancelled', not a safety stop."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        # A no-control card first so the fallback pass would have work to do.
+        self._wire(
+            auto,
+            [(self._profile(0), "none")]
+            + [(self._profile(i), "connect") for i in (1, 2)],
+            monkeypatch,
+        )
+
+        stop = threading.Event()
+
+        async def _attempt(campaign, profile, button, progress_callback=None):
+            stop.set()  # the user presses Stop while this send is in flight
+            return ConnectResult("sent", total_today=1)
+
+        auto._attempt_connect = AsyncMock(side_effect=_attempt)
+        auto.send_connection_requests = AsyncMock()
+
+        messages = []
+        result = await auto.search_and_connect(
+            campaign, limit=10, progress_callback=messages.append, stop_event=stop
+        )
+
+        # The in-flight send completed (never interrupted mid-send)…
+        assert result["sent"] == 1
+        assert auto._attempt_connect.await_count == 1
+        # …the next card was never attempted, the fallback pass was skipped,
+        # and the summary reports the user stop, not a protective one.
+        auto.send_connection_requests.assert_not_called()
+        assert result["stopped_reason"] == "cancelled"
+        assert any("Stop requested" in m for m in messages)
 
 
 @pytest.mark.unit

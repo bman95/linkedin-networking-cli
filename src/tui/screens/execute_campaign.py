@@ -84,8 +84,16 @@ class ExecuteCampaignScreen(AutomationRunScreen):
         limit = self._settings.get_automation_settings().get("search_limit", 100)
         self.progress(f"Searching for up to {limit} targeted profiles…")
         results = await automation.search_and_connect(
-            self._selected, limit=limit, progress_callback=self.progress
+            self._selected,
+            limit=limit,
+            progress_callback=self.progress,
+            stop_event=self._stop_event,
         )
+        # A user-requested stop (issue #43) is a normal partial completion —
+        # checked first so it is never dressed up as a CAPTCHA safety stop.
+        if results.get("stopped_reason") == "cancelled":
+            results["status"] = "cancelled"
+            return results
         # A protective stop (inline CAPTCHA / challenge wall) must never be
         # reported as a clean run — checked before the empty-scan mapping so a
         # first-page CAPTCHA doesn't masquerade as "no profiles" (mirrors the
@@ -111,8 +119,13 @@ class ExecuteCampaignScreen(AutomationRunScreen):
             if result.get("possibly_sent", 0):
                 lines.append(f"Possibly sent: {result.get('possibly_sent', 0)}")
             return "\n".join(lines)
+        headline = (
+            "Run stopped at your request — partial results."
+            if result.get("status") == "cancelled"
+            else "Run complete."
+        )
         lines = [
-            "Run complete.",
+            headline,
             f"Profiles scanned: {result.get('scanned', 0)}",
             f"Invites sent: {result.get('sent', 0)}",
         ]

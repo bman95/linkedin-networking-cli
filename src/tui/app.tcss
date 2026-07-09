@@ -412,6 +412,31 @@ SelectOverlay > .option-list--option-highlighted {
     border: none;
 }
 
+/* The stop control (issue #43) — revealed only while a run is active and
+ * focused by default, so a bare Enter stops after the current profile. The
+ * same field idiom as the inputs (flat elevated panel, left accent rule that
+ * lights up brand-blue on focus) rather than Textual's chunky default button. */
+#run-stop {
+    width: auto;
+    height: 1;
+    min-width: 0;
+    margin: 0 4;
+    padding: 0 2;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel;
+    color: $text;
+    text-style: none;
+}
+#run-stop:focus {
+    border-left: thick $primary;
+    background: $panel-lighten-1;
+    text-style: bold;
+}
+#run-stop:disabled {
+    color: $text-muted;
+}
+
 /* ── Shared status-line semantics (forms, detail, automation) ─────────── */
 
 /* The status line carries validation / write / progress feedback in the

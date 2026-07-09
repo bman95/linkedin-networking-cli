@@ -351,3 +351,82 @@ class TestLocationSearchHardStop:
         assert result == []
         # Hard-stop: no "Press Enter to continue" wait added by this loop.
         assert confirm_count == 0
+
+
+@pytest.mark.unit
+class TestConnectionCheckerPartialCounts:
+    """The direct checker's summary must report contacts actually visited.
+
+    ``check_connection_status`` returns the checker's real stats (issue #43);
+    a walk cut short by a failure checks fewer contacts than were pending, and
+    the summary must not over-report with ``len(pending_contacts)``.
+    """
+
+    def _drive(self, selection):
+        cli = _cli_with_recording_console()
+        campaign = _FakeCampaign()
+
+        from types import SimpleNamespace
+
+        pending = [
+            SimpleNamespace(id=1, status="sent"),
+            SimpleNamespace(id=2, status="sent"),
+            SimpleNamespace(id=3, status="possibly_sent"),
+        ]
+
+        class _DB:
+            def get_campaigns(self, active_only=False):
+                return [campaign]
+
+            def get_contacts_by_status(self, campaign_id, status):
+                return [c for c in pending if c.status == status]
+
+        cli.db_manager = _DB()
+        cli.settings = _real_settings()
+
+        class _FakeAutomation:
+            """Checker that fails after visiting 1 of the 3 pending contacts."""
+
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def login(self, progress_callback=None):
+                return True
+
+            async def check_connection_status(
+                self, contacts, progress_callback=None, stop_event=None
+            ):
+                return {"checked": 1, "newly_accepted": 1, "failed": 1}
+
+        class _Prompt:
+            def __init__(self, value):
+                self._value = value
+
+            def execute(self):
+                return self._value
+
+        # First select -> campaign or "all"; second select -> direct checker.
+        select_values = iter([selection if selection == "all" else campaign, "direct"])
+
+        with patch.object(
+            linkedin_cli.inquirer,
+            "select",
+            side_effect=lambda *a, **k: _Prompt(next(select_values)),
+        ), patch.object(
+            linkedin_cli.inquirer, "confirm", side_effect=lambda *a, **k: _Prompt(True)
+        ), patch.object(linkedin_cli, "LinkedInAutomation", _FakeAutomation):
+            cli.connection_checker()
+
+        return _rendered(cli)
+
+    @pytest.mark.parametrize("selection", ["single", "all"])
+    def test_summary_reports_visited_count_not_pending_count(self, selection):
+        out = self._drive(selection)
+        assert "Contacts Checked: 1" in out  # the checker's real count…
+        assert "Contacts Checked: 3" not in out  # …never len(pending_contacts)
