@@ -123,6 +123,39 @@ class TestSearchParamsBuilding:
         # '&' should be encoded as %26
         assert "software%20%26%20data" in params
 
+    def test_build_search_params_percent_encodes_non_numeric_geo_urn(
+        self, mock_linkedin_automation
+    ):
+        """A malformed geoUrn cannot break out of the ["..."] wrapper or
+        smuggle extra query params into the search URL."""
+        campaign = Campaign(name="Test", geo_urn='90000084"]&evil=1&x=["')
+
+        params = mock_linkedin_automation._build_search_params(campaign)
+
+        assert "&evil=1" not in params
+        # The whole value was percent-encoded into the wrapper.
+        assert 'geoUrn=["90000084%22%5D%26evil%3D1%26x%3D%5B%22"]' in params
+
+    def test_build_search_params_percent_encodes_malformed_network(
+        self, mock_linkedin_automation
+    ):
+        """A network filter not matching the ["F","S"] shape is encoded whole."""
+        campaign = Campaign(name="Test", network='["F"]&evil=1')
+
+        params = mock_linkedin_automation._build_search_params(campaign)
+
+        assert "&evil=1" not in params
+        assert "network=%5B%22F%22%5D%26evil%3D1" in params
+
+    def test_build_search_params_keeps_wellformed_network(
+        self, mock_linkedin_automation
+    ):
+        campaign = Campaign(name="Test", network='["F","S"]')
+
+        params = mock_linkedin_automation._build_search_params(campaign)
+
+        assert 'network=["F","S"]' in params
+
 
 # ============================================================================
 # Profile Extraction Tests
@@ -2958,6 +2991,42 @@ class TestNavigationGuardWiring:
         playwright.stop.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_close_browser_writes_session_when_authenticated(
+        self, mock_linkedin_automation
+    ):
+        """An authenticated run persists session.json on close (CLAUDE.md:
+        persistent runs included, so a later transient run can resume)."""
+        ctx = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.is_authenticated = True
+        write = AsyncMock()
+        with patch.object(
+            mock_linkedin_automation, "_write_session_state", new=write
+        ):
+            await mock_linkedin_automation.close_browser()
+
+        write.assert_awaited_once_with(ctx)
+        ctx.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_close_browser_skips_session_write_when_not_authenticated(
+        self, mock_linkedin_automation
+    ):
+        """A crash-recovery/failed-login teardown must NOT clobber a still-good
+        session.json with a logged-out context's storage state."""
+        ctx = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.is_authenticated = False
+        write = AsyncMock()
+        with patch.object(
+            mock_linkedin_automation, "_write_session_state", new=write
+        ):
+            await mock_linkedin_automation.close_browser()
+
+        write.assert_not_awaited()
+        ctx.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_invite_flow_runs_under_run_bounded(self, mock_linkedin_automation):
         """The connect-click + modal-poll page work is bounded by run_bounded too.
 
@@ -3367,6 +3436,118 @@ class TestSearchAndConnect:
         # ...without any per-profile navigation or profile-page fallback.
         assert not auto.page.goto.called
         auto.send_connection_requests.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_max_sends_caps_invitations_sent(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """max_sends caps sends: with 3 connectable cards and max_sends=1, one
+        invitation goes out and the run stops (fallback included)."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(
+            auto,
+            [(self._profile(i), "connect") for i in range(3)],
+            monkeypatch,
+        )
+        auto._attempt_connect = AsyncMock(
+            return_value=ConnectResult("sent", total_today=1)
+        )
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10, max_sends=1)
+
+        assert result["sent"] == 1
+        assert auto._attempt_connect.await_count == 1
+        # The stop is total: no profile-page fallback after the cap.
+        auto.send_connection_requests.assert_not_called()
+        assert result["stopped_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_already_contacted_does_not_consume_send_budget(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """The --max regression: an already-contacted result card must not eat
+        the send budget — the next fresh card still gets its invitation."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        db = auto.db_manager
+        campaign = db.create_campaign({"name": "Cards"})
+        known, fresh = self._profile(0), self._profile(1)
+        # Profile 0 is already in the contact book from a prior run.
+        db.create_contact({
+            "campaign_id": campaign.id,
+            "name": known.name,
+            "profile_url": known.profile_url,
+            "status": "sent",
+        })
+        self._wire(auto, [(known, "connect"), (fresh, "connect")], monkeypatch)
+        attempt = AsyncMock(return_value=ConnectResult("sent", total_today=2))
+        auto._attempt_connect = attempt
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10, max_sends=1)
+
+        # The known contact was skipped without consuming the budget; the
+        # fresh profile still got the one allowed send.
+        assert result["existing"] == 1
+        assert result["sent"] == 1
+        assert attempt.await_count == 1
+        assert attempt.await_args.args[1] is fresh
+
+    @pytest.mark.asyncio
+    async def test_inline_captcha_sets_stopped_reason(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A results-page CAPTCHA is a safety stop, not an empty result: the
+        counters come back with stopped_reason='captcha' so callers (the `run`
+        subcommand) can exit non-zero instead of reporting 'no profiles'."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "connect")], monkeypatch)
+        # Override the _wire default: the results page shows a CAPTCHA.
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha",
+            AsyncMock(return_value=True),
+        )
+        auto._attempt_connect = AsyncMock()
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["stopped_reason"] == "captcha"
+        assert result["scanned"] == 0
+        auto._attempt_connect.assert_not_called()
+        auto.send_connection_requests.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fallback_receives_remaining_send_budget(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """The profile-page fallback is handed only what remains of max_sends."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Cards"})
+        self._wire(auto, [(self._profile(0), "none")], monkeypatch)
+        auto._attempt_connect = AsyncMock()
+        fallback = AsyncMock(
+            return_value={
+                "sent": 0, "possibly_sent": 0, "failed": 0,
+                "existing": 0, "total_processed": 0, "stopped_reason": None,
+            }
+        )
+        auto.send_connection_requests = fallback
+
+        await auto.search_and_connect(campaign, limit=10, max_sends=4)
+
+        fallback.assert_awaited_once()
+        assert fallback.await_args.kwargs["max_sends"] == 4
 
     @pytest.mark.asyncio
     async def test_card_possibly_sent_is_tallied_and_ends_card_pass(

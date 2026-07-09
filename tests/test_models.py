@@ -295,6 +295,7 @@ class TestContactStatusEnum:
         assert ContactStatus.RESERVED == "reserved"
         assert ContactStatus.SENT == "sent"
         assert ContactStatus.POSSIBLY_SENT == "possibly_sent"
+        assert ContactStatus.PENDING == "pending"
         assert ContactStatus.ACCEPTED == "accepted"
         assert ContactStatus.DECLINED == "declined"
         assert ContactStatus.FAILED == "failed"
@@ -331,6 +332,13 @@ class TestContactStatusEnum:
         """A pre-send reservation counts as neither sent nor pending."""
         assert ContactStatus.RESERVED not in SENT_STATUSES
         assert ContactStatus.RESERVED not in PENDING_STATUSES
+
+    def test_pending_excluded_from_sent_and_pending_groups(self):
+        """An invite discovered as already out (Pending button) was not sent by
+        this app's runs: it belongs to neither the sent totals nor the
+        acceptance-polling group."""
+        assert ContactStatus.PENDING not in SENT_STATUSES
+        assert ContactStatus.PENDING not in PENDING_STATUSES
 
     def test_contact_default_status_is_found_plain_string(self, db_session):
         """The Contact default is ContactStatus.FOUND, stored/read as "found"."""

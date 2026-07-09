@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
@@ -166,12 +167,19 @@ class CampaignFormScreen(BaseScreen):
     def _set_status(self, message: str, kind: str = "") -> None:
         status = self.query_one(self.STATUS_ID, Static)
         status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
+        # Text() renders literally: messages carry raw exception text and user
+        # input, whose square brackets must not be parsed as markup (a selector
+        # like locator([role='option']) would otherwise be silently swallowed).
+        status.update(Text(message))
 
     # ── dirty-form guard ──────────────────────────────────────────────────
 
     _SNAPSHOT_FIELDS = ("#field-name", "#field-description", "#field-keywords",
-                        "#field-daily", "#field-message")
+                        "#field-daily", "#field-message",
+                        # Conditional location inputs: a typed custom geoUrn or
+                        # search query is typed work too — esc must warn first.
+                        "#field-location-query", "#field-location-geourn",
+                        "#field-location-name")
     _SNAPSHOT_SELECTS = ("#field-location", "#field-network", "#field-industry")
 
     def _snapshot(self) -> tuple:
@@ -390,6 +398,10 @@ def read_form(screen: CampaignFormScreen) -> tuple[dict | None, tuple[str, str] 
         geo_urn = screen.query_one("#field-location-geourn", Input).value.strip()
         if not geo_urn:
             return None, ("Enter a geoUrn code for the custom location.",
+                          "#field-location-geourn")
+        # Mirror the classic CLI's validator: a geoUrn is a numeric code.
+        if not geo_urn.isdigit():
+            return None, ("geoUrn must be a numeric code.",
                           "#field-location-geourn")
         custom_name = screen.query_one("#field-location-name", Input).value.strip()
         location_display = custom_name or f"Custom Location ({geo_urn})"

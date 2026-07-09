@@ -105,9 +105,12 @@ and uses two complementary mechanisms, selected by how the browser launches:
 
 Only one mechanism is *read* per run (the persistent profile when present,
 otherwise `~/.linkedin-networking-cli/session.json`). Writing is not exclusive:
-`close_browser` and `login` always write `session.json` for the active context
-— persistent runs included — so a later transient run can resume a session a
-persistent run established.
+`login` writes `session.json` on a confirmed login, and `close_browser` writes
+it whenever the run confirmed an authenticated session (`is_authenticated`) —
+persistent runs included — so a later transient run can resume a session a
+persistent run established. `close_browser` deliberately *skips* the write when
+no authenticated session was confirmed (crash-recovery and failed-login
+teardowns), so a logged-out context never clobbers a still-good `session.json`.
 
 ### File Structure Context
 

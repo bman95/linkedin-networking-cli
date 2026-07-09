@@ -51,8 +51,11 @@ class _FakeDB:
         return list(self._campaigns)
 
 
-def _settings(valid=True):
-    return SimpleNamespace(validate_credentials=lambda: valid)
+def _settings(valid=True, search_limit=100):
+    return SimpleNamespace(
+        validate_credentials=lambda: valid,
+        get_automation_settings=lambda: {"search_limit": search_limit},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +97,13 @@ class TestMainDispatch:
         """--campaign is required; argparse exits non-zero."""
         with pytest.raises(SystemExit) as excinfo:
             linkedin_cli.main(["run"])
+        assert excinfo.value.code != 0
+
+    @pytest.mark.parametrize("bad_max", ["0", "-3", "two"])
+    def test_run_rejects_non_positive_max(self, bad_max):
+        """--max must be a positive integer; argparse exits non-zero."""
+        with pytest.raises(SystemExit) as excinfo:
+            linkedin_cli.main(["run", "--campaign", "1", "--max", bad_max])
         assert excinfo.value.code != 0
 
     def test_run_help_exits_zero(self):
@@ -164,10 +174,13 @@ class TestRunNoninteractive:
         assert rc != 0
 
     def test_invokes_core_with_campaign_and_explicit_max(self):
+        """--max caps invitations SENT (max_sends); the scan budget stays the
+        automation search_limit setting, so repeat scheduled runs can skip past
+        already-contacted results without burning the cap on them."""
         campaign = SimpleNamespace(id=7, name="Growth", daily_limit=20)
         cli = _bare_cli()
         cli.db_manager = _FakeDB([campaign])
-        cli.settings = _settings(valid=True)
+        cli.settings = _settings(valid=True, search_limit=100)
 
         cli._run_campaign_automation = MagicMock(name="core")
 
@@ -178,13 +191,15 @@ class TestRunNoninteractive:
             rc = cli.run_noninteractive("Growth", max_invites=3)
 
         assert rc == 0
-        cli._run_campaign_automation.assert_called_once_with(campaign, 3, ANY)
+        cli._run_campaign_automation.assert_called_once_with(
+            campaign, 100, ANY, max_sends=3
+        )
 
     def test_defaults_max_to_campaign_daily_limit(self):
         campaign = SimpleNamespace(id=7, name="Growth", daily_limit=12)
         cli = _bare_cli()
         cli.db_manager = _FakeDB([campaign])
-        cli.settings = _settings(valid=True)
+        cli.settings = _settings(valid=True, search_limit=50)
 
         cli._run_campaign_automation = MagicMock(name="core")
 
@@ -194,7 +209,36 @@ class TestRunNoninteractive:
             rc = cli.run_noninteractive("7")  # no --max
 
         assert rc == 0
-        cli._run_campaign_automation.assert_called_once_with(campaign, 12, ANY)
+        cli._run_campaign_automation.assert_called_once_with(
+            campaign, 50, ANY, max_sends=12
+        )
+
+    def test_safety_stop_exits_nonzero(self, capsys):
+        """A protective CAPTCHA/challenge stop must fail the scheduled run —
+        never exit 0 as if it were a clean 'no profiles' outcome."""
+        campaign = SimpleNamespace(id=7, name="Growth", daily_limit=12)
+        cli = _bare_cli()
+        cli.db_manager = _FakeDB([campaign])
+        cli.settings = _settings(valid=True)
+        cli._run_campaign_automation = MagicMock(name="core")
+
+        with patch.object(
+            linkedin_cli.asyncio,
+            "run",
+            side_effect=lambda coro: {
+                "status": "safety_stop",
+                "stopped_reason": "captcha",
+                "sent": 1,
+                "possibly_sent": 0,
+                "scanned": 4,
+                "profiles": 4,
+            },
+        ):
+            rc = cli.run_noninteractive("7")
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert "CAPTCHA" in err
 
     def test_login_failure_exits_nonzero(self):
         campaign = SimpleNamespace(id=7, name="Growth", daily_limit=12)

@@ -210,7 +210,8 @@ class DashboardScreen(BaseScreen):
         if error is not None:
             self._set_cards_blank()
             self.query_one("#dashboard-recent", DataTable).clear()
-            status.update(error)
+            # Literal render: raw exception text may contain markup-like brackets.
+            status.update(Text(error))
             return
 
         assert data is not None  # error is None ⇒ data is present

@@ -508,3 +508,60 @@ class TestSearchLoopDiagnosticsWiring:
         call = mock_anomaly.await_args
         assert call.args[1] == "search_page_no_profiles_extracted"
         assert call.kwargs["context"]["campaign"] == "Anomaly Test"
+
+
+# ============================================================================
+# Artifact retention pruning
+# ============================================================================
+
+@pytest.mark.unit
+class TestPruneBundles:
+    """_prune_bundles keeps only the newest _MAX_BUNDLES evidence bundles."""
+
+    @staticmethod
+    def _make_bundle(base: Path, stem: str, mtime: float) -> None:
+        import os
+
+        for ext in (".png", ".html"):
+            path = base / f"{stem}{ext}"
+            path.write_text("x")
+            os.utime(path, (mtime, mtime))
+
+    def test_evicts_oldest_bundles_beyond_cap(self, tmp_path):
+        from automation.diagnostics import _MAX_BUNDLES, _prune_bundles
+
+        total = _MAX_BUNDLES + 3
+        for i in range(total):
+            # Ascending mtimes: bundle_0 is the oldest.
+            self._make_bundle(tmp_path, f"error_bundle_{i:02d}", 1_000_000 + i)
+
+        newest = f"error_bundle_{total - 1:02d}"
+        _prune_bundles(tmp_path, protect_stem=newest)
+
+        stems = {p.stem for p in tmp_path.iterdir()}
+        assert len(stems) == _MAX_BUNDLES
+        # The oldest three were evicted (both files of each pair).
+        for i in range(3):
+            assert f"error_bundle_{i:02d}" not in stems
+        assert newest in stems
+
+    def test_protected_stem_survives_even_when_oldest(self, tmp_path):
+        from automation.diagnostics import _MAX_BUNDLES, _prune_bundles
+
+        protected = "error_being_written"
+        self._make_bundle(tmp_path, protected, 1_000_000)  # oldest of all
+        for i in range(_MAX_BUNDLES + 2):
+            self._make_bundle(tmp_path, f"anomaly_bundle_{i:02d}", 1_000_100 + i)
+
+        _prune_bundles(tmp_path, protect_stem=protected)
+
+        stems = {p.stem for p in tmp_path.iterdir()}
+        assert protected in stems
+
+    def test_ignores_unrelated_files(self, tmp_path):
+        from automation.diagnostics import _prune_bundles
+
+        keeper = tmp_path / "session.json"
+        keeper.write_text("{}")
+        _prune_bundles(tmp_path, protect_stem="none")
+        assert keeper.exists()

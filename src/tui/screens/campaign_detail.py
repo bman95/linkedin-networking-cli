@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -314,4 +315,6 @@ class CampaignDetailScreen(BaseScreen):
     def _set_status(self, message: str, kind: str = "") -> None:
         status = self.query_one("#detail-status", Static)
         status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
+        # Text() renders literally: messages carry campaign names and raw
+        # exception text, whose brackets must not be parsed as markup.
+        status.update(Text(message))

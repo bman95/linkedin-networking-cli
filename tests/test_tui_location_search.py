@@ -180,6 +180,22 @@ async def test_custom_geourn_requires_code(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_custom_geourn_requires_numeric_code(db_manager: DatabaseManager):
+    """Non-numeric geoUrn is rejected — same validator as the classic CLI."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        screen.query_one("#field-name", Input).value = "Bad code"
+        screen.query_one("#field-location", Select).value = CUSTOM_GEO
+        await pilot.pause()
+        screen.query_one("#field-location-geourn", Input).value = "not-a-code"
+        await pilot.press("ctrl+s")
+        await wait_status(pilot, "numeric")
+    assert db_manager.get_campaigns(active_only=False) == []
+
+
+@pytest.mark.unit
 async def test_edit_preserves_non_curated_location(db_manager: DatabaseManager):
     """Editing a campaign with a custom location keeps its geoUrn on save.
 

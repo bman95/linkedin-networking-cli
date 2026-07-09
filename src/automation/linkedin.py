@@ -52,7 +52,7 @@ from automation.navigation import (
     verify_listing_rendered,
 )
 from config.settings import AppSettings
-from database.models import Campaign, Contact
+from database.models import Campaign, Contact, ContactStatus
 from database.operations import DatabaseManager
 from exceptions import (
     CaptchaDetectedException,
@@ -1034,6 +1034,7 @@ class LinkedInAutomation:
         campaign: Campaign,
         limit: int = 100,
         progress_callback: Callable | None = None,
+        max_sends: int | None = None,
     ) -> dict[str, int]:
         """Search and connect from the result cards in a single pass.
 
@@ -1056,8 +1057,16 @@ class LinkedInAutomation:
         later (un-scanned) pages unprocessed; the wedged card itself and the
         no-control cards still get the profile-page fallback.
 
+        ``limit`` caps the *scan* (unique result cards examined); ``max_sends``,
+        when given, additionally caps the *invitations sent* this call (confirmed
+        + ambiguous sends), across both the card pass and the profile-page
+        fallback. The persisted daily/weekly caps still apply on top.
+
         Returns the same aggregate shape as :meth:`send_connection_requests`, plus
-        ``scanned`` (unique cards seen across the result pages).
+        ``scanned`` (unique cards seen across the result pages) and
+        ``stopped_reason`` (``"captcha"``/``"challenge"`` when the run was cut
+        short by an account-safety stop, else ``None``) so callers can tell a
+        protective stop apart from a clean empty result.
         """
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
@@ -1075,6 +1084,7 @@ class LinkedInAutomation:
         fallback_profiles: list[LinkedInProfile] = []
         scan_done = False  # stop walking result pages
         stop_all = False  # also skip the profile-page fallback pass
+        stopped_reason: str | None = None  # set on an account-safety stop
 
         # Inter-session cooldown notice (advisory; mirrors the profile path).
         self._emit_cooldown_notice(automation_settings, progress_callback)
@@ -1094,12 +1104,26 @@ class LinkedInAutomation:
                             "⚠️ CAPTCHA detected — stopping automation to protect "
                             "the account"
                         )
+                    stopped_reason = "captcha"
                     stop_all = True
                     break
                 # Card handles are valid only until the walk paginates, so act on
                 # every card on this page before letting the loop advance.
                 for profile, card in await self._extract_profile_cards():
                     url = profile.profile_url
+                    # Requested per-run send cap (the `run` subcommand's --max):
+                    # counts confirmed + ambiguous sends, NOT cards scanned, so
+                    # already-contacted results never consume the budget.
+                    if (
+                        max_sends is not None
+                        and sent_count + possibly_sent_count >= max_sends
+                    ):
+                        if progress_callback:
+                            progress_callback(
+                                f"Requested send cap reached ({max_sends} this run)"
+                            )
+                        scan_done = stop_all = True
+                        break
                     if len(seen_urls) >= limit:
                         scan_done = True
                         break
@@ -1124,6 +1148,10 @@ class LinkedInAutomation:
                     # send_connection_requests): stop cleanly before the next
                     # invite once the trailing-7-day total reaches the weekly
                     # budget, mirroring the daily-full stop for this loop.
+                    # Advisory read-check only — unlike the daily cap it is NOT
+                    # enforced atomically by the slot reserve, so concurrent
+                    # runs may each pass at limit-1 (bounded overshoot;
+                    # LinkedIn's own weekly cap is the backstop).
                     weekly_limit = self.settings.weekly_invitation_limit
                     weekly_count = self.db_manager.get_weekly_connection_count()
                     if weekly_count >= weekly_limit:
@@ -1182,7 +1210,7 @@ class LinkedInAutomation:
                             "headline": profile.headline,
                             "location": profile.location,
                             "company": profile.company,
-                            "status": "pending",
+                            "status": ContactStatus.PENDING.value,
                             "notes": "Already sent (found Pending button on card)",
                         }, protect_finalized=True)
                         existing_count += 1
@@ -1218,6 +1246,7 @@ class LinkedInAutomation:
                                 "⚠️ Challenge/login wall detected — stopping "
                                 "automation to protect the account"
                             )
+                        stopped_reason = "challenge"
                         scan_done = stop_all = True
                         break
                     except builtins.TimeoutError:
@@ -1318,13 +1347,24 @@ class LinkedInAutomation:
                         f"Visiting {len(fallback_profiles)} profile(s) without a card "
                         "Connect button..."
                     )
+                # Hand the fallback pass only what remains of the per-run send
+                # budget (None = uncapped, mirroring this pass).
+                remaining_sends = (
+                    max_sends - (sent_count + possibly_sent_count)
+                    if max_sends is not None
+                    else None
+                )
                 fb = await self.send_connection_requests(
-                    campaign, fallback_profiles, progress_callback
+                    campaign,
+                    fallback_profiles,
+                    progress_callback,
+                    max_sends=remaining_sends,
                 )
                 sent_count += fb["sent"]
                 possibly_sent_count += fb.get("possibly_sent", 0)
                 failed_count += fb["failed"]
                 existing_count += fb["existing"]
+                stopped_reason = stopped_reason or fb.get("stopped_reason")
 
             self.db_manager.update_campaign_stats(campaign.id)
             return {
@@ -1336,6 +1376,7 @@ class LinkedInAutomation:
                     sent_count + possibly_sent_count + failed_count + existing_count
                 ),
                 "scanned": len(seen_urls),
+                "stopped_reason": stopped_reason,
             }
 
         except (
@@ -1412,8 +1453,15 @@ class LinkedInAutomation:
         campaign: Campaign,
         profiles: list[LinkedInProfile],
         progress_callback: Callable | None = None,
+        max_sends: int | None = None,
     ) -> dict[str, int]:
-        """Send connection requests to profiles"""
+        """Send connection requests to profiles.
+
+        ``max_sends``, when given, caps the invitations sent this call
+        (confirmed + ambiguous sends) on top of the persisted daily/weekly
+        limits. The returned dict carries ``stopped_reason`` (``"captcha"``
+        when the run was cut short to protect the account, else ``None``).
+        """
 
         if not self.is_authenticated:
             raise NotAuthenticatedException("Not authenticated. Please login first.")
@@ -1426,6 +1474,7 @@ class LinkedInAutomation:
         possibly_sent_count = 0  # ambiguous sends that consumed a slot (issue #31)
         failed_count = 0
         existing_count = 0
+        stopped_reason: str | None = None  # set on an account-safety stop
 
         # Persisted, restart-safe daily cap. The count is keyed by the local
         # day, so quitting and reopening the CLI cannot blow past the limit,
@@ -1457,6 +1506,7 @@ class LinkedInAutomation:
                 "failed": 0,
                 "existing": 0,
                 "total_processed": 0,
+                "stopped_reason": None,
             }
 
         # Backoff state: repeated failures may signal a restricted account.
@@ -1467,6 +1517,18 @@ class LinkedInAutomation:
         for i, profile in enumerate(profiles):
             today = date.today().isoformat()
             try:
+                # Requested per-run send cap (see search_and_connect): counts
+                # confirmed + ambiguous sends, not profiles processed.
+                if (
+                    max_sends is not None
+                    and sent_count + possibly_sent_count >= max_sends
+                ):
+                    if progress_callback:
+                        progress_callback(
+                            f"Requested send cap reached ({max_sends} this run)"
+                        )
+                    break
+
                 # Recompute the local-day key each iteration so a run that
                 # crosses midnight starts a fresh bucket. The actual slot is
                 # claimed atomically just before sending (reserve-before-send),
@@ -1484,6 +1546,10 @@ class LinkedInAutomation:
                 # hitting the limit modal mid-run. Stop cleanly before the next
                 # invite once the trailing-7-day total has reached the budget —
                 # mirroring the daily-full stop (a plain break to the return).
+                # Advisory read-check only — unlike the daily cap it is NOT
+                # enforced atomically by the slot reserve, so concurrent runs
+                # may each pass at limit-1 (bounded overshoot; LinkedIn's own
+                # weekly cap is the backstop).
                 weekly_limit = self.settings.weekly_invitation_limit
                 weekly_count = self.db_manager.get_weekly_connection_count()
                 if weekly_count >= weekly_limit:
@@ -1577,6 +1643,7 @@ class LinkedInAutomation:
                         progress_callback(
                             "⚠️ CAPTCHA detected — stopping automation to protect the account"
                         )
+                    stopped_reason = "captcha"
                     break
 
                 if control_kind == "pending":
@@ -1588,7 +1655,7 @@ class LinkedInAutomation:
                         "headline": profile.headline,
                         "location": profile.location,
                         "company": profile.company,
-                        "status": "pending",
+                        "status": ContactStatus.PENDING.value,
                         "notes": "Already sent (found Pending button)",
                     }
                     # upsert + protect_finalized: the UniqueConstraint (#39) would
@@ -1784,6 +1851,7 @@ class LinkedInAutomation:
             "total_processed": (
                 sent_count + possibly_sent_count + failed_count + existing_count
             ),
+            "stopped_reason": stopped_reason,
         }
 
     async def _attempt_connect(

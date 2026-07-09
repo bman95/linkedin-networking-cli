@@ -137,7 +137,8 @@ class CampaignsScreen(BaseScreen):
         table.clear()
         status = self.query_one("#campaigns-status", Static)
         if error is not None:
-            status.update(error)
+            # Literal render: raw exception text may contain markup-like brackets.
+            status.update(Text(error))
             return
         for campaign in campaigns:
             table.add_row(

@@ -908,6 +908,15 @@ class LinkedInCLI:
                 self.console.print(
                     "[yellow]No profiles matched the campaign criteria. Review your filters and try again.[/yellow]"
                 )
+            elif status == "safety_stop":
+                sent = automation_result.get("sent", 0)
+                possibly_sent = automation_result.get("possibly_sent", 0)
+                self.console.print(
+                    "[red]Automation stopped early: LinkedIn presented a "
+                    "CAPTCHA/challenge. Resolve it in the browser before running "
+                    f"again. Progress so far was saved (sent {sent}, possibly "
+                    f"sent {possibly_sent}).[/red]"
+                )
             elif status == "success":
                 sent = automation_result.get("sent", 0)
                 possibly_sent = automation_result.get("possibly_sent", 0)
@@ -945,7 +954,9 @@ class LinkedInCLI:
 
         inquirer.confirm(message="Press Enter to continue...").execute()
 
-    async def _run_campaign_automation(self, campaign, search_limit, progress_update):
+    async def _run_campaign_automation(
+        self, campaign, search_limit, progress_update, max_sends=None
+    ):
         """Run one campaign's search-and-connect pass — the shared run core.
 
         Both the interactive Execute Campaign flow and the non-interactive
@@ -953,7 +964,10 @@ class LinkedInCLI:
         login, search, and all rate-limit/daily-cap/session behavior stay in the
         automation layer (card-first connect from the result cards, falling back
         to the profile-page path for cards with no Connect control — issue #25).
-        Returns the automation result dict with a ``status`` key.
+        ``search_limit`` caps the results scanned; ``max_sends`` (optional)
+        additionally caps the invitations sent this run. Returns the automation
+        result dict with a ``status`` key (``safety_stop`` when the run was cut
+        short by a CAPTCHA/challenge to protect the account).
         """
         async with LinkedInAutomation(self.db_manager, self.settings) as automation:
             progress_update("Launching browser and attaching to Chrome...")
@@ -965,8 +979,23 @@ class LinkedInCLI:
                 f"Searching for up to {search_limit} targeted profiles..."
             )
             results = await automation.search_and_connect(
-                campaign, limit=search_limit, progress_callback=progress_update
+                campaign,
+                limit=search_limit,
+                progress_callback=progress_update,
+                max_sends=max_sends,
             )
+
+            # A protective stop (inline CAPTCHA / challenge wall) must never be
+            # reported as a clean run — checked before the empty-scan mapping so
+            # a first-page CAPTCHA doesn't masquerade as "no profiles".
+            if results.get("stopped_reason"):
+                results.update(
+                    {
+                        "status": "safety_stop",
+                        "profiles": results.get("scanned", 0),
+                    }
+                )
+                return results
 
             if results.get("scanned", 0) == 0:
                 return {"status": "no_profiles", "profiles": 0}
@@ -1008,10 +1037,12 @@ class LinkedInCLI:
         """Execute a campaign without prompts — the ``run`` subcommand path.
 
         Resolves the campaign by id or name and drives the same automation as
-        the interactive flow via :meth:`_run_campaign_automation`, capped at
-        ``max_invites`` (default: the campaign's ``daily_limit``). Progress goes
-        to stdout; failures print to stderr. Returns a process exit code
-        (0 success, non-zero on any failure).
+        the interactive flow via :meth:`_run_campaign_automation`. The scan uses
+        the same ``search_limit`` setting as the interactive flow; invitations
+        *sent* are capped at ``max_invites`` (default: the campaign's
+        ``daily_limit``). Progress goes to stdout; failures print to stderr.
+        Returns a process exit code (0 success, non-zero on any failure —
+        including a protective CAPTCHA/challenge stop, so schedulers can alert).
         """
         if not self.db_manager or not self.settings:
             print(
@@ -1040,23 +1071,30 @@ class LinkedInCLI:
             return 1
 
         campaign_name = self._campaign_get_field(campaign, "name", "campaign")
-        search_limit = (
+        # --max caps invitations SENT; the scan budget stays the interactive
+        # flow's search_limit setting so repeat runs can skip past
+        # already-contacted results instead of burning the cap on them.
+        max_sends = (
             max_invites
             if max_invites is not None
             else self._campaign_get_field(campaign, "daily_limit", 20)
+        )
+        search_limit = self.settings.get_automation_settings().get(
+            "search_limit", 100
         )
 
         def progress_update(message: str) -> None:
             print(message, flush=True)
 
         progress_update(
-            f"Starting run for '{campaign_name}' (max {search_limit} invitations)..."
+            f"Starting run for '{campaign_name}' "
+            f"(up to {max_sends} invitations this run)..."
         )
 
         try:
             result = asyncio.run(
                 self._run_campaign_automation(
-                    campaign, search_limit, progress_update
+                    campaign, search_limit, progress_update, max_sends=max_sends
                 )
             )
         except Exception as exc:
@@ -1102,6 +1140,17 @@ class LinkedInCLI:
                 "No profiles matched the campaign criteria. Review the filters."
             )
             return 0
+        if status == "safety_stop":
+            sent = result.get("sent", 0)
+            possibly_sent = result.get("possibly_sent", 0)
+            print(
+                "Error: automation stopped early to protect the account "
+                "(CAPTCHA or challenge detected). Resolve the challenge in the "
+                f"browser before the next run. Progress so far was saved "
+                f"(sent {sent}, possibly sent {possibly_sent}).",
+                file=sys.stderr,
+            )
+            return 1
         print(f"Automation finished with status: {status}", file=sys.stderr)
         return 1
 
@@ -1673,6 +1722,14 @@ class LinkedInCLI:
         inquirer.confirm(message="Press Enter to continue...").execute()
 
 
+def _positive_int(value):
+    """argparse type for ``--max``: an integer >= 1."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def _build_parser():
     """Build the top-level argument parser.
 
@@ -1705,10 +1762,13 @@ def _build_parser():
     )
     run_parser.add_argument(
         "--max",
-        type=int,
+        type=_positive_int,
         default=None,
         metavar="N",
-        help="Cap on invitations this run (default: the campaign's daily_limit).",
+        help=(
+            "Cap on invitations sent this run "
+            "(default: the campaign's daily_limit)."
+        ),
     )
     return parser
 

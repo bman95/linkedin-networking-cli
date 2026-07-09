@@ -22,6 +22,9 @@ class ContactStatus(str, Enum):  # noqa: UP042 — str mix-in is the storage con
     - ``sent``: invitation confirmed sent.
     - ``possibly_sent``: ambiguous send after the irreversible click (#31);
       assumed sent (non-retryable).
+    - ``pending``: an invitation LinkedIn already shows as pending (a Pending
+      button found on the card/profile) — sent by an earlier run or manually,
+      not by this run.
     - ``accepted`` / ``declined``: terminal outcomes.
     - ``failed``: a clean, retryable send failure.
     """
@@ -30,6 +33,7 @@ class ContactStatus(str, Enum):  # noqa: UP042 — str mix-in is the storage con
     RESERVED = "reserved"
     SENT = "sent"
     POSSIBLY_SENT = "possibly_sent"
+    PENDING = "pending"
     ACCEPTED = "accepted"
     DECLINED = "declined"
     FAILED = "failed"
@@ -39,9 +43,12 @@ class ContactStatus(str, Enum):  # noqa: UP042 — str mix-in is the storage con
 # statistics (see DatabaseManager.get_dashboard_stats / update_campaign_stats).
 # ``possibly_sent`` (an assumed-sent invite that consumed a daily slot, #31)
 # counts as both sent and pending just like ``sent``; ``reserved`` (a pre-send
-# skip marker only, #39) is deliberately excluded from both. Because the members
-# are ``str`` values, these sets look up cleanly against the plain-string status
-# keys returned by a GROUP BY.
+# skip marker only, #39) is deliberately excluded from both. ``pending`` (an
+# invite discovered as already out, not sent by this app's runs) is likewise
+# excluded — its send predates the contact book, so it belongs to neither this
+# app's sent totals nor its acceptance polling. Because the members are ``str``
+# values, these sets look up cleanly against the plain-string status keys
+# returned by a GROUP BY.
 SENT_STATUSES = frozenset(
     {
         ContactStatus.SENT,

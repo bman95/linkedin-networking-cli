@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -279,4 +280,7 @@ class AutomationRunScreen(BaseScreen):
     def _set_status(self, message: str, kind: str = "") -> None:
         status = self.query_one("#run-status", Static)
         status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
+        # Text() renders literally: messages carry raw exception text and user
+        # data (campaign names), whose square brackets must not be parsed as
+        # markup — see automation_errors' plain-text contract.
+        status.update(Text(message))
