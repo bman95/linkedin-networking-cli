@@ -4,6 +4,7 @@ import os
 import platform
 import random
 import re
+import time
 import unicodedata
 import urllib.parse
 import uuid
@@ -1333,18 +1334,18 @@ class LinkedInAutomation:
                             possibly_sent_count += 1
                         # Random delay between connections (mirrors the profile path).
                         # A possibly_sent may have refreshed the browser, so its
-                        # delay is a page-independent wall-clock sleep. Skipped
-                        # once a stop was requested: the wait only humanizes the
-                        # NEXT action, which the stop cancels anyway (issue #43).
-                        if stop_event is None or not stop_event.is_set():
-                            delay = random.randint(
-                                automation_settings["connection_delay_min"],
-                                automation_settings["connection_delay_max"],
-                            )
-                            if result.outcome == "sent":
-                                await self.page.wait_for_timeout(delay * 1000)
-                            else:
-                                await asyncio.sleep(delay)
+                        # delay is a page-independent wall-clock sleep. The wait
+                        # is cancellable: it only humanizes the NEXT action,
+                        # which a stop cancels anyway (issue #43).
+                        delay = random.randint(
+                            automation_settings["connection_delay_min"],
+                            automation_settings["connection_delay_max"],
+                        )
+                        await self._cancellable_delay(
+                            delay,
+                            stop_event,
+                            page_based=result.outcome == "sent",
+                        )
                         if (
                             result.total_today is not None
                             and result.total_today >= daily_limit
@@ -1490,6 +1491,37 @@ class LinkedInAutomation:
                     f"⚠️ Cooldown active — last connection {int(elapsed)}s ago; "
                     f"wait {remaining}s before the next run"
                 )
+
+    async def _cancellable_delay(
+        self, seconds: float, stop_event: Any | None, *, page_based: bool
+    ) -> None:
+        """Humanization wait that ends early once a stop is requested (#43).
+
+        The inter-connection delays and the failure backoff are pure waits —
+        they shield the NEXT action, which a stop cancels — so a stop landing
+        mid-sleep must not run out the full wait (the backoff alone reaches
+        300s). With a ``stop_event`` the wait runs in short slices, polling
+        the flag between them; without one it degrades to the original single
+        blocking wait. ``page_based`` keeps the sent-path's page-driven
+        ``wait_for_timeout`` semantics; the wall-clock (asyncio) variant never
+        touches the page, for waits that must survive a dead/refreshing page.
+        """
+        if stop_event is None:
+            if page_based:
+                await self.page.wait_for_timeout(seconds * 1000)
+            else:
+                await asyncio.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while not stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            slice_s = min(0.5, remaining)
+            if page_based:
+                await self.page.wait_for_timeout(slice_s * 1000)
+            else:
+                await asyncio.sleep(slice_s)
 
     async def send_connection_requests(
         self,
@@ -1789,17 +1821,17 @@ class LinkedInAutomation:
                     # the inter-connection delay is a wall-clock pause, so use
                     # asyncio.sleep when the page may be mid-refresh and
                     # page.wait_for_timeout otherwise (keeps existing behavior).
-                    # Skipped once a stop was requested: the wait only humanizes
-                    # the NEXT action, which the stop cancels anyway (issue #43).
-                    if stop_event is None or not stop_event.is_set():
-                        delay = random.randint(
-                            automation_settings["connection_delay_min"],
-                            automation_settings["connection_delay_max"],
-                        )
-                        if result.outcome == "sent":
-                            await self.page.wait_for_timeout(delay * 1000)
-                        else:
-                            await asyncio.sleep(delay)
+                    # The wait is cancellable: it only humanizes the NEXT
+                    # action, which a stop cancels anyway (issue #43).
+                    delay = random.randint(
+                        automation_settings["connection_delay_min"],
+                        automation_settings["connection_delay_max"],
+                    )
+                    await self._cancellable_delay(
+                        delay,
+                        stop_event,
+                        page_based=result.outcome == "sent",
+                    )
                     # Check the persisted daily limit (cumulative across restarts).
                     if (
                         result.total_today is not None
@@ -1906,11 +1938,13 @@ class LinkedInAutomation:
                     # it never depends on a live page. A crash-shaped failure
                     # above may have left self.page None (a failed refresh), and
                     # the old page-based sleep would then throw AttributeError
-                    # out of this handler and abort the whole run. Skipped once
-                    # a stop was requested — the backoff protects the NEXT
-                    # attempt, which the stop cancels anyway (issue #43).
-                    if stop_event is None or not stop_event.is_set():
-                        await asyncio.sleep(wait_seconds)
+                    # out of this handler and abort the whole run. Cancellable:
+                    # the backoff protects the NEXT attempt, which a stop
+                    # cancels anyway, and it reaches 300s — a stop landing
+                    # mid-backoff must not wait it out (issue #43).
+                    await self._cancellable_delay(
+                        wait_seconds, stop_event, page_based=False
+                    )
                 continue
 
         # Update campaign statistics

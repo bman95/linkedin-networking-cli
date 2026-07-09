@@ -4016,6 +4016,61 @@ class TestCooperativeCancellation:
         assert 77000 not in delays
 
     @pytest.mark.asyncio
+    async def test_cancellable_delay_ends_early_when_stop_lands_mid_wait(
+        self, mock_linkedin_automation
+    ):
+        """A stop landing while the wait is already running ends it within a
+        slice — the 300s failure backoff must never be waited out."""
+        stop = threading.Event()
+        task = asyncio.create_task(
+            mock_linkedin_automation._cancellable_delay(300, stop, page_based=False)
+        )
+        await asyncio.sleep(0.1)  # the wait is underway…
+        stop.set()  # …when the stop request lands
+        await asyncio.wait_for(task, timeout=5)  # returns promptly, not at 300s
+
+    @pytest.mark.asyncio
+    async def test_stop_mid_post_send_delay_ends_the_wait_early(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A stop landing during the post-send humanization sleep ends the
+        wait after the current slice instead of running out the full delay."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "77")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "77")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        stop = threading.Event()
+
+        async def _wait(ms):
+            # The first 500ms slice of the sent-path delay is where the user's
+            # stop lands; every other wait in the flow passes through.
+            if ms == 500.0:
+                stop.set()
+
+        mock_linkedin_automation.page.wait_for_timeout = AsyncMock(side_effect=_wait)
+
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(3),
+                progress_callback=None,
+                stop_event=stop,
+            )
+
+        assert result["sent"] == 1
+        assert result["stopped_reason"] == "cancelled"
+        slices = [
+            call.args[0]
+            for call in mock_linkedin_automation.page.wait_for_timeout.call_args_list
+            if call.args and call.args[0] == 500.0
+        ]
+        assert len(slices) == 1  # one slice, then the flag ended the wait
+
+    @pytest.mark.asyncio
     async def test_stop_ends_card_pass_and_skips_fallback(
         self, mock_linkedin_automation, monkeypatch
     ):
