@@ -95,13 +95,15 @@ class TestEffectiveDailyLimit:
     def test_invalid_values_fall_back(self, invalid):
         assert effective_daily_limit(invalid, 20) == 20
 
-    def test_matches_automation_enforcement(self):
+    @pytest.mark.parametrize("stored", [80, 0, None])
+    def test_matches_automation_enforcement(self, stored):
         """Display surfaces and enforcement must share one rule — the
-        automation's _effective_daily_limit delegates to this helper."""
+        automation's _effective_daily_limit delegates to this helper, on the
+        binding case and on the fallback (invalid/unset) cases alike."""
         from automation.linkedin import LinkedInAutomation
 
-        campaign = SimpleNamespace(daily_limit=80)
+        campaign = SimpleNamespace(daily_limit=stored)
         settings = {"daily_connection_limit": 20}
         assert LinkedInAutomation._effective_daily_limit(
             campaign, settings
-        ) == effective_daily_limit(80, 20)
+        ) == effective_daily_limit(stored, 20)

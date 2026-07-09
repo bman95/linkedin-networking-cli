@@ -1063,8 +1063,10 @@ class LinkedInCLI:
         Resolves the campaign by id or name and drives the same automation as
         the interactive flow via :meth:`_run_campaign_automation`. The scan uses
         the same ``search_limit`` setting as the interactive flow; invitations
-        *sent* are capped at ``max_invites`` (default: the campaign's
-        ``daily_limit``). Progress goes to stdout; failures print to stderr.
+        *sent* are capped at ``max_invites`` (default: the campaign's effective
+        daily limit — its ``daily_limit``, or ``DAILY_CONNECTION_LIMIT`` when
+        the campaign has no valid positive value; the same shared rule
+        enforcement uses). Progress goes to stdout; failures print to stderr.
         Returns a process exit code (0 success, non-zero on any failure —
         including a protective CAPTCHA/challenge stop, so schedulers can alert).
         """
@@ -1821,8 +1823,9 @@ def _build_parser():
         default=None,
         metavar="N",
         help=(
-            "Cap on invitations sent this run "
-            "(default: the campaign's daily_limit)."
+            "Cap on invitations sent this run (default: the campaign's "
+            "daily_limit, falling back to DAILY_CONNECTION_LIMIT when the "
+            "campaign has no valid positive limit)."
         ),
     )
     return parser
