@@ -1246,7 +1246,11 @@ class LinkedInAutomation:
                                 "⚠️ Challenge/login wall detected — stopping "
                                 "automation to protect the account"
                             )
-                        stopped_reason = "challenge"
+                        stopped_reason = (
+                            "captcha"
+                            if isinstance(challenge, CaptchaDetectedException)
+                            else "challenge"
+                        )
                         scan_done = stop_all = True
                         break
                     except builtins.TimeoutError:
@@ -1341,19 +1345,24 @@ class LinkedInAutomation:
             # owns its own cap preamble, cooldown notice, per-item watchdogs and
             # backoff; the persisted cap is shared, so the passes can't jointly
             # exceed the daily limit.
-            if not stop_all and fallback_profiles:
+            # Hand the fallback pass only what remains of the per-run send
+            # budget (None = uncapped, mirroring this pass). An exactly-spent
+            # budget skips the fallback outright — nothing could be sent.
+            remaining_sends = (
+                max_sends - (sent_count + possibly_sent_count)
+                if max_sends is not None
+                else None
+            )
+            if (
+                not stop_all
+                and fallback_profiles
+                and (remaining_sends is None or remaining_sends > 0)
+            ):
                 if progress_callback:
                     progress_callback(
                         f"Visiting {len(fallback_profiles)} profile(s) without a card "
                         "Connect button..."
                     )
-                # Hand the fallback pass only what remains of the per-run send
-                # budget (None = uncapped, mirroring this pass).
-                remaining_sends = (
-                    max_sends - (sent_count + possibly_sent_count)
-                    if max_sends is not None
-                    else None
-                )
                 fb = await self.send_connection_requests(
                     campaign,
                     fallback_profiles,
@@ -1459,8 +1468,9 @@ class LinkedInAutomation:
 
         ``max_sends``, when given, caps the invitations sent this call
         (confirmed + ambiguous sends) on top of the persisted daily/weekly
-        limits. The returned dict carries ``stopped_reason`` (``"captcha"``
-        when the run was cut short to protect the account, else ``None``).
+        limits. The returned dict carries ``stopped_reason``
+        (``"captcha"``/``"challenge"`` when the run was cut short to protect
+        the account, else ``None``).
         """
 
         if not self.is_authenticated:
@@ -1772,6 +1782,14 @@ class LinkedInAutomation:
                         "⚠️ Challenge/login wall detected — stopping automation "
                         "to protect the account"
                     )
+                # Mark the protective stop so callers (the `run` subcommand,
+                # the TUI) never report this run as a clean success — mirrors
+                # the card pass's challenge handler.
+                stopped_reason = (
+                    "captcha"
+                    if isinstance(challenge, CaptchaDetectedException)
+                    else "challenge"
+                )
                 break
             except builtins.TimeoutError:
                 # The interaction watchdog fired: a wedged renderer exceeded the

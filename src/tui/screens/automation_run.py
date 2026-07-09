@@ -250,6 +250,15 @@ class AutomationRunScreen(BaseScreen):
             log.write("Login to LinkedIn failed — could not start the run.")
             self._set_status("Login failed. Press esc to return.", "error")
             return
+        if status == "safety_stop":
+            # A protective CAPTCHA/challenge stop: show the subclass's summary
+            # but never a green "Done." for a run cut short mid-flight.
+            log.write(self.render_result(result or {}))
+            self._set_status(
+                "Stopped early to protect the account. Press esc to return.",
+                "error",
+            )
+            return
         log.write(self.render_result(result or {}))
         self._set_status("Done. Press esc to return.", "good")
 

@@ -86,6 +86,13 @@ class ExecuteCampaignScreen(AutomationRunScreen):
         results = await automation.search_and_connect(
             self._selected, limit=limit, progress_callback=self.progress
         )
+        # A protective stop (inline CAPTCHA / challenge wall) must never be
+        # reported as a clean run — checked before the empty-scan mapping so a
+        # first-page CAPTCHA doesn't masquerade as "no profiles" (mirrors the
+        # classic CLI's _run_campaign_automation).
+        if results.get("stopped_reason"):
+            results["status"] = "safety_stop"
+            return results
         if results.get("scanned", 0) == 0:
             return {"status": "no_profiles"}
         results["status"] = "success"
@@ -94,6 +101,16 @@ class ExecuteCampaignScreen(AutomationRunScreen):
     def render_result(self, result: dict) -> str:
         if result.get("status") == "no_profiles":
             return "No profiles matched the campaign's criteria — nothing sent."
+        if result.get("status") == "safety_stop":
+            lines = [
+                "Automation stopped early: LinkedIn presented a "
+                "CAPTCHA/challenge.",
+                "Resolve it in the browser before running again.",
+                f"Invites sent before the stop: {result.get('sent', 0)}",
+            ]
+            if result.get("possibly_sent", 0):
+                lines.append(f"Possibly sent: {result.get('possibly_sent', 0)}")
+            return "\n".join(lines)
         lines = [
             "Run complete.",
             f"Profiles scanned: {result.get('scanned', 0)}",

@@ -1385,6 +1385,63 @@ class TestPersistedDailyCap:
         assert any("Daily connection limit reached" in m for m in messages)
 
     @pytest.mark.asyncio
+    async def test_max_sends_caps_profile_pass(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """max_sends caps sends inside the profile-page pass itself: with 5
+        profiles and max_sends=2, exactly two invitations go out."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+        self._wire_success_page(mock_linkedin_automation)
+
+        messages = []
+        with patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha", new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign,
+                self._profiles(5),
+                progress_callback=messages.append,
+                max_sends=2,
+            )
+
+        assert result["sent"] == 2
+        assert result["stopped_reason"] is None
+        assert any("Requested send cap reached" in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_challenge_wall_in_profile_pass_sets_stopped_reason(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A challenge wall during the profile pass is a safety stop: the run
+        ends without raising, but the result must carry stopped_reason so the
+        `run` subcommand never reports it as a clean success (exit 0)."""
+        from exceptions import CaptchaDetectedException
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        db = mock_linkedin_automation.db_manager
+        campaign = db.create_campaign({"name": "Test Campaign"})
+
+        async def _passthrough(awaitable, **kwargs):
+            return await awaitable
+
+        messages = []
+        with patch("automation.linkedin.navigate_guarded",
+                   new=AsyncMock(side_effect=CaptchaDetectedException("wall"))), \
+             patch("automation.linkedin.run_bounded",
+                   new=AsyncMock(side_effect=_passthrough)), \
+             patch("automation.linkedin.random_wait", new=AsyncMock()), \
+             patch("automation.interactions.detect_captcha",
+                   new=AsyncMock(return_value=False)):
+            result = await mock_linkedin_automation.send_connection_requests(
+                campaign, self._profiles(3), progress_callback=messages.append
+            )
+
+        assert result["stopped_reason"] == "captcha"
+        assert result["sent"] == 0
+        assert any("Challenge/login wall detected" in m for m in messages)
+
+    @pytest.mark.asyncio
     async def test_cooldown_warns_when_within_window(
         self, mock_linkedin_automation, monkeypatch
     ):
