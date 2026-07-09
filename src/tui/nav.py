@@ -58,12 +58,6 @@ def _create(app: App) -> None:
     app.push_screen(CreateCampaignScreen(app.db_manager))
 
 
-def _extract(app: App) -> None:
-    from .screens.extract_profiles import ExtractProfilesScreen
-
-    app.push_screen(ExtractProfilesScreen(app.db_manager, app.settings))
-
-
 def _settings(app: App) -> None:
     from .screens.settings_view import SettingsScreen
 
@@ -77,11 +71,6 @@ NAV_ITEMS: tuple[NavItem, ...] = (
             "Browse, run and manage your outreach campaigns", _campaigns),
     NavItem("create", "New Campaign",
             "Set up a new outreach campaign", _create),
-    # Palette-only (issue #42): running and checking moved onto the campaign
-    # detail screen, and extraction leaves the shrunk 4-item home but stays
-    # reachable from anywhere via ctrl+p.
-    NavItem("extract", "Extract Profile Data",
-            "Pull detailed public data from profiles", _extract, home=False),
     NavItem("settings", "Settings",
             "Credentials, browser, rate limits, data locations", _settings),
 )

@@ -63,7 +63,7 @@ side effects); write and automation flows follow.
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
 | Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail; smart checker only — the direct per-profile checker and "check all campaigns" remain classic-CLI-only) |
-| Extract Profile Data | `ExtractProfilesScreen` | `extract_detailed_profile` | browser, network | **done** (user-initiated run; palette-only since issue #42 — home shrank to Dashboard · Campaigns · New Campaign · Settings) |
+| Extract Profile Data | — | `extract_detailed_profile` | browser, network | **removed from the TUI (issue #44)** — pre-SDUI selectors, results weren't persisted; classic CLI (`linkedin_cli.py`) still has it. Pending the Voyager rework, see `DESIGN-PROPOSALS.md` §6 |
 | Exit | key binding (`q`) / command palette | — | — | done |
 
 ## 4. Flow-by-flow migration order, with rationale
@@ -88,7 +88,7 @@ side effects); write and automation flows follow.
    geoUrn/name inputs, and a stored non-curated location survives Edit via a
    display-name → geoUrn override map (see `campaign_form.py` and
    `tests/test_tui_location_search.py`).
-3. **Automation flows: Execute / Check Connections / Extract Profile Data (done).**
+3. **Automation flows: Execute / Check Connections (done); Extract Profile Data (removed from the TUI, issue #44).**
    The hardest slice: long-running async Playwright work with live in-place
    progress and credential gating. The pipeline — **gate → confirm → run
    (streaming log) → summary / error** — lives in a reusable
@@ -108,8 +108,10 @@ side effects); write and automation flows follow.
    **ACTIONS** list (Run now, Check acceptances, Edit, Activate/Deactivate,
    Export CSV, Delete) beside the embedded run panel, whose log fills the right
    half of the screen. `AutomationRunScreen` (`automation_run.py`) remains as
-   the screen-shaped host for flows that still need their own selection surface
-   (Extract Profile Data, reachable from the command palette).
+   the screen-shaped host for flows that need their own selection surface —
+   none currently (Extract Profile Data was removed from the TUI, issue #44;
+   see §3) — but it's kept for a future standalone flow and exercised
+   directly by tests.
 
    **Interaction design (owner rule, 2026-07-09): arrows + Enter first.** Every
    action is a visible, focusable element (list item or button); letter keys

@@ -136,6 +136,13 @@ extraction isn't actually used, delete the module.
 **Risk.** Low–medium. **Prerequisite.** Live profile DOM (or a decision to drop the
 feature).
 
+**Update (issue #44, 2026-07-09).** The TUI's `ExtractProfilesScreen` and its nav
+entry/palette command were removed — it burned detection-visible profile visits
+against selectors that already return empty fields silently, and discarded the
+results besides. The classic CLI's `extract_profile_data` flow is untouched, and
+`extract_detailed_profile` itself is untouched pending the decision above (fold
+into Voyager, or delete). The TUI entry can come back once this section resolves.
+
 ---
 
 ## 7. Make analytics an append-only event log; drop the denormalized aggregates
