@@ -3,11 +3,14 @@ Connection status monitoring and smart checking for LinkedIn automation.
 """
 
 import random
-from datetime import datetime, timezone
-from typing import List, Optional, Callable, Dict, Any
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from utils.logging import get_logger
-from .interactions import random_wait, scroll_down
+
 from .scraping import get_contact_info
 
 logger = get_logger(__name__)
@@ -16,8 +19,8 @@ logger = get_logger(__name__)
 async def smart_connection_checker(
     automation,  # LinkedInAutomation instance
     campaign_id: int,
-    progress_callback: Optional[Callable] = None,
-) -> Dict[str, int]:
+    progress_callback: Callable | None = None,
+) -> dict[str, int]:
     """
     Smart checker that monitors LinkedIn connections page to find newly accepted connections.
 
@@ -101,10 +104,10 @@ async def smart_connection_checker(
 
 async def _check_connections_page(
     automation,
-    pending_contacts: List,
-    limit_url: Optional[str],
-    progress_callback: Optional[Callable] = None,
-) -> Dict[str, int]:
+    pending_contacts: list,
+    limit_url: str | None,
+    progress_callback: Callable | None = None,
+) -> dict[str, int]:
     """Check the connections page and update database for newly accepted connections."""
 
     stats = {"checked": 0, "newly_accepted": 0, "updated": 0}
@@ -113,7 +116,39 @@ async def _check_connections_page(
     # Create a lookup dict for faster searching
     pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
 
+    # Every profile URL processed so far. A scroll round that surfaces no NEW
+    # profile is the true end of the list (whether the DOM accumulates cards
+    # or recycles them), giving the walk a natural terminator alongside the
+    # limit_url marker — and sparing already-updated contacts a duplicate pass.
+    seen_urls: set[str] = set()
+
+    # Backstop only: the natural terminators are the limit_url marker, the
+    # no-new-profiles detection above, and the short-page heuristic below. The
+    # cap exists so a pathological page that keeps feeding cards can't scroll
+    # forever; it is generous enough (hundreds of cards) that a real
+    # reconciliation reaches its marker or the list end first. A cap hit is
+    # flagged in the returned stats (``truncated``) so callers can tell it
+    # apart from a complete check.
+    scroll_rounds = 0
+    max_scroll_rounds = 40
+
     while not finish_process:
+        if scroll_rounds >= max_scroll_rounds:
+            logger.warning(
+                "Connections walk hit the max scroll rounds backstop (%d) "
+                "without reaching a stop marker or the end of the list; "
+                "results may be incomplete",
+                max_scroll_rounds,
+            )
+            if progress_callback:
+                progress_callback(
+                    "Reached maximum scroll rounds — stopping; the check may "
+                    "be incomplete"
+                )
+            stats["truncated"] = True
+            break
+        scroll_rounds += 1
+
         # Scroll down to load more connections
         for _ in range(random.randint(4, 6)):
             if progress_callback:
@@ -133,6 +168,7 @@ async def _check_connections_page(
                 progress_callback("No connections found on page, stopping...")
             break
 
+        new_this_round = 0
         for connection in connections:
             try:
                 # Get profile element
@@ -146,6 +182,13 @@ async def _check_connections_page(
 
                 # Clean the URL to match database format
                 profile_url = _clean_profile_url(profile_url)
+
+                # Already handled in an earlier round (the DOM keeps loaded
+                # cards around) — skip the duplicate pass.
+                if profile_url in seen_urls:
+                    continue
+                seen_urls.add(profile_url)
+                new_this_round += 1
 
                 # Check if this is a pending contact we're tracking
                 if profile_url in pending_lookup:
@@ -171,6 +214,12 @@ async def _check_connections_page(
                 logger.warning(f"Error processing connection element: {e}")
                 continue
 
+        if not finish_process and new_this_round == 0:
+            # A whole scroll round surfaced nothing new: the end of the list.
+            if progress_callback:
+                progress_callback("Reached end of connections list")
+            break
+
         if not finish_process and len(connections) < 10:
             # If we got fewer than 10 connections, we might be at the end
             if progress_callback:
@@ -183,37 +232,39 @@ async def _check_connections_page(
 async def _update_accepted_connection(
     automation,
     contact,
-    progress_callback: Optional[Callable] = None,
+    progress_callback: Callable | None = None,
 ) -> None:
     """Update contact in database as accepted and collect additional info."""
 
     try:
-        # Open the contact's profile to get additional info
+        # Open the contact's profile to get additional info. The tab is closed
+        # in the finally so a failure in goto/get_contact_info can't leak it.
         new_page = await automation.context.new_page()
-        await new_page.goto(contact.profile_url, timeout=30000)
-        await new_page.wait_for_timeout(random.randint(5000, 8000))
+        try:
+            await new_page.goto(contact.profile_url, timeout=30000)
+            await new_page.wait_for_timeout(random.randint(5000, 8000))
 
-        # Get updated contact info
-        contact_info = await get_contact_info(new_page)
+            # Get updated contact info
+            contact_info = await get_contact_info(new_page)
 
-        # Update the contact in database
-        update_data = {
-            "status": "accepted",
-            "connection_accepted_at": datetime.now(timezone.utc),
-        }
+            # Update the contact in database
+            update_data = {
+                "status": "accepted",
+                "connection_accepted_at": datetime.now(UTC),
+            }
 
-        # Add contact info if available
-        if contact_info.get("email"):
-            update_data["email"] = contact_info["email"]
-        if contact_info.get("phone"):
-            update_data["phone"] = contact_info["phone"]
-        if contact_info.get("address"):
-            update_data["notes"] = f"Address: {contact_info['address']}"
+            # Add contact info if available
+            if contact_info.get("email"):
+                update_data["email"] = contact_info["email"]
+            if contact_info.get("phone"):
+                update_data["phone"] = contact_info["phone"]
+            if contact_info.get("address"):
+                update_data["notes"] = f"Address: {contact_info['address']}"
 
-        # Update in database
-        automation.db_manager.update_contact(contact.id, update_data)
-
-        await new_page.close()
+            # Update in database
+            automation.db_manager.update_contact(contact.id, update_data)
+        finally:
+            await new_page.close()
 
         if progress_callback:
             progress_callback(f"✅ Updated {contact.name} as accepted connection")
@@ -232,6 +283,7 @@ def _get_connection_limit(db_manager, campaign_id: int):
         # Get the most recent accepted connection for this campaign
         with db_manager.get_session() as session:
             from sqlmodel import select
+
             from database.models import Contact
 
             recent_accepted = session.exec(
@@ -271,9 +323,9 @@ def _clean_profile_url(url: str) -> str:
 
 async def check_specific_contacts(
     automation,
-    contact_ids: List[int],
-    progress_callback: Optional[Callable] = None,
-) -> Dict[str, int]:
+    contact_ids: list[int],
+    progress_callback: Callable | None = None,
+) -> dict[str, int]:
     """
     Check specific contacts by visiting their profiles directly.
 
@@ -299,13 +351,26 @@ async def check_specific_contacts(
             await automation.page.goto(contact.profile_url, timeout=30000)
             await automation.page.wait_for_timeout(random.randint(3000, 5000))
 
-            # Check connection status
-            is_connected = await automation.page.is_visible(
-                "span:has-text('Connected'), "
-                ".pv-top-card__distance-badge:has-text('1st'), "
-                "button:has-text('Message')",
-                timeout=5000
-            )
+            # Check connection status. ``is_visible`` ignores ``timeout`` in
+            # the async API and returns immediately, so a slow-hydrating
+            # profile would be misread as not-connected; ``wait_for_selector``
+            # actually waits (timing out means not connected). The ES/EN text
+            # variants are co-equal locale primaries, mirroring the registry
+            # style in ``selectors.py``.
+            try:
+                await automation.page.wait_for_selector(
+                    "span:has-text('Connected'), "
+                    "span:has-text('Conectado'), "
+                    ".pv-top-card__distance-badge:has-text('1st'), "
+                    ".pv-top-card__distance-badge:has-text('1.º'), "
+                    "button:has-text('Message'), "
+                    "button:has-text('Enviar mensaje')",
+                    timeout=5000,
+                    state="visible",
+                )
+                is_connected = True
+            except PlaywrightTimeoutError:
+                is_connected = False
 
             stats["checked"] += 1
 
@@ -313,7 +378,7 @@ async def check_specific_contacts(
                 # Update as accepted
                 update_data = {
                     "status": "accepted",
-                    "connection_accepted_at": datetime.now(timezone.utc)
+                    "connection_accepted_at": datetime.now(UTC)
                 }
 
                 # Try to get contact info
@@ -345,11 +410,11 @@ async def check_specific_contacts(
 
 async def monitor_pending_connections(
     automation,
-    campaign_ids: List[int],
+    campaign_ids: list[int],
     check_interval_minutes: int = 60,
     max_iterations: int = 24,  # 24 hours if checking every hour
-    progress_callback: Optional[Callable] = None,
-) -> Dict[str, Any]:
+    progress_callback: Callable | None = None,
+) -> dict[str, Any]:
     """
     Continuously monitor pending connections for multiple campaigns.
 

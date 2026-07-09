@@ -12,8 +12,6 @@ flags make a double ``ctrl+s`` a no-op so a campaign can't be created twice.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -22,23 +20,26 @@ from textual.widgets import Static
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
-from .base import BaseScreen
-from .campaign_form import campaign_form_widgets, read_form
+from .campaign_form import CampaignFormScreen, campaign_form_widgets, read_form
 
 logger = get_logger(__name__)
 
 
-class CreateCampaignScreen(BaseScreen):
+class CreateCampaignScreen(CampaignFormScreen):
     """Form screen that creates a campaign, then writes it in a thread worker."""
 
     BINDINGS = [
-        ("escape", "app.pop_screen", "Back"),
+        # "back" (not app.pop_screen): the shared form owns esc so a dirty form
+        # warns before discarding (see CampaignFormScreen.action_back).
+        ("escape", "back", "Back"),
         # priority so ctrl+s fires even while an Input/Select holds focus.
         Binding("ctrl+s", "create", "Create", priority=True),
         ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Create Campaign"
+
+    STATUS_ID = "#create-status"
 
     HINTS = (
         ("ctrl+s", "create"),
@@ -47,7 +48,7 @@ class CreateCampaignScreen(BaseScreen):
         ("ctrl+p", "commands"),
     )
 
-    def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
+    def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
         self._db_manager = db_manager
         self._submitting = False
@@ -63,11 +64,9 @@ class CreateCampaignScreen(BaseScreen):
             return
         # Keyboard-first: land in the first field so a user can start typing.
         self.query_one("#field-name").focus()
-
-    def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#create-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
+        # The freshly composed defaults are the pristine state for the
+        # dirty-form esc guard.
+        self.mark_clean()
 
     # ── submit ────────────────────────────────────────────────────────────
 
@@ -96,24 +95,11 @@ class CreateCampaignScreen(BaseScreen):
         try:
             campaign = self._db_manager.create_campaign(campaign_data)
         except Exception as exc:  # surface in-place, never crash the UI
-            self._marshal_done(app, None, None, str(exc))
+            self.marshal(app, self._done, None, None, str(exc))
             return
-        self._marshal_done(app, campaign.name, campaign.id, None)
+        self.marshal(app, self._done, campaign.name, campaign.id, None)
 
-    def _marshal_done(
-        self, app: App, name: Optional[str], cid: Optional[int], error: Optional[str]
-    ) -> None:
-        """Hand the result back to the UI thread, but only while the app runs."""
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._done, name, cid, error)
-        except RuntimeError:
-            return
-
-    def _done(self, name: Optional[str], cid: Optional[int], error: Optional[str]) -> None:
-        if not self.is_mounted:
-            return
+    def _done(self, name: str | None, cid: int | None, error: str | None) -> None:
         self._submitting = False
         if error is not None:
             self._set_status(f"Error creating campaign: {error}", "error")

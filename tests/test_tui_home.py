@@ -6,7 +6,6 @@ and the number-key quick-navigation, using Textual's headless harness with a rea
 """
 
 import pytest
-
 from textual.widgets import Static
 
 from database.operations import DatabaseManager

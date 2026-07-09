@@ -38,6 +38,8 @@ dev = [
     "pytest-mock>=3.12.0",
     "pytest-xdist>=3.5.0",  # For parallel tests
     "freezegun>=1.4.0",  # For mocking time
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
 ]
 
 [project.scripts]
@@ -83,8 +85,43 @@ source = ["src", "linkedin_cli"]
 omit = [
     "*/tests/*",
     "*/__init__.py",
-    "*/migrations/*",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "F841", "B017"]
+# Legacy classic CLI: imports after logger setup + long lines. Retires with the
+# single-UI cutover (issue #47).
+"linkedin_cli.py" = ["E402", "E501"]
+# Logging must be configured before the app package imports (module docstrings).
+"src/tui/__main__.py" = ["E402"]
+"linkedin_tui.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+# Generated half-block art data — single-line row strings by construction.
+"src/tui/screens/_mascot_large.py" = ["E501"]
+"src/tui/screens/_wordmark.py" = ["E501"]
+# One-off tooling, not shipped: long report lines and in-loop helper closures.
+"scripts/*" = ["E501"]
+"tools/*" = ["E501", "B905", "B023"]
+# Pre-existing long lines in the automation/data core; shrink opportunistically.
+"src/automation/checker.py" = ["E501"]
+"src/automation/linkedin.py" = ["E501"]
+"src/automation/scraping.py" = ["E501"]
+"src/config/settings.py" = ["E501"]
+"src/database/operations.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = true
+exclude = ["tests/", "scripts/"]
 
 [tool.coverage.report]
 exclude_lines = [

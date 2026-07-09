@@ -3,20 +3,21 @@ Tests for connection-status checking (src/automation/checker.py).
 """
 
 import sys
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from automation.checker import (
     _clean_profile_url,
     _get_connection_limit,
-    smart_connection_checker,
     check_specific_contacts,
     monitor_pending_connections,
+    smart_connection_checker,
 )
 
 
@@ -30,7 +31,14 @@ def _automation(authenticated=True, pending=None, contact=None, is_connected=Tru
     page.query_selector = AsyncMock(return_value=None)
     page.query_selector_all = AsyncMock(return_value=[])
     page.content = AsyncMock(return_value="")
-    page.is_visible = AsyncMock(return_value=is_connected)
+    # The connected-check waits for the indicator selector; a timeout means
+    # the profile is not a 1st-degree connection.
+    if is_connected:
+        page.wait_for_selector = AsyncMock()
+    else:
+        page.wait_for_selector = AsyncMock(
+            side_effect=PlaywrightTimeoutError("indicator never visible")
+        )
     page.keyboard = AsyncMock()
     automation.page = page
     automation.context = AsyncMock()
@@ -150,6 +158,19 @@ class TestCheckSpecificContacts:
         automation = _automation(contact=contact)
         stats = await check_specific_contacts(automation, [2])
         assert stats["checked"] == 0
+        automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_not_connected_when_indicator_wait_times_out(self):
+        """A wait_for_selector timeout means not accepted (no false failure)."""
+        contact = SimpleNamespace(
+            id=4, name="Zoe", status="sent", profile_url="https://x/in/zoe/"
+        )
+        automation = _automation(contact=contact, is_connected=False)
+        stats = await check_specific_contacts(automation, [4])
+        assert stats["checked"] == 1
+        assert stats["newly_accepted"] == 0
+        assert stats["failed"] == 0
         automation.db_manager.update_contact.assert_not_called()
 
     @pytest.mark.asyncio
@@ -324,6 +345,82 @@ class TestSmartCheckerWalk:
         # The card matched (counted) but enrichment failed, so no DB update.
         assert result["checked"] == 1
         automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_closes_tab_when_enrichment_fails(self):
+        """The enrichment tab is closed even when goto blows up (no tab leak)."""
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(id=5, name="Jane", status="sent", profile_url=url)
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url)]
+        )
+        new_page = AsyncMock()
+        new_page.goto = AsyncMock(side_effect=RuntimeError("nav boom"))
+        automation.context.new_page = AsyncMock(return_value=new_page)
+        await smart_connection_checker(automation, 1)
+        new_page.close.assert_awaited_once()
+        automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_walk_without_limit_terminates_at_end_of_list(self):
+        """With no stop marker and the same full page of cards every round,
+        the no-new-profiles detection ends the walk after one repeat round
+        (it looped forever before the guards existed) — and the result is NOT
+        flagged as truncated: the whole list was seen."""
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[
+                _connection_el(f"https://www.linkedin.com/in/other{i}/")
+                for i in range(10)
+            ]
+        )
+        messages = []
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=messages.append
+        )
+        assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
+        assert "truncated" not in result
+        assert any("end of connections list" in m.lower() for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_walk_pathological_feed_hits_scroll_backstop(self):
+        """A page that keeps feeding NEW cards forever trips the scroll-rounds
+        backstop, and the result is flagged truncated so callers can tell an
+        incomplete check from a complete one."""
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+
+        calls = {"n": 0}
+
+        async def _fresh_cards(_selector):
+            calls["n"] += 1
+            base = calls["n"] * 100
+            return [
+                _connection_el(f"https://www.linkedin.com/in/other{base + i}/")
+                for i in range(10)
+            ]
+
+        automation.page.query_selector_all = AsyncMock(side_effect=_fresh_cards)
+        messages = []
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=messages.append
+        )
+        assert result.get("truncated") is True
+        assert any("maximum scroll rounds" in m.lower() for m in messages)
 
 
 @pytest.mark.unit

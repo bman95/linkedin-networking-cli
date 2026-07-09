@@ -19,15 +19,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import linkedin_cli
-from linkedin_cli import LinkedInCLI
 from exceptions import (
     CaptchaDetectedException,
-    RateLimitExceededException,
+    LinkedInAutomationError,
     NotAuthenticatedException,
+    RateLimitExceededException,
     SelectorNotFoundException,
     UnexpectedLandingException,
-    LinkedInAutomationError,
 )
+from linkedin_cli import LinkedInCLI
 
 
 def _cli_with_recording_console():

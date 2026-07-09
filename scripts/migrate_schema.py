@@ -15,10 +15,10 @@ Options:
     --dry-run    Show SQL statements without executing them
 """
 
-import sys
-import sqlite3
-from pathlib import Path
 import argparse
+import sqlite3
+import sys
+from pathlib import Path
 
 # Database paths (check multiple locations)
 DB_PATH_HOME = Path.home() / ".linkedin-networking-cli" / "linkedin_networking.db"

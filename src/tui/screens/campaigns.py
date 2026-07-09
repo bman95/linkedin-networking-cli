@@ -11,13 +11,13 @@ short.
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable, Static
 
+from cli.helpers import acceptance_rate as _acceptance_rate
+from cli.helpers import campaign_get_field
 from database.models import Campaign
 from database.operations import DatabaseManager
 from utils.logging import get_logger
@@ -29,10 +29,11 @@ logger = get_logger(__name__)
 
 
 def acceptance_rate(campaign: Campaign) -> float:
-    """Acceptance rate as a percentage, mirroring the InquirerPy CLI."""
-    if campaign.total_sent > 0:
-        return campaign.total_accepted / campaign.total_sent * 100
-    return 0.0
+    """Acceptance rate as a percentage, shared with the classic CLI."""
+    return _acceptance_rate(
+        campaign_get_field(campaign, "total_sent", 0),
+        campaign_get_field(campaign, "total_accepted", 0),
+    )
 
 
 class CampaignsScreen(BaseScreen):
@@ -44,6 +45,7 @@ class CampaignsScreen(BaseScreen):
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
+        ("n", "new", "New campaign"),
         ("r", "refresh", "Refresh"),
         ("q", "app.quit", "Quit"),
     ]
@@ -52,6 +54,7 @@ class CampaignsScreen(BaseScreen):
 
     HINTS = (
         ("enter", "open"),
+        ("n", "new"),
         ("esc", "back"),
         ("r", "refresh"),
         ("q", "quit"),
@@ -60,14 +63,9 @@ class CampaignsScreen(BaseScreen):
 
     COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate", "Daily Limit")
 
-    def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
+    def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
         self._db_manager = db_manager
-        # Monotonic token identifying the most recent load. A thread worker can't
-        # be cancelled mid-read, so a superseded (slower) load would otherwise
-        # overwrite the table with a stale snapshot; results are applied only if
-        # their token still matches.
-        self._load_generation = 0
 
     def compose_body(self) -> ComposeResult:
         yield DataTable(id="campaigns-table", zebra_stripes=True, cursor_type="row")
@@ -102,64 +100,45 @@ class CampaignsScreen(BaseScreen):
         self.query_one("#campaigns-status", Static).update("Refreshing…")
         self.load_campaigns()
 
+    def action_new(self) -> None:
+        """Create a campaign without detouring back through the home screen."""
+        if self._db_manager is None:
+            return
+        from .create_campaign import CreateCampaignScreen
+
+        self.app.push_screen(CreateCampaignScreen(self._db_manager))
+
     def load_campaigns(self) -> None:
-        """Start a fresh load, invalidating any in-flight (slower) one."""
-        self._load_generation += 1
-        # Capture the app reference here, on the UI thread while the screen is
-        # still attached. ``@work(thread=True)`` defers the worker body, so
-        # resolving ``self.app`` inside it would run later on a worker thread —
-        # and if the user popped/quit the screen first, that lookup would raise
-        # before the shutdown guards in ``_marshal_populate`` get a chance to run.
-        self._run_load(self.app, self._load_generation)
+        """Start a fresh load, invalidating any in-flight (slower) one.
+
+        ``begin_load`` captures the app on the UI thread at schedule time and
+        bumps the generation token; the mixin's ``marshal_load`` applies the
+        shutdown/unmount/stale guards on the way back (see ``workers.py``).
+        """
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True)
     def _run_load(self, app: App, generation: int) -> None:
         """Fetch campaigns off the event loop, then populate the table."""
         if self._db_manager is None:
-            self._marshal_populate(app, generation, [], "Database unavailable.")
+            self.marshal_load(app, generation, self._populate, [], "Database unavailable.")
             return
         try:
             campaigns = self._db_manager.get_campaigns(active_only=False)
         except Exception as exc:  # surface the failure in-place, don't crash the UI
-            self._marshal_populate(app, generation, [], f"Error loading campaigns: {exc}")
+            self.marshal_load(
+                app, generation, self._populate, [], f"Error loading campaigns: {exc}"
+            )
             return
-        self._marshal_populate(app, generation, campaigns, None)
+        self.marshal_load(app, generation, self._populate, campaigns, None)
 
-    def _marshal_populate(
-        self, app: App, generation: int, campaigns: List[Campaign], error: Optional[str]
-    ) -> None:
-        """Hand results back to the UI thread, but only while the app runs.
-
-        The thread worker can't be interrupted, so it may finish after the user
-        quit. ``call_from_thread`` raises ``RuntimeError`` once the event loop is
-        torn down; treating a late callback as a no-op lets the worker thread
-        exit cleanly instead of erroring (and hanging the ``linkedin-tui``
-        process on shutdown).
-        """
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, campaigns, error)
-        except RuntimeError:
-            # App stopped between the is_running check and the call; ignore.
-            return
-
-    def _populate(
-        self, generation: int, campaigns: List[Campaign], error: Optional[str]
-    ) -> None:
-        # The worker body can't be interrupted, so it may still call this after
-        # the screen was popped (its widgets gone). Bail out if we're detached.
-        if not self.is_mounted:
-            return
-        # Drop results from a superseded load so a slower older read can't
-        # overwrite the table with a stale snapshot.
-        if generation != self._load_generation:
-            return
+    def _populate(self, campaigns: list[Campaign], error: str | None) -> None:
         table = self.query_one("#campaigns-table", DataTable)
         table.clear()
         status = self.query_one("#campaigns-status", Static)
         if error is not None:
-            status.update(error)
+            # Literal render: raw exception text may contain markup-like brackets.
+            status.update(Text(error))
             return
         for campaign in campaigns:
             table.add_row(
@@ -176,6 +155,7 @@ class CampaignsScreen(BaseScreen):
                 key=str(campaign.id),
             )
         if campaigns:
-            status.update(f"{len(campaigns)} campaign(s).")
+            noun = "campaign" if len(campaigns) == 1 else "campaigns"
+            status.update(f"{len(campaigns)} {noun}.")
         else:
-            status.update("No campaigns yet. Create one in the classic CLI (linkedin-cli).")
+            status.update("No campaigns yet — press n to create one.")

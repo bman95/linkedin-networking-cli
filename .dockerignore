@@ -1,9 +1,14 @@
 .git
 .venv
 __pycache__
+**/__pycache__
 htmlcov
 .coverage
 coverage.xml
 *.pyc
 .pytest_cache
 browser_data
+*.db
+logs/
+.claude
+tests

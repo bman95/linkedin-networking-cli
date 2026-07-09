@@ -7,7 +7,6 @@ internal IDs/URNs for various search parameters.
 Last updated: 2025-11-12
 """
 
-from typing import Dict, List, Tuple
 
 # ============================================================================
 # LOCATION MAPPINGS (geoUrn)
@@ -19,7 +18,7 @@ from typing import Dict, List, Tuple
 # by LinkedInAutomation.search_location) or paste a custom geoUrn via the
 # "Other (enter custom geoUrn)" option when creating/editing a campaign.
 
-LOCATION_MAPPING: Dict[str, str] = {
+LOCATION_MAPPING: dict[str, str] = {
     # === VERIFIED LOCATIONS ===
     "San Francisco Bay Area": "90000084",  # ✅ Verified
     "Greater Boston Area": "105646813",  # ✅ Verified
@@ -123,7 +122,7 @@ LOCATION_MAPPING: Dict[str, str] = {
 }
 
 # Display names for UI (ordered by region and popularity)
-LOCATION_CHOICES: List[Tuple[str, str]] = [
+LOCATION_CHOICES: list[tuple[str, str]] = [
     ("Any", ""),  # Empty string means no filter
 
     # === TOP US TECH HUBS ===
@@ -180,7 +179,7 @@ LOCATION_CHOICES: List[Tuple[str, str]] = [
     ("United States", "103644278"),
 ]
 
-def get_location_display_names() -> List[str]:
+def get_location_display_names() -> list[str]:
     """Get list of location display names for UI"""
     return [name for name, _ in LOCATION_CHOICES]
 
@@ -195,20 +194,20 @@ def get_location_urn(display_name: str) -> str:
 # NETWORK MAPPINGS (connection degree)
 # ============================================================================
 
-NETWORK_MAPPING: Dict[str, str] = {
+NETWORK_MAPPING: dict[str, str] = {
     "1st degree connections only": '["F"]',
     "1st + 2nd degree connections": '["F","S"]',
     "1st, 2nd + 3rd degree connections": '["F","S","O"]',
 }
 
 # Display names for UI (ordered)
-NETWORK_CHOICES: List[Tuple[str, str]] = [
+NETWORK_CHOICES: list[tuple[str, str]] = [
     ("1st degree connections only", '["F"]'),
     ("1st + 2nd degree connections", '["F","S"]'),
     ("1st, 2nd + 3rd degree connections", '["F","S","O"]'),
 ]
 
-def get_network_display_names() -> List[str]:
+def get_network_display_names() -> list[str]:
     """Get list of network display names for UI"""
     return [name for name, _ in NETWORK_CHOICES]
 
@@ -223,7 +222,7 @@ def get_network_value(display_name: str) -> str:
 # INDUSTRY MAPPINGS
 # ============================================================================
 
-INDUSTRY_MAPPING: Dict[str, str] = {
+INDUSTRY_MAPPING: dict[str, str] = {
     "Computer Software": "4",
     "Information Technology & Services": "96",
     "Internet": "6",
@@ -259,7 +258,7 @@ INDUSTRY_MAPPING: Dict[str, str] = {
 }
 
 # Display names for UI (ordered by popularity/relevance)
-INDUSTRY_CHOICES: List[Tuple[str, str]] = [
+INDUSTRY_CHOICES: list[tuple[str, str]] = [
     ("Any", ""),
     ("Computer Software", "4"),
     ("Information Technology & Services", "96"),
@@ -290,7 +289,7 @@ INDUSTRY_CHOICES: List[Tuple[str, str]] = [
     ("Retail", "27"),
 ]
 
-def get_industry_display_names() -> List[str]:
+def get_industry_display_names() -> list[str]:
     """Get list of industry display names for UI"""
     return [name for name, _ in INDUSTRY_CHOICES]
 
@@ -301,7 +300,7 @@ def get_industry_id(display_name: str) -> str:
             return id
     return ""
 
-def get_industry_ids_for_multiple(display_names: List[str]) -> str:
+def get_industry_ids_for_multiple(display_names: list[str]) -> str:
     """
     Get comma-separated industry IDs for multiple display names
 
@@ -322,7 +321,7 @@ def get_industry_ids_for_multiple(display_names: List[str]) -> str:
 # LANGUAGE MAPPINGS (for future use)
 # ============================================================================
 
-LANGUAGE_MAPPING: Dict[str, str] = {
+LANGUAGE_MAPPING: dict[str, str] = {
     "English": "en",
     "Spanish": "es",
     "French": "fr",
@@ -343,7 +342,7 @@ LANGUAGE_MAPPING: Dict[str, str] = {
 # COMMON COMPANIES (for future use)
 # ============================================================================
 
-COMMON_COMPANIES: Dict[str, str] = {
+COMMON_COMPANIES: dict[str, str] = {
     "Google": "1441",
     "Meta": "1586",
     "Apple": "162479",

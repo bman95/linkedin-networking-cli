@@ -27,16 +27,17 @@ Options:
     --dry-run    Show what would be migrated without making changes
 """
 
+import argparse
 import sys
 from pathlib import Path
-import argparse
 
 # Add src directory to path
 sys.path.append(str(Path(__file__).parent / "src"))
 
-from database.operations import DatabaseManager
-from database.models import Campaign
 from sqlmodel import select
+
+from database.models import Campaign
+from database.operations import DatabaseManager
 
 # Simple mappings for common legacy values
 LEGACY_LOCATION_MAPPING = {

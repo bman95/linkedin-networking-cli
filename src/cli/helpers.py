@@ -6,8 +6,11 @@ so they are trivially unit-testable and covered under ``source = ["src"]``.
 its existing call sites and public surface are unchanged.
 """
 
+import csv
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any
 
 
 def campaign_get_field(campaign: Any, attr: str, default: Any = None) -> Any:
@@ -34,7 +37,55 @@ def csv_value(value: Any) -> str:
     return str(value)
 
 
-def mask_email(email: Optional[str]) -> str:
+def acceptance_rate(sent: int, accepted: int) -> float:
+    """Acceptance rate as a percentage; ``0.0`` when nothing was sent."""
+    return (accepted / sent * 100) if sent > 0 else 0.0
+
+
+# Contact CSV export columns, shared by the classic CLI and the TUI so both
+# produce the same file shape.
+CONTACT_CSV_FIELDS = (
+    "name",
+    "profile_url",
+    "headline",
+    "location",
+    "company",
+    "status",
+    "connection_sent_at",
+    "connection_accepted_at",
+    "notes",
+)
+
+
+def contacts_csv_filename(campaign_name: str) -> str:
+    """Default ``<safe-name>_contacts_<timestamp>.csv`` filename for an export."""
+    safe = "".join(
+        c if c.isalnum() or c in ("-", "_") else "_" for c in campaign_name
+    ).strip("_") or "campaign"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{safe}_contacts_{timestamp}.csv"
+
+
+def write_contacts_csv(path: str | Path, contacts: Iterable[Any]) -> None:
+    """Write contacts to ``path`` as CSV using :data:`CONTACT_CSV_FIELDS`.
+
+    Path policy (where the file goes, prompting, directory creation) is the
+    caller's concern; this owns only the writing. Contacts may be SQLModel
+    objects or plain dicts (see :func:`campaign_get_field`).
+    """
+    with Path(path).open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(CONTACT_CSV_FIELDS))
+        writer.writeheader()
+        for contact in contacts:
+            writer.writerow(
+                {
+                    field: csv_value(campaign_get_field(contact, field))
+                    for field in CONTACT_CSV_FIELDS
+                }
+            )
+
+
+def mask_email(email: str | None) -> str:
     """Mask an email for display, e.g. ``'joh***@example.com'``."""
     if not email:
         return "Not set"

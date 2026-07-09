@@ -16,8 +16,6 @@ importers (and tests) have a single stable entry point.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from textual.app import App
 
 from config.settings import AppSettings
@@ -70,8 +68,8 @@ class LinkedInTUI(App):
 
     def __init__(
         self,
-        db_manager: Optional[DatabaseManager] = None,
-        settings: Optional[AppSettings] = None,
+        db_manager: DatabaseManager | None = None,
+        settings: AppSettings | None = None,
     ) -> None:
         super().__init__()
         # AppSettings() touches the filesystem (it creates the app dir) and the

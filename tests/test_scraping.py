@@ -11,11 +11,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from automation.scraping import (
-    get_profession,
+    collect_public_information,
+    get_contact_info,
     get_location,
     get_open_to_work_status,
-    get_contact_info,
-    collect_public_information,
+    get_profession,
 )
 
 
@@ -68,9 +68,12 @@ class TestOpenToWork:
         assert await get_open_to_work_status(page) is True
 
     @pytest.mark.asyncio
-    async def test_text_in_content(self):
+    async def test_text_in_page_content_alone_is_not_enough(self):
+        # A bare substring match in page.content() (hidden SDUI templates,
+        # i18n bundles, "People also viewed") must NOT count as open-to-work;
+        # only a scoped, visible badge/photo-frame element does.
         page = _page(query_result=None, content="this person is Open To Work")
-        assert await get_open_to_work_status(page) is True
+        assert await get_open_to_work_status(page) is False
 
     @pytest.mark.asyncio
     async def test_not_open(self):

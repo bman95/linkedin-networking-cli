@@ -7,16 +7,15 @@ run → summary/error pipeline (via a browser-free fake that overrides the singl
 """
 
 import pytest
-
 from textual.widgets import Input, RichLog, Select, Static
 
+from database.operations import DatabaseManager
 from exceptions import (
     CaptchaDetectedException,
     NotAuthenticatedException,
     RateLimitExceededException,
     SelectorNotFoundException,
 )
-from database.operations import DatabaseManager
 from tui.app import (
     CheckConnectionsScreen,
     ExecuteCampaignScreen,
@@ -95,6 +94,8 @@ class _FakeRunScreen(AutomationRunScreen):
             raise CaptchaDetectedException("captcha wall")
         if self._outcome == "login_failed":
             return {"status": "login_failed"}
+        if self._outcome == "safety_stop":
+            return {"status": "safety_stop", "n": 3}
         return {"status": "success", "n": 7}
 
     def render_result(self, result: dict) -> str:
@@ -140,6 +141,56 @@ async def test_run_pipeline_login_failed(db_manager: DatabaseManager):
         await _run_fake(pilot, app, "login_failed")
         status = await wait_text(pilot, "#run-status", "Login failed")
         assert "Login failed" in status
+
+
+@pytest.mark.unit
+async def test_run_pipeline_safety_stop_is_not_a_green_done(
+    db_manager: DatabaseManager,
+):
+    """A safety_stop result renders the summary but never a green 'Done.'."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _run_fake(pilot, app, "safety_stop")
+        status = await wait_text(pilot, "#run-status", "Stopped early")
+        assert "Stopped early to protect the account" in status
+
+
+@pytest.mark.unit
+async def test_execute_automate_maps_stopped_reason_to_safety_stop(
+    db_manager: DatabaseManager,
+):
+    """The Execute screen mirrors the classic CLI: a protective stop is a
+    safety_stop status — even (especially) when nothing was scanned yet — and
+    its rendering names the CAPTCHA, not 'no profiles matched'."""
+
+    class _Settings:
+        def get_automation_settings(self):
+            return {"search_limit": 10}
+
+    def _fake_automation(scanned):
+        class _Fake:
+            async def search_and_connect(
+                self, campaign, limit, progress_callback=None, max_sends=None
+            ):
+                return {
+                    "sent": 1 if scanned else 0, "possibly_sent": 0,
+                    "failed": 0, "existing": 0, "total_processed": scanned,
+                    "scanned": scanned, "stopped_reason": "captcha",
+                }
+        return _Fake()
+
+    screen = ExecuteCampaignScreen(db_manager, _Settings())
+    screen._selected = make_campaign(db_manager, name="Exec safety")
+
+    # Mid-run stop (some cards scanned) and first-page stop (nothing scanned):
+    # both must map to safety_stop, never to success or no_profiles.
+    for scanned in (3, 0):
+        result = await screen.automate(_fake_automation(scanned))
+        assert result["status"] == "safety_stop"
+        text = screen.render_result(result)
+        assert "CAPTCHA" in text
+        assert "No profiles matched" not in text
 
 
 # ── gating / selection on the real screens ──────────────────────────────────

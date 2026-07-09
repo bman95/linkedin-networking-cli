@@ -1,13 +1,24 @@
-from datetime import datetime, date, timezone
-from typing import List, Optional, Dict, Any
-from sqlmodel import SQLModel, create_engine, Session, select, update
-from sqlalchemy import and_, or_
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from pathlib import Path
 import json
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from sqlalchemy import and_, event, func, or_
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlmodel import Session, SQLModel, create_engine, delete, select, update
 
 from utils.logging import get_logger
-from .models import Campaign, Contact, Analytics, Settings, DailyConnectionCount
+
+from .models import (
+    PENDING_STATUSES,
+    SENT_STATUSES,
+    Analytics,
+    Campaign,
+    Contact,
+    ContactStatus,
+    DailyConnectionCount,
+    Settings,
+)
 
 logger = get_logger(__name__)
 
@@ -18,8 +29,37 @@ class DatabaseManager:
     def __init__(self, db_path: str = "linkedin_networking.db"):
         self.db_path = Path(db_path)
         logger.info(f"Initializing database at: {self.db_path}")
-        self.engine = create_engine(f"sqlite:///{self.db_path}")
+        # check_same_thread=False: the engine is shared across the sync CLI,
+        # Textual worker threads and the async automation thread; SQLAlchemy's
+        # pool hands each thread its own connection, so this is safe.
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            connect_args={"check_same_thread": False},
+        )
+        self._configure_sqlite_pragmas()
         self.create_tables()
+
+    def _configure_sqlite_pragmas(self) -> None:
+        """Register per-connection SQLite PRAGMAs for safe concurrent access.
+
+        Applied on EVERY new DBAPI connection: ``busy_timeout`` and
+        ``foreign_keys`` are connection-scoped in SQLite, so they must be
+        re-issued each time. ``journal_mode=WAL`` is persistent per database
+        file (re-issuing is a cheap no-op) and lets concurrent readers coexist
+        with a writer; an in-memory DB cannot use WAL, so it is skipped there.
+        """
+        is_memory = str(self.db_path) == ":memory:"
+
+        @event.listens_for(self.engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA foreign_keys=ON")
+                if not is_memory:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+            finally:
+                cursor.close()
 
     def create_tables(self):
         """Create all database tables, migrating an existing DB if needed."""
@@ -53,7 +93,8 @@ class DatabaseManager:
         ``ADD COLUMN IF NOT EXISTS``, so check the existing columns first. A
         no-op when the table is absent (fresh DB) or already has the column.
         """
-        from sqlalchemy import inspect as sa_inspect, text
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text
 
         inspector = sa_inspect(self.engine)
         if not inspector.has_table("contact"):
@@ -83,7 +124,8 @@ class DatabaseManager:
         table is absent (fresh DB) or already free of duplicates. Returns the
         number of rows deleted.
         """
-        from sqlalchemy import inspect as sa_inspect, text
+        from sqlalchemy import inspect as sa_inspect
+        from sqlalchemy import text
 
         inspector = sa_inspect(self.engine)
         if not inspector.has_table("contact"):
@@ -146,7 +188,7 @@ class DatabaseManager:
         return Session(self.engine)
 
     # Campaign operations
-    def create_campaign(self, campaign_data: Dict[str, Any]) -> Campaign:
+    def create_campaign(self, campaign_data: dict[str, Any]) -> Campaign:
         """Create a new campaign"""
         try:
             campaign = Campaign(**campaign_data)
@@ -160,13 +202,14 @@ class DatabaseManager:
             logger.error(f"Failed to create campaign: {e}")
             raise
 
-    def get_campaigns(self, active_only: bool = True) -> List[Campaign]:
+    def get_campaigns(self, active_only: bool = True) -> list[Campaign]:
         """Get all campaigns"""
         try:
             with self.get_session() as session:
                 statement = select(Campaign)
                 if active_only:
-                    statement = statement.where(Campaign.active == True)
+                    # noqa applies to the SQLAlchemy column expression, not a truth test.
+                    statement = statement.where(Campaign.active == True)  # noqa: E712
                 campaigns = session.exec(statement).all()
                 logger.debug(f"Retrieved {len(campaigns)} campaigns (active_only={active_only})")
                 return list(campaigns)
@@ -174,13 +217,13 @@ class DatabaseManager:
             logger.error(f"Failed to get campaigns: {e}")
             raise
 
-    def get_campaign(self, campaign_id: int) -> Optional[Campaign]:
+    def get_campaign(self, campaign_id: int) -> Campaign | None:
         """Get campaign by ID"""
         with self.get_session() as session:
             campaign = session.get(Campaign, campaign_id)
             return campaign
 
-    def update_campaign(self, campaign_id: int, updates: Dict[str, Any]) -> Optional[Campaign]:
+    def update_campaign(self, campaign_id: int, updates: dict[str, Any]) -> Campaign | None:
         """Update campaign"""
         try:
             with self.get_session() as session:
@@ -188,7 +231,7 @@ class DatabaseManager:
                 if campaign:
                     for key, value in updates.items():
                         setattr(campaign, key, value)
-                    campaign.updated_at = datetime.now()
+                    campaign.updated_at = datetime.now(UTC)
                     session.commit()
                     session.refresh(campaign)
                     logger.info(f"Updated campaign {campaign_id}: {list(updates.keys())}")
@@ -200,23 +243,29 @@ class DatabaseManager:
             raise
 
     def delete_campaign(self, campaign_id: int) -> bool:
-        """Delete campaign and its contacts"""
+        """Delete campaign and its contacts and analytics"""
         try:
             with self.get_session() as session:
                 campaign = session.get(Campaign, campaign_id)
                 if campaign:
-                    # Delete associated contacts first
-                    contacts = session.exec(
-                        select(Contact).where(Contact.campaign_id == campaign_id)
-                    ).all()
-                    contact_count = len(list(contacts))
-                    for contact in contacts:
-                        session.delete(contact)
+                    # Bulk-delete dependents first so the FK constraint
+                    # (PRAGMA foreign_keys=ON) never sees an orphaned child.
+                    contact_result = session.exec(
+                        delete(Contact).where(Contact.campaign_id == campaign_id)
+                    )
+                    contact_count = contact_result.rowcount or 0
+                    analytics_result = session.exec(
+                        delete(Analytics).where(Analytics.campaign_id == campaign_id)
+                    )
+                    analytics_count = analytics_result.rowcount or 0
 
                     # Delete campaign
                     session.delete(campaign)
                     session.commit()
-                    logger.info(f"Deleted campaign {campaign_id} and {contact_count} associated contacts")
+                    logger.info(
+                        f"Deleted campaign {campaign_id}, {contact_count} associated "
+                        f"contacts and {analytics_count} analytics rows"
+                    )
                     return True
                 logger.warning(f"Campaign {campaign_id} not found for deletion")
                 return False
@@ -225,7 +274,7 @@ class DatabaseManager:
             raise
 
     # Contact operations
-    def create_contact(self, contact_data: Dict[str, Any]) -> Contact:
+    def create_contact(self, contact_data: dict[str, Any]) -> Contact:
         """Create a new contact"""
         try:
             contact = Contact(**contact_data)
@@ -289,7 +338,7 @@ class DatabaseManager:
 
     def upsert_contact(
         self,
-        contact_data: Dict[str, Any],
+        contact_data: dict[str, Any],
         protect_finalized: bool = False,
         protect_other_reservation: bool = False,
     ) -> Contact:
@@ -332,7 +381,7 @@ class DatabaseManager:
         try:
             campaign_id = contact_data.get("campaign_id")
             profile_url = contact_data.get("profile_url")
-            now_naive = datetime.now()
+            now = datetime.now(UTC)
             # The conflict update sets every provided mutable column plus
             # updated_at; never the conflict keys or created_at.
             update_set = {
@@ -340,7 +389,7 @@ class DatabaseManager:
                 for key, value in contact_data.items()
                 if key not in self._UPSERT_PRESERVE_COLUMNS
             }
-            update_set["updated_at"] = now_naive
+            update_set["updated_at"] = now
             with self.get_session() as session:
                 stmt = sqlite_insert(Contact).values(**contact_data)
                 on_conflict_kwargs = {
@@ -396,7 +445,7 @@ class DatabaseManager:
         profile_url: str,
         only_unfinalized: bool = False,
         reserved_only: bool = False,
-        reservation_token: Optional[str] = None,
+        reservation_token: str | None = None,
     ) -> int:
         """Delete contact rows for a profile in a campaign; return the count.
 
@@ -460,7 +509,7 @@ class DatabaseManager:
         campaign_id: int,
         profile_url: str,
         reservation_token: str,
-        notes: Optional[str] = None,
+        notes: str | None = None,
     ) -> int:
         """Flip a ``reserved`` row we OWN back to retryable ``found``; return count.
 
@@ -487,7 +536,7 @@ class DatabaseManager:
                         status="found",
                         reservation_token=None,
                         notes=notes,
-                        updated_at=datetime.now(),
+                        updated_at=datetime.now(UTC),
                     )
                 )
                 result = session.exec(stmt)
@@ -508,7 +557,7 @@ class DatabaseManager:
         self,
         campaign_id: int,
         profile_url: str,
-        reservation_token: Optional[str] = None,
+        reservation_token: str | None = None,
     ) -> int:
         """Flip a lingering ``reserved`` marker to ``possibly_sent``; return count.
 
@@ -542,8 +591,8 @@ class DatabaseManager:
                     .where(*where_clauses)
                     .values(
                         status="possibly_sent",
-                        connection_sent_at=datetime.now(timezone.utc),
-                        updated_at=datetime.now(),
+                        connection_sent_at=datetime.now(UTC),
+                        updated_at=datetime.now(UTC),
                     )
                 )
                 result = session.exec(stmt)
@@ -561,7 +610,7 @@ class DatabaseManager:
             )
             return 0
 
-    def get_contacts(self, campaign_id: Optional[int] = None) -> List[Contact]:
+    def get_contacts(self, campaign_id: int | None = None) -> list[Contact]:
         """Get contacts, optionally filtered by campaign"""
         with self.get_session() as session:
             statement = select(Contact)
@@ -570,13 +619,13 @@ class DatabaseManager:
             contacts = session.exec(statement).all()
             return list(contacts)
 
-    def get_contact(self, contact_id: int) -> Optional[Contact]:
+    def get_contact(self, contact_id: int) -> Contact | None:
         """Get contact by ID"""
         with self.get_session() as session:
             contact = session.get(Contact, contact_id)
             return contact
 
-    def update_contact(self, contact_id: int, updates: Dict[str, Any]) -> Optional[Contact]:
+    def update_contact(self, contact_id: int, updates: dict[str, Any]) -> Contact | None:
         """Update contact"""
         try:
             with self.get_session() as session:
@@ -584,7 +633,7 @@ class DatabaseManager:
                 if contact:
                     for key, value in updates.items():
                         setattr(contact, key, value)
-                    contact.updated_at = datetime.now()
+                    contact.updated_at = datetime.now(UTC)
                     session.commit()
                     session.refresh(contact)
                     logger.debug(f"Updated contact {contact_id}: {list(updates.keys())}")
@@ -595,7 +644,7 @@ class DatabaseManager:
             logger.error(f"Failed to update contact {contact_id}: {e}")
             raise
 
-    def get_contacts_by_status(self, campaign_id: int, status: str) -> List[Contact]:
+    def get_contacts_by_status(self, campaign_id: int, status: str) -> list[Contact]:
         """Get contacts by status for a campaign"""
         with self.get_session() as session:
             contacts = session.exec(
@@ -607,7 +656,7 @@ class DatabaseManager:
             return list(contacts)
 
     # Analytics operations
-    def record_daily_analytics(self, campaign_id: int, date_str: str, metrics: Dict[str, Any]):
+    def record_daily_analytics(self, campaign_id: int, date_str: str, metrics: dict[str, Any]):
         """Record or update daily analytics"""
         try:
             with self.get_session() as session:
@@ -623,7 +672,7 @@ class DatabaseManager:
                     # Update existing record
                     for key, value in metrics.items():
                         setattr(existing, key, value)
-                    existing.updated_at = datetime.now()
+                    existing.updated_at = datetime.now(UTC)
                     session.commit()
                     session.refresh(existing)
                     logger.debug(f"Updated analytics for campaign {campaign_id} on {date_str}")
@@ -644,7 +693,7 @@ class DatabaseManager:
             logger.error(f"Failed to record analytics for campaign {campaign_id}: {e}")
             raise
 
-    def get_campaign_analytics(self, campaign_id: int, days: int = 30) -> List[Analytics]:
+    def get_campaign_analytics(self, campaign_id: int, days: int = 30) -> list[Analytics]:
         """Get analytics for a campaign"""
         with self.get_session() as session:
             analytics = session.exec(
@@ -689,7 +738,7 @@ class DatabaseManager:
 
                 if existing:
                     existing.value = value_str
-                    existing.updated_at = datetime.now()
+                    existing.updated_at = datetime.now(UTC)
                     if description:
                         existing.description = description
                     logger.debug(f"Updated setting '{key}' = {value}")
@@ -728,6 +777,35 @@ class DatabaseManager:
             logger.error(f"Failed to get daily connection count for {date_str}: {e}")
             raise
 
+    def get_weekly_connection_count(
+        self, reference_date: date | None = None
+    ) -> int:
+        """Sum the connection counts over the trailing 7 local days.
+
+        LinkedIn's binding invitation cap is a rolling ~weekly one, so this adds
+        up ``DailyConnectionCount.count`` for ``reference_date`` (default the
+        local ``date.today()`` the daily counter uses) plus the previous 6 days,
+        keyed by the same ``YYYY-MM-DD`` local-day strings. Days outside that
+        7-day window are excluded; absent days simply contribute 0. Returns the
+        cumulative weekly total so a run can proactively stop before hitting the
+        weekly-limit modal.
+        """
+        try:
+            ref = reference_date or date.today()
+            day_keys = [(ref - timedelta(days=n)).isoformat() for n in range(7)]
+            with self.get_session() as session:
+                total = session.exec(
+                    select(func.coalesce(func.sum(DailyConnectionCount.count), 0))
+                    .where(DailyConnectionCount.date.in_(day_keys))
+                ).one()
+                logger.debug(
+                    f"Weekly connection count ending {ref.isoformat()}: {total}"
+                )
+                return total or 0
+        except Exception as e:
+            logger.error(f"Failed to get weekly connection count: {e}")
+            raise
+
     def increment_daily_connection_count(self, date_str: str) -> int:
         """Atomically increment the connection count for a given local day.
 
@@ -737,8 +815,7 @@ class DatabaseManager:
         the increment must respect the daily limit. Returns the new count.
         """
         try:
-            now = datetime.now(timezone.utc)
-            now_naive = datetime.now()
+            now = datetime.now(UTC)
             with self.get_session() as session:
                 stmt = sqlite_insert(DailyConnectionCount).values(
                     date=date_str,
@@ -750,7 +827,7 @@ class DatabaseManager:
                     set_={
                         "count": DailyConnectionCount.count + 1,
                         "last_action_at": now,
-                        "updated_at": now_naive,
+                        "updated_at": now,
                     },
                 )
                 session.exec(stmt)
@@ -770,7 +847,7 @@ class DatabaseManager:
             )
             raise
 
-    def reserve_daily_slot(self, date_str: str, limit: int) -> Optional[int]:
+    def reserve_daily_slot(self, date_str: str, limit: int) -> int | None:
         """Atomically claim one connection slot for the day if under ``limit``.
 
         Performed as a single conditional SQLite upsert
@@ -795,7 +872,7 @@ class DatabaseManager:
             # guard, so refuse explicitly.
             return None
         try:
-            now_naive = datetime.now()
+            now = datetime.now(UTC)
             with self.get_session() as session:
                 stmt = sqlite_insert(DailyConnectionCount).values(
                     date=date_str,
@@ -810,7 +887,7 @@ class DatabaseManager:
                     index_elements=["date"],
                     set_={
                         "count": DailyConnectionCount.count + 1,
-                        "updated_at": now_naive,
+                        "updated_at": now,
                     },
                     where=DailyConnectionCount.count < limit,
                 )
@@ -855,7 +932,7 @@ class DatabaseManager:
                     )
                     .values(
                         count=DailyConnectionCount.count - 1,
-                        updated_at=datetime.now(),
+                        updated_at=datetime.now(UTC),
                     )
                 )
                 session.exec(stmt)
@@ -877,7 +954,7 @@ class DatabaseManager:
                 stmt = (
                     update(DailyConnectionCount)
                     .where(DailyConnectionCount.date == date_str)
-                    .values(last_action_at=datetime.now(timezone.utc))
+                    .values(last_action_at=datetime.now(UTC))
                 )
                 session.exec(stmt)
                 session.commit()
@@ -885,7 +962,7 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to mark connection sent for {date_str}: {e}")
 
-    def get_last_connection_at(self) -> Optional[datetime]:
+    def get_last_connection_at(self) -> datetime | None:
         """Return the most recent connection timestamp across all days.
 
         Used to enforce the optional inter-session cooldown when a new run
@@ -914,24 +991,29 @@ class DatabaseManager:
                     logger.warning(f"Campaign {campaign_id} not found for stats update")
                     return
 
-                contacts = session.exec(
-                    select(Contact).where(Contact.campaign_id == campaign_id)
-                ).all()
-
                 # "possibly_sent" (issue #31) is an assumed-sent invite that
                 # consumed a daily slot, so it counts as sent and as pending
                 # (awaiting acceptance) just like "sent" — otherwise an ambiguous
                 # send would under-report totals and overstate the acceptance rate.
                 # "reserved" (issue #39) is a pre-send skip marker only (no invite
                 # is known to be out), so it is deliberately excluded from both.
-                total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
-                total_accepted = len([c for c in contacts if c.status == "accepted"])
-                total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
+                status_counts = dict(
+                    session.exec(
+                        select(Contact.status, func.count())
+                        .where(Contact.campaign_id == campaign_id)
+                        .group_by(Contact.status)
+                    ).all()
+                )
+                total_sent = sum(status_counts.get(s, 0) for s in SENT_STATUSES)
+                total_accepted = status_counts.get(ContactStatus.ACCEPTED, 0)
+                total_pending = sum(
+                    status_counts.get(s, 0) for s in PENDING_STATUSES
+                )
 
                 campaign.total_sent = total_sent
                 campaign.total_accepted = total_accepted
                 campaign.total_pending = total_pending
-                campaign.updated_at = datetime.now()
+                campaign.updated_at = datetime.now(UTC)
 
                 session.commit()
                 logger.debug(f"Updated stats for campaign {campaign_id}: sent={total_sent}, accepted={total_accepted}, pending={total_pending}")
@@ -939,23 +1021,33 @@ class DatabaseManager:
             logger.error(f"Failed to update campaign stats for {campaign_id}: {e}")
             raise
 
-    def get_dashboard_stats(self) -> Dict[str, Any]:
+    def get_dashboard_stats(self) -> dict[str, Any]:
         """Get overall dashboard statistics"""
         try:
             with self.get_session() as session:
-                campaigns = session.exec(select(Campaign)).all()
-                contacts = session.exec(select(Contact)).all()
-
-                total_campaigns = len(campaigns)
-                active_campaigns = len([c for c in campaigns if c.active])
-                total_contacts = len(contacts)
+                total_campaigns = session.exec(
+                    select(func.count()).select_from(Campaign)
+                ).one()
+                active_campaigns = session.exec(
+                    select(func.count())
+                    .select_from(Campaign)
+                    .where(Campaign.active == True)  # noqa: E712
+                ).one()
                 # See update_campaign_stats: "possibly_sent" counts as sent and
                 # pending (assumed-sent, awaiting acceptance) so an ambiguous send
                 # doesn't under-report or skew the acceptance rate. "reserved"
                 # (issue #39, a pre-send skip marker only) is excluded from both.
-                total_sent = len([c for c in contacts if c.status in ["sent", "possibly_sent", "accepted", "declined"]])
-                total_accepted = len([c for c in contacts if c.status == "accepted"])
-                total_pending = len([c for c in contacts if c.status in ["sent", "possibly_sent"]])
+                status_counts = dict(
+                    session.exec(
+                        select(Contact.status, func.count()).group_by(Contact.status)
+                    ).all()
+                )
+                total_contacts = sum(status_counts.values())
+                total_sent = sum(status_counts.get(s, 0) for s in SENT_STATUSES)
+                total_accepted = status_counts.get(ContactStatus.ACCEPTED, 0)
+                total_pending = sum(
+                    status_counts.get(s, 0) for s in PENDING_STATUSES
+                )
 
                 acceptance_rate = (total_accepted / total_sent * 100) if total_sent > 0 else 0
 

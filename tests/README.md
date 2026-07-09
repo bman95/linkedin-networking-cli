@@ -29,6 +29,9 @@ This test suite provides comprehensive coverage of the LinkedIn Networking CLI a
 - `test_database_operations.py` - Tests for DatabaseManager CRUD operations
 - `test_settings.py` - Tests for application settings and configuration
 - `test_linkedin_automation.py` - Tests for LinkedIn automation with mocked Playwright
+- `test_navigation.py`, `test_interactions.py`, `test_selectors.py`, `test_scraping.py`, `test_diagnostics.py`, `test_checker.py` - Tests for automation sub-modules
+- `test_cli_helpers.py`, `test_cli_run_loops.py` - Tests for CLI helpers and run loops
+- `test_tui*.py` - Tests for the Textual TUI screens
 - `conftest.py` - Shared fixtures and test configuration
 
 ## 🚀 Installation
@@ -123,11 +126,20 @@ pytest -n 4
 tests/
 ├── __init__.py                      # Package initialization
 ├── conftest.py                      # Shared fixtures and configuration
-├── test_linkedin_mappings.py        # ~200 LOC, 50+ tests
-├── test_models.py                   # ~400 LOC, 40+ tests
-├── test_database_operations.py      # ~500 LOC, 50+ tests
-├── test_settings.py                 # ~300 LOC, 40+ tests
-├── test_linkedin_automation.py      # ~300 LOC, 30+ tests
+├── test_checker.py                  # ~360 LOC, 24 tests
+├── test_cli_helpers.py              # ~80 LOC, 12 tests
+├── test_cli_run_loops.py            # ~350 LOC, 22 tests
+├── test_database_operations.py     # ~1,400 LOC, 88 tests
+├── test_diagnostics.py              # ~570 LOC, 33 tests
+├── test_interactions.py             # ~420 LOC, 25 tests
+├── test_linkedin_automation.py      # ~4,000 LOC, 139 tests
+├── test_linkedin_mappings.py        # ~530 LOC, 82 tests
+├── test_models.py                   # ~760 LOC, 53 tests
+├── test_navigation.py               # ~1,150 LOC, 89 tests
+├── test_scraping.py                 # ~100 LOC, 8 tests
+├── test_selectors.py                # ~340 LOC, 29 tests
+├── test_settings.py                 # ~820 LOC, 94 tests
+├── test_tui*.py                     # TUI screen tests (78 tests across 8 files)
 └── README.md                        # This file
 ```
 
@@ -503,6 +515,6 @@ Before committing new code, ensure:
 
 ---
 
-**Total Tests**: 200+ tests covering all major functionality
+**Total Tests**: 825 tests covering all major functionality
 **Test Coverage**: Targeting 80%+ code coverage
 **Test Execution Time**: ~5-10 seconds (with pytest-xdist)

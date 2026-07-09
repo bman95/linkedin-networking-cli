@@ -5,18 +5,22 @@ Tests model creation, validation, defaults, and custom methods.
 """
 
 import json
+from datetime import datetime
+
 import pytest
-from datetime import datetime, timezone, date
-from sqlmodel import Session, select
+from sqlmodel import select
 
 from database.models import (
+    ACCEPTED_STATUSES,
+    PENDING_STATUSES,
+    SENT_STATUSES,
+    Analytics,
     Campaign,
     Contact,
-    Analytics,
-    Settings,
+    ContactStatus,
     DailyConnectionCount,
+    Settings,
 )
-
 
 # ============================================================================
 # Campaign Model Tests
@@ -275,6 +279,91 @@ class TestContactModel:
             status=status
         )
         assert contact.status == status
+
+
+# ============================================================================
+# ContactStatus Enum Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestContactStatusEnum:
+    """The ContactStatus str-Enum is the single source of truth for statuses."""
+
+    def test_members_equal_their_string_values(self):
+        """Each member equals (and is) its plain string value."""
+        assert ContactStatus.FOUND == "found"
+        assert ContactStatus.RESERVED == "reserved"
+        assert ContactStatus.SENT == "sent"
+        assert ContactStatus.POSSIBLY_SENT == "possibly_sent"
+        assert ContactStatus.PENDING == "pending"
+        assert ContactStatus.ACCEPTED == "accepted"
+        assert ContactStatus.DECLINED == "declined"
+        assert ContactStatus.FAILED == "failed"
+
+    def test_members_are_str_instances(self):
+        """A str mix-in keeps every existing string-literal consumer working."""
+        assert isinstance(ContactStatus.SENT, str)
+        # Hash/equality parity: a member finds its key in a plain-string dict
+        # (this is what makes the GROUP BY stat lookups work unchanged).
+        assert {"sent": 3}.get(ContactStatus.SENT) == 3
+
+    def test_sent_statuses_group_members(self):
+        """SENT_STATUSES is exactly {sent, possibly_sent, accepted, declined}."""
+        assert SENT_STATUSES == {
+            ContactStatus.SENT,
+            ContactStatus.POSSIBLY_SENT,
+            ContactStatus.ACCEPTED,
+            ContactStatus.DECLINED,
+        }
+        # Matches the raw string groupings used before the refactor.
+        assert set(SENT_STATUSES) == {"sent", "possibly_sent", "accepted", "declined"}
+
+    def test_pending_statuses_group_members(self):
+        """PENDING_STATUSES is exactly {sent, possibly_sent}."""
+        assert PENDING_STATUSES == {ContactStatus.SENT, ContactStatus.POSSIBLY_SENT}
+        assert set(PENDING_STATUSES) == {"sent", "possibly_sent"}
+
+    def test_accepted_statuses_group_members(self):
+        """ACCEPTED_STATUSES is exactly {accepted}."""
+        assert ACCEPTED_STATUSES == {ContactStatus.ACCEPTED}
+        assert set(ACCEPTED_STATUSES) == {"accepted"}
+
+    def test_reserved_excluded_from_sent_and_pending(self):
+        """A pre-send reservation counts as neither sent nor pending."""
+        assert ContactStatus.RESERVED not in SENT_STATUSES
+        assert ContactStatus.RESERVED not in PENDING_STATUSES
+
+    def test_pending_excluded_from_sent_and_pending_groups(self):
+        """An invite discovered as already out (Pending button) was not sent by
+        this app's runs: it belongs to neither the sent totals nor the
+        acceptance-polling group."""
+        assert ContactStatus.PENDING not in SENT_STATUSES
+        assert ContactStatus.PENDING not in PENDING_STATUSES
+
+    def test_contact_default_status_is_found_plain_string(self, db_session):
+        """The Contact default is ContactStatus.FOUND, stored/read as "found"."""
+        contact = Contact(
+            campaign_id=1,
+            name="John Doe",
+            profile_url="https://linkedin.com/in/johndoe",
+        )
+        assert contact.status == "found"
+        assert contact.status == ContactStatus.FOUND
+
+        # Round-trips through SQLite as the plain string "found".
+        campaign = Campaign(name="Test Campaign")
+        db_session.add(campaign)
+        db_session.commit()
+        db_session.refresh(campaign)
+        contact.campaign_id = campaign.id
+        db_session.add(contact)
+        db_session.commit()
+        db_session.refresh(contact)
+        assert contact.status == "found"
+        raw = db_session.connection().exec_driver_sql(
+            "SELECT status FROM contact WHERE id = ?", (contact.id,)
+        ).fetchone()
+        assert raw[0] == "found"
 
 
 # ============================================================================

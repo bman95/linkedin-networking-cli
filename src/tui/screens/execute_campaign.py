@@ -22,20 +22,34 @@ class ExecuteCampaignScreen(AutomationRunScreen):
         super().__init__(db_manager, settings)
         self._campaigns: dict = {}
         self._selected = None
+        self._used_today = None
 
     def compose_selection(self) -> ComposeResult:
         yield Static("ACTIVE CAMPAIGN", classes="eyebrow")
         yield Select([], prompt="Loading campaigns…", id="run-campaign")
 
     def ready_hint(self) -> str:
-        return "Select a campaign, then ctrl+r to start sending invites."
+        hint = "Select a campaign, then ctrl+r to start sending invites."
+        if self._used_today:
+            hint += f"  {self._used_today} already sent today."
+        return hint
 
     # ── selection data ────────────────────────────────────────────────────
 
     def fetch_options(self):
-        return self._db_manager.get_campaigns(active_only=True)
+        campaigns = self._db_manager.get_campaigns(active_only=True)
+        try:
+            from datetime import date
 
-    def apply_options(self, campaigns) -> None:
+            used_today = self._db_manager.get_daily_connection_count(
+                date.today().isoformat()
+            )
+        except Exception:  # a quota hint must never block the run screen
+            used_today = None
+        return campaigns, used_today
+
+    def apply_options(self, data) -> None:
+        campaigns, self._used_today = data
         if not campaigns:
             self._run_can_start = False
             self._set_status(
@@ -72,6 +86,13 @@ class ExecuteCampaignScreen(AutomationRunScreen):
         results = await automation.search_and_connect(
             self._selected, limit=limit, progress_callback=self.progress
         )
+        # A protective stop (inline CAPTCHA / challenge wall) must never be
+        # reported as a clean run — checked before the empty-scan mapping so a
+        # first-page CAPTCHA doesn't masquerade as "no profiles" (mirrors the
+        # classic CLI's _run_campaign_automation).
+        if results.get("stopped_reason"):
+            results["status"] = "safety_stop"
+            return results
         if results.get("scanned", 0) == 0:
             return {"status": "no_profiles"}
         results["status"] = "success"
@@ -80,6 +101,16 @@ class ExecuteCampaignScreen(AutomationRunScreen):
     def render_result(self, result: dict) -> str:
         if result.get("status") == "no_profiles":
             return "No profiles matched the campaign's criteria — nothing sent."
+        if result.get("status") == "safety_stop":
+            lines = [
+                "Automation stopped early: LinkedIn presented a "
+                "CAPTCHA/challenge.",
+                "Resolve it in the browser before running again.",
+                f"Invites sent before the stop: {result.get('sent', 0)}",
+            ]
+            if result.get("possibly_sent", 0):
+                lines.append(f"Possibly sent: {result.get('possibly_sent', 0)}")
+            return "\n".join(lines)
         lines = [
             "Run complete.",
             f"Profiles scanned: {result.get('scanned', 0)}",

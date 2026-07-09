@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import List, Optional, Tuple
 
 from rich.text import Text
 from textual import work
@@ -47,9 +46,9 @@ class DashboardData:
     """An immutable snapshot handed from the worker thread to the UI thread."""
 
     stats: dict
-    recent: List[Tuple]  # (name: Text, status, sent, accepted, rate) — ready for add_row
-    used_today: Optional[int]
-    daily_limit: Optional[int]
+    recent: list[tuple]  # (name: Text, status, sent, accepted, rate) — ready for add_row
+    used_today: int | None
+    daily_limit: int | None
 
 
 class DashboardScreen(BaseScreen):
@@ -62,6 +61,14 @@ class DashboardScreen(BaseScreen):
     ]
 
     SCREEN_TITLE = "Dashboard"
+
+    HINTS = (
+        ("enter", "open campaign"),
+        ("esc", "back"),
+        ("r", "refresh"),
+        ("q", "quit"),
+        ("ctrl+p", "commands"),
+    )
 
     RECENT_COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate")
 
@@ -76,10 +83,9 @@ class DashboardScreen(BaseScreen):
         ("used-today", "Used Today"),
     )
 
-    def __init__(self, db_manager: Optional[DatabaseManager]) -> None:
+    def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
         self._db_manager = db_manager
-        self._load_generation = 0
 
     def compose_body(self) -> ComposeResult:
         with Container(id="dashboard-body"):
@@ -106,16 +112,15 @@ class DashboardScreen(BaseScreen):
 
     def load_dashboard(self) -> None:
         """Start a fresh load, invalidating any in-flight (slower) one."""
-        self._load_generation += 1
-        # Capture the app on the UI thread (see CampaignsScreen for why the
-        # deferred worker body must not resolve self.app itself).
-        self._run_load(self.app, self._load_generation)
+        # begin_load captures the app on the UI thread (see workers.py for why
+        # the deferred worker body must not resolve self.app itself).
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True)
     def _run_load(self, app: App, generation: int) -> None:
         """Fetch every dashboard datum off the event loop, then populate."""
         if self._db_manager is None:
-            self._marshal_populate(app, generation, None, "Database unavailable.")
+            self.marshal_load(app, generation, self._populate, None, "Database unavailable.")
             return
         try:
             stats = self._db_manager.get_dashboard_stats()
@@ -123,16 +128,18 @@ class DashboardScreen(BaseScreen):
             contacts = self._db_manager.get_contacts()
             used_today, daily_limit = self._load_quota()
         except Exception as exc:  # surface in-place, never crash the UI
-            self._marshal_populate(app, generation, None, f"Error loading dashboard: {exc}")
+            self.marshal_load(
+                app, generation, self._populate, None, f"Error loading dashboard: {exc}"
+            )
             return
 
         recent = self._recent_rows(campaigns, contacts)
         data = DashboardData(
             stats=stats, recent=recent, used_today=used_today, daily_limit=daily_limit
         )
-        self._marshal_populate(app, generation, data, None)
+        self.marshal_load(app, generation, self._populate, data, None)
 
-    def _load_quota(self) -> Tuple[Optional[int], Optional[int]]:
+    def _load_quota(self) -> tuple[int | None, int | None]:
         """Today's connection usage and the configured daily limit.
 
         ``AppSettings()`` touches the filesystem (it creates the app dir), so a
@@ -153,7 +160,7 @@ class DashboardScreen(BaseScreen):
             return None, None
 
     @staticmethod
-    def _recent_rows(campaigns, contacts) -> List[Tuple]:
+    def _recent_rows(campaigns, contacts) -> list[tuple]:
         """Top-N campaigns, most recently active first, as table-ready rows.
 
         Sent/accepted/rate are computed from live ``contacts`` — the same source
@@ -185,6 +192,9 @@ class DashboardScreen(BaseScreen):
             rate = (c_accepted / c_sent * 100) if c_sent > 0 else 0.0
             rows.append(
                 (
+                    # Row key first: it carries the campaign id so activating a
+                    # row can open its detail screen.
+                    str(c.id),
                     # User-controlled — render literally (see CampaignsScreen).
                     Text(c.name),
                     "Active" if c.active else "Inactive",
@@ -195,37 +205,22 @@ class DashboardScreen(BaseScreen):
             )
         return rows
 
-    def _marshal_populate(
-        self, app: App, generation: int, data: Optional[DashboardData], error: Optional[str]
-    ) -> None:
-        """Hand results back to the UI thread, but only while the app runs."""
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, data, error)
-        except RuntimeError:
-            # App stopped between the is_running check and the call; ignore.
-            return
-
-    def _populate(
-        self, generation: int, data: Optional[DashboardData], error: Optional[str]
-    ) -> None:
-        if not self.is_mounted:
-            return
-        if generation != self._load_generation:
-            return
+    def _populate(self, data: DashboardData | None, error: str | None) -> None:
         status = self.query_one("#dashboard-status", Static)
         if error is not None:
             self._set_cards_blank()
             self.query_one("#dashboard-recent", DataTable).clear()
-            status.update(error)
+            # Literal render: raw exception text may contain markup-like brackets.
+            status.update(Text(error))
             return
 
         assert data is not None  # error is None ⇒ data is present
         self._fill_cards(data)
         self._fill_recent(data.recent)
         if data.stats.get("total_campaigns", 0) == 0:
-            status.update("No campaigns yet. Create one in the classic CLI (linkedin-cli).")
+            status.update(
+                "No campaigns yet. Use Create Campaign (ctrl+p, or 3 on Home) to add one."
+            )
         else:
             status.update("Updated.")
 
@@ -269,8 +264,23 @@ class DashboardScreen(BaseScreen):
             at_cap = data.daily_limit > 0 and data.used_today >= data.daily_limit
             used_value.set_classes("stat-value -warn" if at_cap else "stat-value")
 
-    def _fill_recent(self, rows: List[Tuple[str, str, str, str, str]]) -> None:
+    def _fill_recent(self, rows: list[tuple]) -> None:
         table = self.query_one("#dashboard-recent", DataTable)
         table.clear()
-        for row in rows:
-            table.add_row(*row)
+        for key, *row in rows:
+            table.add_row(*row, key=key)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Activating a recent-campaigns row opens that campaign's detail."""
+        if self._db_manager is None:
+            return
+        key = event.row_key.value if event.row_key is not None else None
+        if key is None:
+            return
+        try:
+            campaign_id = int(key)
+        except (TypeError, ValueError):
+            return
+        from .campaign_detail import CampaignDetailScreen
+
+        self.app.push_screen(CampaignDetailScreen(self._db_manager, campaign_id))

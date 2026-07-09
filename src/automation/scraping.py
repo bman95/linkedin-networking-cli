@@ -5,7 +5,6 @@ All functions operate on an async Playwright ``Page`` and must be awaited.
 """
 
 import re
-from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 
 from utils.logging import get_logger
@@ -13,7 +12,7 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-async def get_contact_info(page) -> Dict[str, Optional[str]]:
+async def get_contact_info(page) -> dict[str, str | None]:
     """Extract contact information from LinkedIn profile."""
     contact_info = {
         "email": None,
@@ -129,7 +128,7 @@ async def get_contact_info(page) -> Dict[str, Optional[str]]:
     return contact_info
 
 
-async def get_profession(page) -> Optional[str]:
+async def get_profession(page) -> str | None:
     """Extract profession/headline from LinkedIn profile."""
     try:
         profession_selectors = [
@@ -152,7 +151,7 @@ async def get_profession(page) -> Optional[str]:
     return None
 
 
-async def get_location(page) -> Optional[str]:
+async def get_location(page) -> str | None:
     """Extract location from LinkedIn profile."""
     try:
         location_selectors = [
@@ -175,7 +174,7 @@ async def get_location(page) -> Optional[str]:
     return None
 
 
-async def get_experience(page) -> List[Dict[str, Optional[str]]]:
+async def get_experience(page) -> list[dict[str, str | None]]:
     """Extract work experience from LinkedIn profile."""
     experience = []
 
@@ -281,7 +280,7 @@ async def get_experience(page) -> List[Dict[str, Optional[str]]]:
     return experience
 
 
-async def get_education(page) -> List[Dict[str, Optional[str]]]:
+async def get_education(page) -> list[dict[str, str | None]]:
     """Extract education from LinkedIn profile."""
     education = []
 
@@ -374,23 +373,31 @@ async def get_education(page) -> List[Dict[str, Optional[str]]]:
 async def get_open_to_work_status(page) -> bool:
     """Check if candidate has 'Open to Work' badge."""
     try:
+        # Scoped, visible indicators only: the dedicated badge element or the
+        # profile photo's #OPEN_TO_WORK frame in the top card. Deliberately no
+        # whole-DOM substring check — ``page.content()`` matching
+        # "open to work" false-positives on hidden SDUI templates, i18n
+        # bundles and "People also viewed" sidebar entries.
+        # NOTE: the top-card photo-frame candidates below are best-effort and
+        # need live-DOM verification against current LinkedIn markup.
         open_to_work_indicators = [
             ".open-to-work-badge",
             "[data-test-id='open-to-work-badge']",
             ".pv-open-to-work-badge",
-            "span:has-text('Open to work')",
-            ".artdeco-badge:has-text('Open to work')",
+            # The #OPEN_TO_WORK frame around the top-card profile photo (the
+            # photo's alt text carries the frame label).
+            ".pv-top-card-profile-picture img[alt*='open to work' i]",
+            ".pv-top-card-profile-picture__container:has-text('#OPEN_TO_WORK')",
+            # Badge text scoped to the top card, not the whole page (a bare
+            # span:has-text would also match the "People also viewed" rail).
+            ".pv-top-card span:has-text('Open to work')",
+            ".pv-top-card .artdeco-badge:has-text('Open to work')",
         ]
 
         for selector in open_to_work_indicators:
             element = await page.query_selector(selector)
             if element and await element.is_visible():
                 return True
-
-        # Also check in profile text
-        page_content = (await page.content()).lower()
-        if "open to work" in page_content or "opentowork" in page_content:
-            return True
 
         return False
 
@@ -399,7 +406,7 @@ async def get_open_to_work_status(page) -> bool:
         return False
 
 
-async def collect_public_information(page) -> Tuple[Optional[str], Optional[str], List[Dict], List[Dict]]:
+async def collect_public_information(page) -> tuple[str | None, str | None, list[dict], list[dict]]:
     """
     Collect comprehensive public profile information.
 

@@ -14,18 +14,17 @@ irreversible action gets an explicit y/n gate, never a single-keystroke wipe.
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.widgets import Static
 
+from cli.helpers import acceptance_rate, contacts_csv_filename, write_contacts_csv
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
@@ -33,45 +32,18 @@ from .base import BaseScreen
 
 logger = get_logger(__name__)
 
-# CSV columns, matching the classic CLI's export_contacts for parity.
-_CSV_FIELDS = (
-    "name",
-    "profile_url",
-    "headline",
-    "location",
-    "company",
-    "status",
-    "connection_sent_at",
-    "connection_accepted_at",
-    "notes",
-)
-
-
-def _csv_value(value) -> str:
-    """Normalize a value for CSV output (mirrors the classic ``_csv_value``)."""
-    if value is None:
-        return ""
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)
-
 
 def export_contacts_csv(campaign_name: str, contacts) -> Path:
-    """Write a campaign's contacts to a timestamped CSV under the exports dir."""
-    safe = "".join(
-        c if c.isalnum() or c in ("-", "_") else "_" for c in campaign_name
-    ).strip("_") or "campaign"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    """Write a campaign's contacts to a timestamped CSV under the exports dir.
+
+    The field list and writing logic are shared with the classic CLI
+    (``cli.helpers``); only the destination policy (a fixed exports directory,
+    since the TUI has no path prompt) lives here.
+    """
     export_dir = Path.home() / ".linkedin-networking-cli" / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
-    path = export_dir / f"{safe}_contacts_{timestamp}.csv"
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(_CSV_FIELDS))
-        writer.writeheader()
-        for contact in contacts:
-            writer.writerow(
-                {field: _csv_value(getattr(contact, field, None)) for field in _CSV_FIELDS}
-            )
+    path = export_dir / contacts_csv_filename(campaign_name)
+    write_contacts_csv(path, contacts)
     return path
 
 
@@ -88,15 +60,11 @@ class CampaignDetail:
     performance: str
 
 
-def acceptance_rate(sent: int, accepted: int) -> float:
-    return (accepted / sent * 100) if sent > 0 else 0.0
-
-
 class CampaignDetailScreen(BaseScreen):
     """Full view of a single campaign, with manage actions."""
 
     BINDINGS = [
-        ("escape", "app.pop_screen", "Back"),
+        ("escape", "back", "Back"),
         ("r", "refresh", "Refresh"),
         Binding("e", "edit", "Edit"),
         Binding("a", "toggle_active", "Toggle active"),
@@ -116,14 +84,13 @@ class CampaignDetailScreen(BaseScreen):
         ("q", "quit"),
     )
 
-    def __init__(self, db_manager: Optional[DatabaseManager], campaign_id: int) -> None:
+    def __init__(self, db_manager: DatabaseManager | None, campaign_id: int) -> None:
         super().__init__()
         self._db_manager = db_manager
         self._campaign_id = campaign_id
-        self._load_generation = 0
         # Cached active flag so the toggle action knows the current state without
         # re-reading; refreshed on every load.
-        self._active: Optional[bool] = None
+        self._active: bool | None = None
         self._busy = False  # a mutating action is in flight
         self._confirming_delete = False
 
@@ -158,25 +125,26 @@ class CampaignDetailScreen(BaseScreen):
     # ── load ──────────────────────────────────────────────────────────────
 
     def load_detail(self) -> None:
-        self._load_generation += 1
-        self._run_load(self.app, self._load_generation)
+        self._run_load(*self.begin_load())
 
     @work(thread=True, exclusive=True)
     def _run_load(self, app: App, generation: int) -> None:
         if self._db_manager is None:
-            self._marshal(app, generation, None, "Database unavailable.")
+            self.marshal_load(app, generation, self._populate, None, "Database unavailable.")
             return
         try:
             detail = self._gather()
         except Exception as exc:
-            self._marshal(app, generation, None, f"Error loading campaign: {exc}")
+            self.marshal_load(
+                app, generation, self._populate, None, f"Error loading campaign: {exc}"
+            )
             return
         if detail is None:
-            self._marshal(app, generation, None, "Campaign not found.")
+            self.marshal_load(app, generation, self._populate, None, "Campaign not found.")
             return
-        self._marshal(app, generation, detail, None)
+        self.marshal_load(app, generation, self._populate, detail, None)
 
-    def _gather(self) -> Optional[CampaignDetail]:
+    def _gather(self) -> CampaignDetail | None:
         assert self._db_manager is not None  # guarded in _run_load
         c = self._db_manager.get_campaign(self._campaign_id)
         if c is None:
@@ -211,23 +179,7 @@ class CampaignDetailScreen(BaseScreen):
             performance=performance,
         )
 
-    def _marshal(
-        self, app: App, generation: int, detail: Optional[CampaignDetail], error: Optional[str]
-    ) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._populate, generation, detail, error)
-        except RuntimeError:
-            return
-
-    def _populate(
-        self, generation: int, detail: Optional[CampaignDetail], error: Optional[str]
-    ) -> None:
-        if not self.is_mounted:
-            return
-        if generation != self._load_generation:
-            return
+    def _populate(self, detail: CampaignDetail | None, error: str | None) -> None:
         if error is not None:
             self._active = None
             self._set_status(error, "error")
@@ -238,9 +190,22 @@ class CampaignDetailScreen(BaseScreen):
         self.query_one("#detail-body-targeting", Static).update(detail.targeting)
         self.query_one("#detail-body-message", Static).update(detail.message)
         self.query_one("#detail-body-performance", Static).update(detail.performance)
-        self._set_status("Read-only view.  e edit · a toggle active · x export · d delete")
+        # The hint bar below already lists the actions; don't repeat them here.
+        self._set_status("Read-only view.")
 
     # ── actions ───────────────────────────────────────────────────────────
+
+    def action_back(self) -> None:
+        """``esc``: cancel an armed delete first; only then leave the screen.
+
+        The delete prompt promises "esc to cancel", so esc while confirming must
+        cancel the confirmation — not pop the whole screen.
+        """
+        if self._confirming_delete:
+            self._confirming_delete = False
+            self._set_status("Delete cancelled.")
+            return
+        self.app.pop_screen()
 
     def action_edit(self) -> None:
         self._confirming_delete = False
@@ -274,7 +239,11 @@ class CampaignDetailScreen(BaseScreen):
         # action never fires on a single keystroke.
         if not self._confirming_delete:
             self._confirming_delete = True
-            self._set_status("Delete this campaign and all its contacts? Press d again to confirm, esc to cancel.", "warn")
+            self._set_status(
+                "Delete this campaign and all its contacts? "
+                "Press d again to confirm, esc to cancel.",
+                "warn",
+            )
             return
         self._confirming_delete = False
         self._busy = True
@@ -287,9 +256,9 @@ class CampaignDetailScreen(BaseScreen):
         try:
             self._db_manager.update_campaign(self._campaign_id, updates)
         except Exception as exc:
-            self._marshal_action(app, f"Error updating campaign: {exc}", reload=False)
+            self.marshal(app, self._after_action, f"Error updating campaign: {exc}", False)
             return
-        self._marshal_action(app, None, reload=True)
+        self.marshal(app, self._after_action, None, True)
 
     @work(thread=True, exclusive=True, group="export")
     def _run_export(self, app: App) -> None:
@@ -298,32 +267,24 @@ class CampaignDetailScreen(BaseScreen):
             campaign = self._db_manager.get_campaign(self._campaign_id)
             contacts = self._db_manager.get_contacts(self._campaign_id)
         except Exception as exc:
-            self._marshal_export(app, f"Error loading contacts: {exc}", "error")
+            self.marshal(app, self._after_export, f"Error loading contacts: {exc}", "error")
             return
         if campaign is None:
-            self._marshal_export(app, "Campaign not found.", "error")
+            self.marshal(app, self._after_export, "Campaign not found.", "error")
             return
         if not contacts:
-            self._marshal_export(app, "No contacts to export yet.", "warn")
+            self.marshal(app, self._after_export, "No contacts to export yet.", "warn")
             return
         try:
             path = export_contacts_csv(campaign.name, contacts)
         except Exception as exc:
-            self._marshal_export(app, f"Error writing CSV: {exc}", "error")
+            self.marshal(app, self._after_export, f"Error writing CSV: {exc}", "error")
             return
-        self._marshal_export(app, f"✓ Exported {len(contacts)} contacts to {path}", "good")
-
-    def _marshal_export(self, app: App, message: str, kind: str) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._after_export, message, kind)
-        except RuntimeError:
-            return
+        self.marshal(
+            app, self._after_export, f"✓ Exported {len(contacts)} contacts to {path}", "good"
+        )
 
     def _after_export(self, message: str, kind: str) -> None:
-        if not self.is_mounted:
-            return
         self._busy = False
         self._set_status(message, kind)
 
@@ -333,21 +294,11 @@ class CampaignDetailScreen(BaseScreen):
         try:
             ok = self._db_manager.delete_campaign(self._campaign_id)
         except Exception as exc:
-            self._marshal_action(app, f"Error deleting campaign: {exc}", reload=False)
+            self.marshal(app, self._after_action, f"Error deleting campaign: {exc}", False)
             return
-        self._marshal_action(app, "__deleted__" if ok else "Campaign not found.", reload=False)
+        self.marshal(app, self._after_action, "__deleted__" if ok else "Campaign not found.", False)
 
-    def _marshal_action(self, app: App, message: Optional[str], reload: bool) -> None:
-        if not app.is_running:
-            return
-        try:
-            app.call_from_thread(self._after_action, message, reload)
-        except RuntimeError:
-            return
-
-    def _after_action(self, message: Optional[str], reload: bool) -> None:
-        if not self.is_mounted:
-            return
+    def _after_action(self, message: str | None, reload: bool) -> None:
         self._busy = False
         if message == "__deleted__":
             # Pop back to the (refreshed) campaigns list.
@@ -364,4 +315,6 @@ class CampaignDetailScreen(BaseScreen):
     def _set_status(self, message: str, kind: str = "") -> None:
         status = self.query_one("#detail-status", Static)
         status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(message)
+        # Text() renders literally: messages carry campaign names and raw
+        # exception text, whose brackets must not be parsed as markup.
+        status.update(Text(message))

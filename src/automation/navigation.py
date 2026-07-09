@@ -66,19 +66,19 @@ All functions are async and operate on an async Playwright ``Page``.
 import asyncio
 import time
 import urllib.parse
-from typing import Awaitable, Callable, Dict, Optional, Tuple
+from collections.abc import Awaitable, Callable
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from automation import selectors as sel
 from automation.diagnostics import capture_anomaly_context, capture_error_context
-from utils.logging import get_logger
 from exceptions import (
     CaptchaDetectedException,
     NotAuthenticatedException,
     UnexpectedLandingException,
 )
+from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -153,7 +153,7 @@ def _path_segments(path: str) -> set:
     return {seg for seg in path.split("/") if seg}
 
 
-def _split(url: str) -> Tuple[str, Dict[str, str]]:
+def _split(url: str) -> tuple[str, dict[str, str]]:
     """Return ``(path, query_dict)`` for ``url``.
 
     The path is lower-cased and trailing-slash-stripped so ``/feed`` and
@@ -171,7 +171,7 @@ def _split(url: str) -> Tuple[str, Dict[str, str]]:
     return path, query
 
 
-def landed_on_challenge(landed_url: str) -> Optional[str]:
+def landed_on_challenge(landed_url: str) -> str | None:
     """Return ``"login"`` / ``"challenge"`` if the landed path is a wall, else None.
 
     URL-over-DOM: a positive result is trusted regardless of what the DOM shows.
@@ -199,7 +199,7 @@ def landed_on_checkpoint(landed_url: str) -> bool:
     return "checkpoint" in _path_segments(_split(landed_url)[0])
 
 
-def diff_redirect(requested_url: str, landed_url: str) -> Optional[Tuple[str, str]]:
+def diff_redirect(requested_url: str, landed_url: str) -> tuple[str, str] | None:
     """Compare requested vs landed URL; return ``(reason, detail)`` or None.
 
     Flags two low-noise mismatches:
@@ -259,7 +259,7 @@ async def _settle(page, settle_timeout_ms: int) -> None:
         logger.debug("settle timeout wait skipped: %s", exc)
 
 
-async def sweep_unexpected_overlay(page, *, context: Optional[dict] = None) -> bool:
+async def sweep_unexpected_overlay(page, *, context: dict | None = None) -> bool:
     """Sweep for a visible blocking overlay the workflow did not open.
 
     Non-fatal: a stray interstitial/upsell/survey modal is an anomaly, not a
@@ -401,7 +401,7 @@ async def _goto_with_retry(
     url: str,
     *,
     timeout: int,
-    wait_until: Optional[str],
+    wait_until: str | None,
     max_retries: int,
     retry_backoff_base_s: int,
     hard_timeout_margin_s: int,
@@ -443,7 +443,7 @@ async def _goto_with_retry(
         try:
             await asyncio.wait_for(page.goto(url, **goto_kwargs), timeout=hard)
             return
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             # ONLY the outer watchdog firing means the renderer is wedged: the
             # driver timeout never resolved, so the goto deadlocked. Surface it
             # as a crash so the caller refreshes the browser instead of retrying
@@ -479,7 +479,7 @@ async def _goto_with_retry(
 _EMAIL_MODAL_FINGERPRINT = "label[for='email']"
 
 
-async def _interstitial_present(page, fingerprint: Optional[str]) -> bool:
+async def _interstitial_present(page, fingerprint: str | None) -> bool:
     """Whether a gating fingerprint is on the page (non-raising). None => always."""
     if fingerprint is None:
         return True
@@ -490,7 +490,7 @@ async def _interstitial_present(page, fingerprint: Optional[str]) -> bool:
         return False
 
 
-async def surf_benign_interstitials(page, *, context: Optional[dict] = None) -> bool:
+async def surf_benign_interstitials(page, *, context: dict | None = None) -> bool:
     """Auto-dismiss the *safe-to-surf* interstitials (cookie banner, email modal).
 
     Surfing means clicking away only the overlays that are benign decoys — a
@@ -550,13 +550,13 @@ async def navigate_guarded(
     page,
     url: str,
     *,
-    strict_path: Optional[str] = None,
+    strict_path: str | None = None,
     check_path: bool = True,
     timeout: int = _DEFAULT_GOTO_TIMEOUT_MS,
     settle_timeout_ms: int = 2_000,
-    wait_until: Optional[str] = None,
-    context: Optional[dict] = None,
-    recover: Optional[RecoverCallback] = None,
+    wait_until: str | None = None,
+    context: dict | None = None,
+    recover: RecoverCallback | None = None,
     max_retries: int = _DEFAULT_MAX_RETRIES,
     retry_backoff_base_s: int = _DEFAULT_BACKOFF_BASE_S,
     hard_timeout_margin_s: int = _DEFAULT_HARD_MARGIN_S,
@@ -657,7 +657,7 @@ async def navigate_guarded(
 
         try:
             await asyncio.wait_for(_post_goto(), timeout=post_goto_hard_s)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             # A wedged renderer hung the post-goto reads. Surface it crash-shaped
             # so the outer recovery refreshes the context and retries.
             raise PlaywrightError(
@@ -694,7 +694,7 @@ async def navigate_guarded(
                 recover_exc,
                 url,
             )
-            raise exc
+            raise exc  # noqa: B904 — re-raise the original; recovery error already logged
         if fresh is not None:
             page = fresh
         # One full retry on the fresh page. A second crash propagates: a context
@@ -709,7 +709,7 @@ async def confirm_logged_in_dom(
     page,
     *,
     timeout: int = 60_000,
-    context: Optional[dict] = None,
+    context: dict | None = None,
 ) -> None:
     """Confirm login by URL *and* a logged-in DOM landmark.
 
@@ -785,9 +785,9 @@ async def verify_listing_rendered(
     page,
     ready_selector: "sel.Selector",
     *,
-    empty_selector: Optional[str] = None,
+    empty_selector: str | None = None,
     ready_timeout_ms: int = 10_000,
-    context: Optional[dict] = None,
+    context: dict | None = None,
 ) -> bool:
     """Disambiguate "empty listing" from "listing not rendered yet".
 
@@ -821,7 +821,7 @@ async def verify_listing_rendered(
     if empty_selector:
         race_css = f"{race_css}, {empty_selector}"
 
-    async def _attempt() -> Optional[str]:
+    async def _attempt() -> str | None:
         """Return 'ready', 'empty', or None (nothing appeared in time)."""
         try:
             await page.wait_for_selector(race_css, timeout=ready_timeout_ms)
@@ -894,7 +894,7 @@ async def run_bounded(
     awaitable: Awaitable,
     *,
     timeout_s: float = _DEFAULT_INTERACTION_WATCHDOG_S,
-    recover: Optional[RecoverCallback] = None,
+    recover: RecoverCallback | None = None,
     label: str = "unit",
 ):
     """Run one unit of page interaction under a hard watchdog. Returns its result.
@@ -931,7 +931,7 @@ async def run_bounded(
     start = time.monotonic()
     try:
         result = await asyncio.wait_for(awaitable, timeout=timeout_s)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "%s wedged the renderer (>%.0fs) — refreshing browser",
             label,
