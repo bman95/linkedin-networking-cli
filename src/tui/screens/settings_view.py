@@ -18,7 +18,7 @@ from datetime import date
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.widgets import Static
+from textual.widgets import Button, Static
 
 from cli.helpers import mask_email
 from database.operations import DatabaseManager
@@ -45,7 +45,12 @@ class SettingsData:
 
 
 class SettingsScreen(BaseScreen):
-    """Read-only view of the application's effective configuration."""
+    """Read-only view of the application's effective configuration.
+
+    Interaction design (owner rule, 2026-07-09): Refresh is a visible, focusable
+    button below the sections — reachable with tab + Enter — with ``r`` kept as
+    an optional accelerator, never the only path.
+    """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
@@ -74,10 +79,16 @@ class SettingsScreen(BaseScreen):
                     # contain Rich markup characters; treat them literally so a
                     # stray "[/]" can't raise MarkupError and crash the screen.
                     yield Static("", id=f"body-{section_id}", markup=False)
+            yield Button("Refresh", id="settings-refresh", classes="flat-button")
         yield Static("Loading settings…", id="settings-status", classes="status-line")
 
     def on_mount(self) -> None:
         self.load_settings()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "settings-refresh":
+            event.stop()
+            self.action_refresh()
 
     def action_refresh(self) -> None:
         self.query_one("#settings-status", Static).update("Refreshing…")

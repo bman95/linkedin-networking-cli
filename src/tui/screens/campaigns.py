@@ -14,7 +14,8 @@ from __future__ import annotations
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.widgets import DataTable, Static
+from textual.containers import Horizontal
+from textual.widgets import Button, DataTable, Static
 
 from cli.helpers import acceptance_rate as _acceptance_rate
 from cli.helpers import campaign_get_field
@@ -41,6 +42,10 @@ class CampaignsScreen(BaseScreen):
 
     Loads data through ``DatabaseManager.get_campaigns`` in a threaded worker so
     the blocking SQLite read does not stall the UI.
+
+    Interaction design (owner rule, 2026-07-09): New Campaign and Refresh are
+    visible, focusable buttons below the table — reachable with tab + Enter —
+    with ``n``/``r`` kept as optional accelerators, never the only path.
     """
 
     BINDINGS = [
@@ -69,6 +74,9 @@ class CampaignsScreen(BaseScreen):
 
     def compose_body(self) -> ComposeResult:
         yield DataTable(id="campaigns-table", zebra_stripes=True, cursor_type="row")
+        with Horizontal(id="campaigns-toolbar"):
+            yield Button("New Campaign", id="campaigns-new", classes="flat-button")
+            yield Button("Refresh", id="campaigns-refresh", classes="flat-button")
         yield Static("", id="campaigns-status", classes="status-line")
 
     def on_mount(self) -> None:
@@ -95,6 +103,14 @@ class CampaignsScreen(BaseScreen):
         except (TypeError, ValueError):
             return
         self.app.push_screen(CampaignDetailScreen(self._db_manager, campaign_id))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "campaigns-new":
+            event.stop()
+            self.action_new()
+        elif event.button.id == "campaigns-refresh":
+            event.stop()
+            self.action_refresh()
 
     def action_refresh(self) -> None:
         self.query_one("#campaigns-status", Static).update("Refreshing…")

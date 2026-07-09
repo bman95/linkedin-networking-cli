@@ -22,7 +22,7 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Grid
-from textual.widgets import DataTable, Static
+from textual.widgets import Button, DataTable, Static
 
 from database.operations import DatabaseManager
 from utils.logging import get_logger
@@ -52,7 +52,12 @@ class DashboardData:
 
 
 class DashboardScreen(BaseScreen):
-    """Overview of campaigns, contacts and connection stats."""
+    """Overview of campaigns, contacts and connection stats.
+
+    Interaction design (owner rule, 2026-07-09): Refresh is a visible, focusable
+    button below the recent-campaigns table — reachable with tab + Enter — with
+    ``r`` kept as an optional accelerator, never the only path.
+    """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
@@ -102,12 +107,18 @@ class DashboardScreen(BaseScreen):
             yield DataTable(
                 id="dashboard-recent", zebra_stripes=True, cursor_type="row"
             )
+            yield Button("Refresh", id="dashboard-refresh", classes="flat-button")
         yield Static("Loading dashboard…", id="dashboard-status", classes="status-line")
 
     def on_mount(self) -> None:
         table = self.query_one("#dashboard-recent", DataTable)
         table.add_columns(*self.RECENT_COLUMNS)
         self.load_dashboard()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "dashboard-refresh":
+            event.stop()
+            self.action_refresh()
 
     def action_refresh(self) -> None:
         self.query_one("#dashboard-status", Static).update("Refreshing…")
