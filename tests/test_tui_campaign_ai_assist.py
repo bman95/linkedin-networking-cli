@@ -10,7 +10,7 @@ like ``perform_location_search`` is overridden in test_tui_location_search.py.
 import threading
 
 import pytest
-from textual.widgets import Button, Input, Select, Static, TextArea
+from textual.widgets import Button, Input, ListView, Select, Static, TextArea
 
 from database.operations import DatabaseManager
 from llm_assist import ExtractedCampaign, ExtractionResult
@@ -49,12 +49,24 @@ def _result(data=None, flagged=(), location=None, industry=None, network=None) -
 
 
 async def goto_create(pilot) -> CreateCampaignScreen:
+    """Open Create Campaign via arrows + Enter on the home nav list."""
     assert isinstance(pilot.app.screen, HomeScreen)
-    await pilot.press("3")
+    nav = pilot.app.screen.query_one("#home-nav", ListView)
+    while nav.index != 2:  # "New Campaign" is the third home item
+        await pilot.press("down")
+    await pilot.press("enter")
     await pilot.pause()
     screen = pilot.app.screen
     assert isinstance(screen, CreateCampaignScreen)
     return screen
+
+
+async def submit_form(pilot, screen) -> None:
+    """Tab to the form's submit button and press Enter (the only submit path)."""
+    button = screen.query_one("#form-submit", Button)
+    while pilot.app.focused is not button:
+        await pilot.press("tab")
+    await pilot.press("enter")
 
 
 async def press_button(pilot, panel, selector: str) -> None:
@@ -96,13 +108,33 @@ async def test_panel_starts_collapsed_and_field_name_keeps_focus(db_manager: Dat
 
 
 @pytest.mark.unit
-async def test_toggle_expands_and_focuses_the_description_input(db_manager: DatabaseManager):
+async def test_toggle_expands_and_focuses_the_model_select(db_manager: DatabaseManager):
+    """The model select is the first interactive control in local mode (the
+    default in tests, no LLM_API_KEY set); the toggle focuses it, not the
+    TextArea further down (regression: Tab order previously skipped it)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await goto_create(pilot)
         panel = await expand_panel(pilot, screen)
         assert panel.query_one("#ai-assist-body").display is True
+        assert app.focused is panel.query_one("#ai-assist-model-select", Select)
+
+
+@pytest.mark.unit
+async def test_toggle_focuses_the_textarea_in_hosted_mode(
+    db_manager: DatabaseManager, monkeypatch
+):
+    """In hosted mode the model select is hidden, so it must not receive
+    focus; the TextArea (the first visible control) does instead."""
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+        assert panel.query_one("#ai-assist-model-select", Select).display is False
         assert app.focused is panel.query_one("#ai-assist-input", TextArea)
 
 
@@ -139,7 +171,10 @@ async def test_happy_path_prefills_unflagged_fields_and_focuses_name(db_manager:
         assert screen.query_one("#field-industry", Select).value == "Computer Software"
         assert screen.query_one("#field-daily", Input).value == "15"
         assert screen.query_one("#field-message", Input).value == "Hi {name}!"
-        assert "Filled 8 of 8" in str(screen.query_one("#create-status", Static).render())
+        # 6 of 8: description and network were never mentioned (regression —
+        # the old "8 - len(flagged)" formula miscounted unmentioned fields as
+        # filled since they're never flagged either).
+        assert "Filled 6 of 8" in str(screen.query_one("#create-status", Static).render())
         assert app.focused is screen.query_one("#field-name", Input)
 
 
@@ -170,6 +205,55 @@ async def test_unmatched_location_leaves_any_and_shows_hint(db_manager: Database
 
 
 @pytest.mark.unit
+async def test_matched_but_needs_review_location_applies_value_and_flags(
+    db_manager: DatabaseManager,
+):
+    """A containment/ratio location match (``MatchResult.needs_review=True``)
+    is still APPLIED — unlike a fully unmatched mention — but the field must
+    also be flagged and hinted for review (regression: _apply_match treated
+    any ``matched_display_name`` as confident and skipped flagging/hinting).
+    Also exercises the Select-echo race: setting .value programmatically
+    queues a deferred Select.Changed that on_select_changed must not let
+    strip the flag we just set (mirrors the Input snapshot guard)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        result = _result(
+            data=_extracted(name="India Reach"),
+            location=MatchResult("Bangalore, India", "India", True),
+        )
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: result
+
+        panel.query_one("#ai-assist-input", TextArea).text = "connect with people in India"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        # give the value-set-triggered Select.Changed message time to be
+        # processed — this is exactly the race the snapshot guard protects.
+        await pilot.pause()
+        await pilot.pause()
+
+        location = screen.query_one("#field-location", Select)
+        hint = screen.query_one("#hint-location", Static)
+        assert location.value == "Bangalore, India"
+        assert location.has_class("field-flagged")
+        assert hint.display is True
+        assert "India" in str(hint.render())
+        assert "review" in str(hint.render()).lower()
+        assert app.focused is location
+
+        # "Filled" still counts the matched-but-flagged field, and the
+        # summary stays coherent with the amber flag shown on the field.
+        status = str(screen.query_one("#create-status", Static).render())
+        assert "Filled 2 of 8" in status
+        assert "review the highlighted ones" in status
+
+
+@pytest.mark.unit
 async def test_message_template_repair_flag_survives_the_async_echo_then_saves(
     db_manager: DatabaseManager,
 ):
@@ -197,7 +281,7 @@ async def test_message_template_repair_flag_survives_the_async_echo_then_saves(
 
         assert screen.query_one("#field-message").has_class("field-flagged")
 
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         assert await wait_until(
             pilot,
             lambda: "created" in str(screen.query_one("#create-status", Static).render()),
@@ -205,6 +289,37 @@ async def test_message_template_repair_flag_survives_the_async_echo_then_saves(
 
     campaign = db_manager.get_campaigns(active_only=False)[0]
     assert campaign.message_template == "Hi {name}, connect?"
+
+
+@pytest.mark.unit
+async def test_ai_panel_locks_after_successful_create(db_manager: DatabaseManager):
+    """A late extraction after a successful create must not write into the
+    locked form, and the panel's own controls go disabled too (regression:
+    ``_done()`` previously locked only the form, leaving the panel live)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        screen.query_one("#field-name", Input).value = "Locked Before AI"
+        await submit_form(pilot, screen)
+        assert await wait_until(
+            pilot,
+            lambda: "created" in str(screen.query_one("#create-status", Static).render()),
+        )
+
+        assert panel._locked is True
+        assert panel.query_one("#ai-assist-toggle", Button).disabled is True
+        assert panel.query_one("#ai-assist-run", Button).disabled is True
+        assert panel.query_one("#ai-assist-input", TextArea).disabled is True
+
+        # A straggling Extracted message (e.g. a run started before submit)
+        # must be a no-op on the now-locked form.
+        result = _result(data=_extracted(name="Should Not Apply"))
+        panel.post_message(CampaignAIAssistPanel.Extracted(panel, result))
+        await pilot.pause()
+        assert screen.query_one("#field-name", Input).value == "Locked Before AI"
 
 
 @pytest.mark.unit
@@ -261,6 +376,60 @@ async def test_rerun_preserves_hand_edited_fields_the_llm_did_not_mention(
         assert screen.query_one("#field-keywords", Input).value == "hand typed keywords"
 
 
+@pytest.mark.unit
+async def test_rerun_clears_stale_flag_and_hint_when_no_longer_mentioned(
+    db_manager: DatabaseManager,
+):
+    """A field flagged/hinted by one run must not keep its amber flag or
+    "You said: …" hint after a re-run whose new description drops the mention
+    (regression: fill_form_from_extraction only ever added flags/hints)."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        first = _result(
+            data=_extracted(daily_limit=99),
+            flagged={"daily_limit"},
+            location=MatchResult(None, "Atlantis", True),
+        )
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: first
+
+        panel.query_one("#ai-assist-input", TextArea).text = (
+            "connect with a lot of people in Atlantis"
+        )
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        await pilot.pause()
+
+        daily = screen.query_one("#field-daily", Input)
+        location = screen.query_one("#field-location", Select)
+        hint = screen.query_one("#hint-location", Static)
+        assert daily.has_class("field-flagged")
+        assert location.has_class("field-flagged")
+        assert hint.display is True
+        assert "Atlantis" in str(hint.render())
+
+        # Re-run: this time neither daily_limit nor the location is mentioned.
+        second = _result(data=_extracted(name="Second Pass"))
+        panel.perform_extraction = lambda *a, **k: second
+
+        panel.query_one("#ai-assist-input", TextArea).text = "software engineers"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert daily.has_class("field-flagged") is False
+        assert location.has_class("field-flagged") is False
+        assert hint.display is False
+
+
 # ── input validation / errors ───────────────────────────────────────────
 
 
@@ -309,7 +478,7 @@ async def test_extraction_error_leaves_the_manual_form_usable(db_manager: Databa
         assert screen.query_one("#field-name", Input).value == ""
 
         screen.query_one("#field-name", Input).value = "Manual fallback"
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         assert await wait_until(
             pilot,
             lambda: "created" in str(screen.query_one("#create-status", Static).render()),

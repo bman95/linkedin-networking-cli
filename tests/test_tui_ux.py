@@ -1,7 +1,7 @@
 """Regression tests for the 2026-07-07 UX pass (issue #24).
 
 Pins the escape semantics ("esc to cancel" must cancel, not leave), the
-dirty-form discard guard, and the navigation affordances (``n`` on the
+dirty-form discard guard, and the navigation affordances (New Campaign on the
 campaigns list, activating a dashboard row). All flows run in the headless
 harness with no browser.
 
@@ -12,15 +12,16 @@ once mid-run — only the arming/confirming control moved onto focusable buttons
 
 Issue #49 (same owner rule) swept the remaining key-only actions on every other
 screen (Campaigns' New/Refresh, Dashboard's and Settings' Refresh, Create/Edit's
-Save) onto visible, focusable buttons; the tests below drive those flows with
-tab + Enter alone, never the letter/ctrl accelerator, to prove the widget path
-actually exists and works end to end.
+Save) onto visible, focusable buttons; issue #49's follow-up pass (2026-07-10)
+then removed every letter/ctrl-chord accelerator app-wide, so tab + Enter (or
+arrows + Enter over a list) is now the *only* path to any of these — the tests
+below drive them that way throughout.
 """
 
 import asyncio
 
 import pytest
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, ListView, Static
 
 from database.operations import DatabaseManager
 from tui.app import LinkedInTUI
@@ -77,14 +78,18 @@ async def tab_until_focused(pilot, widget, tries: int = 40) -> None:
 
 @pytest.mark.unit
 async def test_detail_esc_cancels_armed_delete(db_manager: DatabaseManager):
-    """First d arms the delete confirm; esc cancels the confirmation and STAYS."""
+    """Activating Delete on the ACTIONS list arms the confirm; esc cancels the
+    confirmation and STAYS."""
     campaign = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(CampaignDetailScreen(db_manager, campaign.id))
         await wait_text(pilot, "#detail-status", "select an action")
-        await pilot.press("d")
+        actions = app.screen.query_one("#detail-actions", ListView)
+        while actions.index != 5:  # Delete is the last action
+            await pilot.press("down")
+        await pilot.press("enter")
         await wait_text(pilot, "#detail-status", "Enter to confirm")
         await pilot.press("escape")
         await pilot.pause()
@@ -119,7 +124,8 @@ async def test_run_esc_cancels_armed_confirmation(db_manager: DatabaseManager):
         screen = _SlowRunScreen(db_manager, _DummySettings())
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.press("ctrl+r")
+        screen.query_one("#run-start", Button).focus()
+        await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("escape")
         await pilot.pause()
@@ -138,9 +144,10 @@ async def test_run_esc_mid_run_warns_then_leaves(db_manager: DatabaseManager):
         screen = _SlowRunScreen(db_manager, _DummySettings())
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.press("ctrl+r")
+        screen.query_one("#run-start", Button).focus()
+        await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Enter to confirm")
-        await pilot.press("ctrl+r")
+        await pilot.press("enter")  # the confirm bar's focused Yes button
         await wait_text(pilot, "#run-status", "Running")
         # First esc warns and stays; the run is not stopped by leaving.
         await pilot.press("escape")
@@ -189,21 +196,6 @@ async def test_create_esc_dirty_warns_then_discards(db_manager: DatabaseManager)
 
 
 # ── navigation affordances ──────────────────────────────────────────────────
-
-
-@pytest.mark.unit
-async def test_campaigns_n_opens_create(db_manager: DatabaseManager):
-    """'n' is kept as an optional accelerator (the New Campaign button below
-    the table is the primary, tab-reachable path — see the tab/Enter test)."""
-    make_campaign(db_manager)
-    app = LinkedInTUI(db_manager=db_manager)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        app.push_screen(CampaignsScreen(db_manager))
-        await wait_text(pilot, "#campaigns-status", "campaign")
-        await pilot.press("n")
-        await pilot.pause()
-        assert isinstance(app.screen, CreateCampaignScreen)
 
 
 @pytest.mark.unit
@@ -300,8 +292,8 @@ async def test_settings_refresh_reachable_by_tab_and_enter(db_manager: DatabaseM
 async def test_create_campaign_full_happy_path_via_tab_and_enter(
     db_manager: DatabaseManager,
 ):
-    """The whole create flow — fill the name, tab to Create, Enter — needs no
-    ctrl+s (owner rule: the visible button is the primary path)."""
+    """The whole create flow — fill the name, tab to Create, Enter — is the
+    only path now (owner rule: no accelerators, 2026-07-10)."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -321,8 +313,8 @@ async def test_create_campaign_full_happy_path_via_tab_and_enter(
 
 @pytest.mark.unit
 async def test_edit_save_reachable_by_tab_and_enter(db_manager: DatabaseManager):
-    """Editing end to end — change the name, tab to Save, Enter — needs no
-    ctrl+s (owner rule: the visible button is the primary path)."""
+    """Editing end to end — change the name, tab to Save, Enter — is the only
+    path now (owner rule: no accelerators, 2026-07-10)."""
     c = make_campaign(db_manager, name="Old Name")
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:

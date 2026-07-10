@@ -59,22 +59,20 @@ class BaseScreen(WorkerGuardMixin, Screen):
     worker guards (``begin_load`` / ``marshal`` / ``marshal_load``).
     """
 
-    # Back to the previous screen, then Quit — surfaced in the hint bar.
+    # Back to the previous screen — surfaced in the hint bar. Quit lives only
+    # on the home screen (owner rule, 2026-07-09: no letter/ctrl accelerators
+    # app-wide); every other screen's Quit path is esc-back-to-home-then-esc.
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("q", "app.quit", "Quit"),
     ]
 
     # Current location, shown in the masthead breadcrumb. Subclasses override.
     SCREEN_TITLE = ""
 
-    # (key, action) pairs shown in the dim hint bar. The data screens add their
-    # own refresh hint; this is the shared baseline.
+    # (key, action) pairs shown in the dim hint bar. Subclasses override with
+    # their own actual verbs; this is the generic fallback.
     HINTS: tuple[tuple[str, str], ...] = (
         ("esc", "back"),
-        ("r", "refresh"),
-        ("q", "quit"),
-        ("ctrl+p", "commands"),
     )
 
     def compose(self) -> ComposeResult:

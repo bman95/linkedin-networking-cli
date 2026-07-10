@@ -7,9 +7,10 @@ summary/error pipeline (via browser-free fakes that override the ``run_body`` /
 cooperative stop control, and the campaign-detail run/check flows issue #42
 folded in.
 
-Interaction design under test (owner rule, 2026-07-09): every flow is driven
-arrows + Enter first — the Start control and the inline confirm are focusable
-buttons — with the letter keys (and ``ctrl+r``) as optional accelerators.
+Interaction design under test (owner rule, 2026-07-09; no accelerators,
+2026-07-10): every flow is driven arrows + Enter alone — the Start control,
+the inline confirm, and the campaign detail's ACTIONS list are all focusable,
+and there are no letter/ctrl-chord shortcuts anywhere.
 """
 
 import asyncio
@@ -167,13 +168,25 @@ class _FakeRunScreen(AutomationRunScreen):
         return f"summary: n={result.get('n')}"
 
 
+async def arm_run(pilot, screen) -> None:
+    """Focus the Start button and press Enter to arm the inline confirmation."""
+    screen.query_one("#run-start", Button).focus()
+    await pilot.press("enter")
+
+
+async def start_run(pilot, screen) -> None:
+    """Arm, then confirm on the confirm bar's own focused button — the only
+    path to starting a run (no accelerator)."""
+    await arm_run(pilot, screen)
+    await wait_text(pilot, "#run-status", "Enter to confirm")
+    await pilot.press("enter")  # confirm bar's focused Yes button
+
+
 async def _run_fake(pilot, app, outcome):
-    """Start a fake run via the ctrl+r accelerator (twice = arm, confirm)."""
+    """Push a fake run screen and start it via the Start button."""
     app.push_screen(_FakeRunScreen(app.db_manager, _DummySettings(), outcome=outcome))
     await pilot.pause()
-    await pilot.press("ctrl+r")  # arm the inline confirmation
-    await wait_text(pilot, "#run-status", "Enter to confirm")
-    await pilot.press("ctrl+r")  # repeated accelerator confirms
+    await start_run(pilot, app.screen)
 
 
 @pytest.mark.unit
@@ -221,7 +234,7 @@ async def test_confirm_cancel_button_reachable_with_arrows(
         screen = _FakeRunScreen(app.db_manager, _DummySettings())
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.press("ctrl+r")
+        await arm_run(pilot, screen)
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("right")  # confirm → Cancel
         bar = screen.query_one("#run-confirm", ConfirmBar)
@@ -242,12 +255,18 @@ async def test_confirm_cancel_restores_focus_to_start(db_manager: DatabaseManage
         screen = _FakeRunScreen(app.db_manager, _DummySettings())
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.press("ctrl+r")
+        await arm_run(pilot, screen)
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("escape")
         await wait_text(pilot, "#run-status", "Cancelled")
         start = screen.query_one("#run-start", Button)
         assert app.focused is start
+        # Button presses debounce a same-button re-press for their brief
+        # "-active" flash animation (Textual: Button.action_press no-ops
+        # while the class is still set) — real wall-clock time, not just a
+        # pump, so it must actually elapse before the same button is pressed
+        # again in one test.
+        await pilot.pause(0.25)
         # The keyboard still drives the flow: Enter re-arms the confirmation.
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Enter to confirm")
@@ -265,6 +284,11 @@ async def test_rerun_after_completion(db_manager: DatabaseManager):
         await wait_text(pilot, "#run-status", "Done")
         screen = app.screen
         assert app.focused is screen.query_one("#run-start", Button)
+        # Real wall-clock gap so the first press's "-active" flash animation
+        # (Button.action_press no-ops while it's still set) has cleared
+        # before this same button is pressed again — see the same guard in
+        # test_confirm_cancel_restores_focus_to_start.
+        await pilot.pause(0.25)
         await pilot.press("enter")  # re-arm from the refocused Start control
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")  # confirm
@@ -370,9 +394,7 @@ async def _wait_log(pilot, screen, needle: str, timeout=8.0) -> str:
 async def _start_stoppable(pilot, app):
     app.push_screen(_FakeStoppableRunScreen(app.db_manager, _DummySettings()))
     await pilot.pause()
-    await pilot.press("ctrl+r")  # arm the inline confirmation
-    await wait_text(pilot, "#run-status", "Enter to confirm")
-    await pilot.press("ctrl+r")  # repeated accelerator confirms
+    await start_run(pilot, app.screen)
     await pilot.pause()
     return app.screen
 
@@ -440,25 +462,11 @@ async def test_request_stop_shows_stopping_status_and_disables_button(
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _start_stoppable(pilot, app)
-        screen.panel.request_stop()  # what Enter on the button and 's' dispatch to
+        screen.panel.request_stop()  # what Enter on the focused Stop button dispatches to
         status = str(screen.query_one("#run-status", Static).render())
         assert "Stopping" in status
         assert screen.query_one("#run-stop", Button).disabled is True
         await wait_text_timed(pilot, "#run-status", "Stopped at your request")
-
-
-@pytest.mark.unit
-async def test_stop_via_s_accelerator(db_manager: DatabaseManager):
-    """The optional 's' accelerator requests the same stop as the button."""
-    app = LinkedInTUI(db_manager=db_manager)
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        screen = await _start_stoppable(pilot, app)
-        await _wait_log(pilot, screen, "profile 1")
-        await pilot.press("s")
-        status = await wait_text_timed(pilot, "#run-status", "Stopped at your request")
-        assert "Stopped at your request" in status
-        assert "summary: n=" in log_text(screen)
 
 
 @pytest.mark.unit
@@ -474,7 +482,7 @@ async def test_midrun_esc_warning_mentions_stop_control(
         await pilot.press("escape")
         status = await wait_text(pilot, "#run-status", "leaving does not stop it")
         assert "leaving does not stop it" in status
-        assert "Stop" in status and "s)" in status
+        assert "Stop button" in status
         assert app.screen is screen  # first esc warns, does not leave
 
 
@@ -581,9 +589,7 @@ async def test_stop_during_login_ends_run_before_automation(
         screen = _RunScreen(app.db_manager, _DummySettings())
         app.push_screen(screen)
         await pilot.pause()
-        await pilot.press("ctrl+r")
-        await wait_text(pilot, "#run-status", "Enter to confirm")
-        await pilot.press("ctrl+r")
+        await start_run(pilot, screen)
         status = await wait_text_timed(pilot, "#run-status", "Stopped at your request")
         assert "Stopped at your request" in status
         assert automate_calls == []  # the run ended before automation began
@@ -623,6 +629,17 @@ async def _push_detail(pilot, app, campaign_id, screen_cls=_FakeRunDetail, **kwa
     return screen
 
 
+async def activate_action(pilot, screen, index: int) -> None:
+    """Navigate the ACTIONS list to ``index`` and press Enter (arrows + Enter
+    is the only path to any action — owner rule, 2026-07-10: no accelerators).
+    ACTIONS order: run(0), check(1), edit(2), toggle(3), export(4), delete(5).
+    """
+    actions = screen.query_one("#detail-actions", ListView)
+    while actions.index != index:
+        await pilot.press("down")
+    await pilot.press("enter")
+
+
 @pytest.mark.unit
 async def test_detail_run_now_via_actions_list(db_manager: DatabaseManager):
     """The issue #42 e2e criterion: run from the detail screen with a fake
@@ -655,12 +672,12 @@ async def test_detail_run_now_via_actions_list(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
-async def test_detail_run_accelerator_and_cancelled_summary(
+async def test_detail_run_cancelled_summary_is_neutral_status(
     db_manager: DatabaseManager,
 ):
-    """`r` arms the same confirm (accelerator over the focusable action), and a
-    body-reported stop renders the partial summary with the neutral status."""
-    campaign = make_campaign(db_manager, name="Accel Run")
+    """A body-reported stop renders the partial summary with the neutral
+    status, driven arrows + Enter over the ACTIONS list throughout."""
+    campaign = make_campaign(db_manager, name="Cancelled Run")
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -672,9 +689,9 @@ async def test_detail_run_accelerator_and_cancelled_summary(
                 "total_processed": 2,
             },
         )
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
-        await pilot.press("r")  # repeated accelerator confirms (two-press path)
+        await pilot.press("enter")  # confirm bar's focused Yes button
         await wait_text(pilot, "#run-status", "Stopped at your request")
         assert "stopped at your request" in log_text(screen)
 
@@ -683,8 +700,7 @@ async def test_detail_run_accelerator_and_cancelled_summary(
 async def test_detail_check_acceptances_from_detail(db_manager: DatabaseManager):
     """The issue #42 e2e criterion: check from the detail screen with a fake
     check_body seam — gated on pending invites, summary on the same surface.
-    Pins both paths: the `c` accelerator arms it, and (after an esc cancel)
-    arrows + Enter alone arm and start it."""
+    Driven arrows + Enter throughout: arm, esc-cancel, then re-arm and start."""
     campaign = make_campaign(db_manager, name="Detail Check")
     db_manager.create_contact({
         "campaign_id": campaign.id,
@@ -696,7 +712,7 @@ async def test_detail_check_acceptances_from_detail(db_manager: DatabaseManager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("c")  # accelerator arms the confirm
+        await activate_action(pilot, screen, 1)  # Check acceptances: arms the confirm
         status = await wait_text(pilot, "#run-status", "Enter to confirm")
         assert "smart checker" in status
         await pilot.press("escape")
@@ -705,7 +721,6 @@ async def test_detail_check_acceptances_from_detail(db_manager: DatabaseManager)
         # arrows + Enter path arms and starts the same check.
         actions = screen.query_one("#detail-actions", ListView)
         assert app.focused is actions
-        await pilot.press("down")  # Run now → Check acceptances
         assert actions.index == 1
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Enter to confirm")
@@ -727,7 +742,7 @@ async def test_detail_esc_cancels_armed_run_confirmation(
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("escape")
         await pilot.pause()
@@ -754,7 +769,7 @@ async def test_detail_esc_mid_run_warns_then_leaves(db_manager: DatabaseManager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id, screen_cls=_SlowRunDetail)
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Running")
@@ -797,7 +812,7 @@ async def test_detail_stop_control_stops_run(db_manager: DatabaseManager):
         screen = await _push_detail(
             pilot, app, campaign.id, screen_cls=_StoppableRunDetail
         )
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Running")
@@ -822,9 +837,11 @@ async def test_detail_mutation_disarms_armed_run_confirm(
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
-        await pilot.press("a")  # deactivate the campaign
+        # Deactivate directly (not via the ACTIONS list): the point under test
+        # is the state-change disarm guard, not this setup step's own path.
+        screen.action_toggle_active()
         # Wait on the UI-applied signal (the reloaded detail), not just the DB
         # write, so the follow-up Enter runs against settled screen state.
         await wait_text(pilot, "#detail-status", "select an action")
@@ -846,18 +863,22 @@ async def test_detail_mutation_disarms_armed_run_confirm(
 async def test_delete_confirm_keeps_focus_after_dismissing_run_confirm(
     db_manager: DatabaseManager,
 ):
-    """`r` then `d`: arming delete dismisses the run confirm, whose deferred
-    ConfirmDismissed refocus must NOT steal focus from the freshly armed delete
-    bar — otherwise the promised Enter lands on 'Run now' and a second Enter
-    starts a run the user never asked for (reviewer finding, iteration 2)."""
+    """Arming delete while Run now is already armed dismisses the run confirm,
+    whose deferred ConfirmDismissed refocus must NOT steal focus from the
+    freshly armed delete bar — otherwise the promised Enter lands on 'Run now'
+    and a second Enter starts a run the user never asked for (reviewer
+    finding, iteration 2). ``action_delete`` is called directly: with no
+    accelerator left, arming delete while a *different* confirm is armed isn't
+    reachable through the ACTIONS list (it isn't focused), but the dismiss
+    race it exercises is still a real state-machine guard worth pinning."""
     campaign = make_campaign(db_manager, name="Focus Steal")
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
-        await pilot.press("d")
+        screen.action_delete()
         await wait_text(pilot, "#detail-status", "Enter to confirm")
         await pilot.pause()  # let the queued ConfirmDismissed handler run
         await pilot.pause()
@@ -885,7 +906,7 @@ async def test_failed_delete_returns_focus_to_actions(db_manager: DatabaseManage
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("d")
+        await activate_action(pilot, screen, 5)  # Delete: arms the confirm
         await wait_text(pilot, "#detail-status", "Enter to confirm")
         db_manager.delete_campaign(campaign.id)  # yanked from under the screen
         await pilot.press("enter")  # confirm → delete fails: "Campaign not found."
@@ -902,7 +923,10 @@ async def test_detail_mutations_blocked_while_run_active(
     """Campaign mutations wait for the stop control while a run is active
     (codex gate finding): delete, toggle and edit are refused — the screen must
     never show a deleted/edited/inactive campaign while invites keep sending —
-    while the read-only export stays available."""
+    while the read-only export stays available. Actions are invoked directly
+    once the run is active: focus has moved to the Stop button by then (not
+    the ACTIONS list), and there is no accelerator left to reach them by key —
+    the gate under test is the same either way."""
     campaign = make_campaign(db_manager)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
@@ -910,27 +934,27 @@ async def test_detail_mutations_blocked_while_run_active(
         screen = await _push_detail(
             pilot, app, campaign.id, screen_cls=_StoppableRunDetail
         )
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now: arms the confirm
         await wait_text(pilot, "#run-status", "Enter to confirm")
         await pilot.press("enter")
         await wait_text(pilot, "#run-status", "Running")
 
-        await pilot.press("d")
+        screen.action_delete()
         status = await wait_text(pilot, "#detail-status", "stop it before deleting")
         assert "stop it before deleting" in status
         assert not screen.query_one("#detail-delete-confirm", ConfirmBar).armed
         assert db_manager.get_campaign(campaign.id) is not None
 
-        await pilot.press("a")
+        screen.action_toggle_active()
         await wait_text(pilot, "#detail-status", "changing its active state")
         assert db_manager.get_campaign(campaign.id).active is True  # unchanged
 
-        await pilot.press("e")
+        screen.action_edit()
         await wait_text(pilot, "#detail-status", "editing the campaign")
         assert app.screen is screen  # no edit screen was pushed
 
         # The read-only export is deliberately NOT blocked mid-run.
-        await pilot.press("x")
+        screen.action_export()
         await wait_text(pilot, "#detail-status", "No contacts to export")
 
         screen.panel.request_stop()  # let the run wind down before teardown
@@ -946,7 +970,7 @@ async def test_detail_run_blocked_when_campaign_inactive(
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now
         status = await wait_text(pilot, "#run-status", "inactive")
         assert "inactive" in status
         assert screen.panel.run_active is False
@@ -960,7 +984,7 @@ async def test_detail_check_blocked_without_pending(db_manager: DatabaseManager)
     async with app.run_test() as pilot:
         await pilot.pause()
         screen = await _push_detail(pilot, app, campaign.id)
-        await pilot.press("c")
+        await activate_action(pilot, screen, 1)  # Check acceptances
         status = await wait_text(pilot, "#run-status", "No pending invites")
         assert "No pending invites" in status
         assert screen.panel.run_active is False
@@ -976,7 +1000,7 @@ async def test_detail_run_degraded_without_settings(db_manager: DatabaseManager)
         screen = CampaignDetailScreen(db_manager, campaign.id)  # no settings injected
         app.push_screen(screen)
         await wait_text(pilot, "#detail-status", "select an action")
-        await pilot.press("r")
+        await activate_action(pilot, screen, 0)  # Run now
         status = await wait_text(pilot, "#run-status", "unavailable")
         assert "unavailable" in status
 

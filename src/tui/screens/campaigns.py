@@ -43,27 +43,22 @@ class CampaignsScreen(BaseScreen):
     Loads data through ``DatabaseManager.get_campaigns`` in a threaded worker so
     the blocking SQLite read does not stall the UI.
 
-    Interaction design (owner rule, 2026-07-09): New Campaign and Refresh are
-    visible, focusable buttons below the table — reachable with tab + Enter —
-    with ``n``/``r`` kept as optional accelerators, never the only path.
+    Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+    New Campaign and Refresh are visible, focusable buttons below the table —
+    tab + Enter is the only path to them.
     """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("n", "new", "New campaign"),
-        ("r", "refresh", "Refresh"),
-        ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Campaigns"
 
     HINTS = (
+        ("↑↓", "rows"),
         ("enter", "open"),
-        ("n", "new"),
+        ("tab", "buttons"),
         ("esc", "back"),
-        ("r", "refresh"),
-        ("q", "quit"),
-        ("ctrl+p", "commands"),
     )
 
     COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate", "Daily Limit")
@@ -174,4 +169,4 @@ class CampaignsScreen(BaseScreen):
             noun = "campaign" if len(campaigns) == 1 else "campaigns"
             status.update(f"{len(campaigns)} {noun}.")
         else:
-            status.update("No campaigns yet — press n to create one.")
+            status.update("No campaigns yet — use New Campaign below to create one.")

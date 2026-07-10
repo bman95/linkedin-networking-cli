@@ -11,7 +11,7 @@ on a temp SQLite path.
 """
 
 import pytest
-from textual.widgets import Input, Select, Static
+from textual.widgets import Button, Input, ListView, OptionList, Select, Static
 
 from database.operations import DatabaseManager
 from tui.app import CampaignEditScreen, CreateCampaignScreen, HomeScreen, LinkedInTUI
@@ -22,12 +22,24 @@ TOKYO = {"name": "Greater Tokyo Area", "geoUrn": "90009620"}
 
 
 async def goto_create(pilot) -> CreateCampaignScreen:
+    """Open Create Campaign via arrows + Enter on the home nav list."""
     assert isinstance(pilot.app.screen, HomeScreen)
-    await pilot.press("3")
+    nav = pilot.app.screen.query_one("#home-nav", ListView)
+    while nav.index != 2:  # "New Campaign" is the third home item
+        await pilot.press("down")
+    await pilot.press("enter")
     await pilot.pause()
     screen = pilot.app.screen
     assert isinstance(screen, CreateCampaignScreen)
     return screen
+
+
+async def submit_form(pilot, screen) -> None:
+    """Tab to the form's submit button and press Enter (the only submit path)."""
+    button = screen.query_one("#form-submit", Button)
+    while pilot.app.focused is not button:
+        await pilot.press("tab")
+    await pilot.press("enter")
 
 
 async def wait_status(pilot, needle: str, status_id: str = "#create-status", tries: int = 60) -> str:
@@ -76,7 +88,13 @@ async def test_location_modes_reveal_their_widgets(db_manager: DatabaseManager):
 
 @pytest.mark.unit
 async def test_online_search_pick_persists_geourn(db_manager: DatabaseManager):
-    """Searching, picking a result and saving stores the picked geoUrn."""
+    """Searching, picking a result and saving stores the picked geoUrn.
+
+    Drives the real keyboard sequence — search lands focus on the results
+    list with the first result highlighted, Enter picks it — rather than
+    assigning a value in Python, so this pins the actual keyboard path
+    (regression: a plain Select here silently ate Enter on a blank sentinel).
+    """
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -87,16 +105,18 @@ async def test_online_search_pick_persists_geourn(db_manager: DatabaseManager):
         await start_search(pilot, screen, "Madrid")
         await wait_status(pilot, "pick one")
 
-        picker = screen.query_one("#field-location-results", Select)
+        picker = screen.query_one("#field-location-results", OptionList)
         assert picker.display
-        picker.value = (MADRID["name"], MADRID["geoUrn"])
+        assert screen.app.focused is picker
+        assert picker.highlighted == 0  # first (Madrid) result pre-highlighted
+        await pilot.press("enter")
         await pilot.pause()
 
         # The pick became the selected Location option and the search UI closed.
         assert screen.query_one("#field-location", Select).value == MADRID["name"]
         assert not screen.query_one("#field-location-query", Input).display
 
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "created")
 
     c = db_manager.get_campaigns(active_only=False)[0]
@@ -132,7 +152,7 @@ async def test_online_search_empty_auth_and_error_states(db_manager: DatabaseMan
 
 @pytest.mark.unit
 async def test_submit_with_unresolved_search_is_rejected(db_manager: DatabaseManager):
-    """ctrl+s while the select still says 'search online' must not persist."""
+    """Submitting while the select still says 'search online' must not persist."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -140,7 +160,7 @@ async def test_submit_with_unresolved_search_is_rejected(db_manager: DatabaseMan
         screen.query_one("#field-name", Input).value = "Unresolved"
         screen.query_one("#field-location", Select).value = SEARCH_ONLINE
         await pilot.pause()
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "pick a location")
     assert db_manager.get_campaigns(active_only=False) == []
 
@@ -157,7 +177,7 @@ async def test_custom_geourn_persists(db_manager: DatabaseManager):
         await pilot.pause()
         screen.query_one("#field-location-geourn", Input).value = "90000084"
         # Display name left empty → classic default name.
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "created")
 
     c = db_manager.get_campaigns(active_only=False)[0]
@@ -174,7 +194,7 @@ async def test_custom_geourn_requires_code(db_manager: DatabaseManager):
         screen.query_one("#field-name", Input).value = "Missing code"
         screen.query_one("#field-location", Select).value = CUSTOM_GEO
         await pilot.pause()
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "geoUrn")
     assert db_manager.get_campaigns(active_only=False) == []
 
@@ -190,7 +210,7 @@ async def test_custom_geourn_requires_numeric_code(db_manager: DatabaseManager):
         screen.query_one("#field-location", Select).value = CUSTOM_GEO
         await pilot.pause()
         screen.query_one("#field-location-geourn", Input).value = "not-a-code"
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "numeric")
     assert db_manager.get_campaigns(active_only=False) == []
 
@@ -216,13 +236,13 @@ async def test_edit_preserves_non_curated_location(db_manager: DatabaseManager):
         await pilot.pause()
         screen = app.screen
         assert isinstance(screen, CampaignEditScreen)
-        await wait_status(pilot, "ctrl+s to save", status_id="#edit-status")
+        await wait_status(pilot, "Edit the fields", status_id="#edit-status")
 
         # The stored custom location is the selected option, not 'Any'.
         assert screen.query_one("#field-location", Select).value == TOKYO["name"]
 
         screen.query_one("#field-daily", Input).value = "15"
-        await pilot.press("ctrl+s")
+        await submit_form(pilot, screen)
         await wait_status(pilot, "updated", status_id="#edit-status")
 
     c = db_manager.get_campaign(created.id)
@@ -232,16 +252,41 @@ async def test_edit_preserves_non_curated_location(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_stale_search_result_does_not_reveal_or_steal_focus(db_manager: DatabaseManager):
+    """A result landing after the user switched Location away from "Search
+    location online…" must be dropped silently — no reveal, no focus steal.
+
+    Drives ``_search_done`` directly (the worker callback) rather than racing
+    a real thread worker, mirroring the deterministic-guard style already used
+    for the dashboard's stale-load test.
+    """
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        screen._search_in_flight = True
+        # The user switched away from "Search location online…" while the
+        # search was still in flight.
+        screen.query_one("#field-location", Select).value = "Any"
+        await pilot.pause()
+
+        screen._search_done("Madrid", [MADRID, TOKYO], None)
+        await pilot.pause()
+
+        picker = screen.query_one("#field-location-results", OptionList)
+        assert not picker.display
+        assert app.focused is not picker
+        assert screen._search_in_flight is False  # bookkeeping still resets
+
+
+@pytest.mark.unit
 async def test_search_requires_db_and_settings(db_manager: DatabaseManager):
     """A degraded app (no DB) refuses the online search with a clear message."""
     app = LinkedInTUI(db_manager=db_manager)
     app.db_manager = None
     async with app.run_test() as pilot:
         await pilot.pause()
-        await pilot.press("3")
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, CreateCampaignScreen)
+        screen = await goto_create(pilot)
         await start_search(pilot, screen, "Madrid")
         await wait_status(pilot, "requires database access")
         assert screen._search_in_flight is False

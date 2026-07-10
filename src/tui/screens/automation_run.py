@@ -12,10 +12,10 @@ the selection widgets and their threaded population, the visible **Start**
 control, and delegates the confirm/run/stop/summary machinery to an embedded
 :class:`~tui.screens.run_panel.AutomationRunPanel`.
 
-Interaction design (owner rule, 2026-07-09): starting a run is arrows + Enter
-first — focus the Start button and press Enter, then confirm on the focused
-inline confirm. ``ctrl+r`` remains as an accelerator (pressing it twice still
-starts, matching the old two-press muscle memory), never the only path.
+Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+starting a run is arrows + Enter — focus the Start button and press Enter,
+then confirm on the focused inline confirm. There is no key accelerator for
+either Start or the run panel's Stop button; both are reached by focus alone.
 
 ``run_body`` is the single seam a test overrides to exercise the
 run/log/summary/error pipeline without a browser.
@@ -27,7 +27,6 @@ from typing import Any
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Button
 
@@ -49,22 +48,12 @@ class AutomationRunScreen(BaseScreen):
 
     BINDINGS = [
         ("escape", "back", "Back"),
-        # Accelerator only (the primary path is the focused Start button):
-        # priority so it fires while a Select/Input holds focus.
-        Binding("ctrl+r", "start", "Start", priority=True),
-        # Optional accelerator for the Stop button (issue #43). Deliberately
-        # NOT priority: while an Input holds focus, "s" must keep typing; the
-        # binding matters mid-run, when focus sits on the Stop button anyway.
-        ("s", "stop", "Stop"),
-        ("q", "app.quit", "Quit"),
     ]
 
     HINTS = (
-        ("enter", "start"),
-        ("s", "stop"),
+        ("tab", "fields"),
+        ("enter", "activate"),
         ("esc", "back"),
-        ("q", "quit"),
-        ("ctrl+p", "commands"),
     )
 
     def __init__(
@@ -83,8 +72,8 @@ class AutomationRunScreen(BaseScreen):
     def compose_body(self) -> ComposeResult:
         with VerticalScroll(id="run-body"):
             yield from self.compose_selection()
-            # The start control: a visible, focusable button — arrows/tab +
-            # Enter first, with ctrl+r as the accelerator.
+            # The start control: a visible, focusable button — tab + Enter is
+            # the only path to it.
             yield Button("Start", id="run-start")
         yield AutomationRunPanel(id="run-panel")
 
@@ -180,9 +169,6 @@ class AutomationRunScreen(BaseScreen):
                 render=self.render_result,
             )
         )
-
-    def action_stop(self) -> None:
-        self.panel.request_stop()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "run-start":

@@ -34,7 +34,8 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
-from textual.widgets import Input, Label, Select, Static
+from textual.widgets import Input, Label, OptionList, Select, Static
+from textual.widgets.option_list import Option
 
 from automation.linkedin_mappings import (
     get_industry_display_names,
@@ -101,8 +102,12 @@ def campaign_form_widgets() -> ComposeResult:
                     id="field-location-query", classes="loc-conditional")
         yield Label("Search results", classes="field-label loc-conditional",
                     id="label-location-results")
-        yield Select([], prompt="Pick a location", id="field-location-results",
-                     classes="loc-conditional")
+        # OptionList, not Select: a Select without allow_blank=False prepends a
+        # blank sentinel at index 0, so the natural keyboard sequence Enter
+        # (open) Enter (pick) silently selected the sentinel instead of the
+        # first result. An OptionList has no such sentinel — arrows move,
+        # Enter picks the highlighted result directly.
+        yield OptionList(id="field-location-results", classes="loc-conditional")
         yield Label("geoUrn code (LinkedIn URL: geoUrn=[\"CODE\"])",
                     classes="field-label loc-conditional", id="label-location-geourn")
         yield Input(placeholder="e.g. 90000084", id="field-location-geourn",
@@ -161,6 +166,10 @@ class CampaignFormScreen(BaseScreen):
         # from an online search, or carried over from the edited campaign).
         self._location_overrides: dict[str, str] = {}
         self._search_in_flight = False
+        # The last search's results, in display order, so the OptionList's
+        # OptionSelected index (it carries no arbitrary payload) can be
+        # resolved back to a {"name", "geoUrn"} dict.
+        self._search_results: list[dict] = []
         # Captured on the UI thread when a search starts, for progress marshaling.
         self._search_app_ref: App | None = None
         # Snapshot of the pristine field values (set via mark_clean once the
@@ -168,12 +177,13 @@ class CampaignFormScreen(BaseScreen):
         self._baseline: tuple | None = None
         self._discard_confirming = False
         # selector -> value last written by fill_form_from_extraction, for the
-        # fields it also flags (#field-daily, #field-message). Setting
-        # Input.value programmatically posts a Changed message that is only
-        # processed on a later event-loop tick — by the time on_input_changed
-        # runs, this snapshot distinguishes "that Changed event is just an
-        # echo of our own prefill" (value still matches — keep the flag) from
-        # a genuine user edit (value differs — clear it).
+        # fields it also flags (#field-daily, #field-message, and any Select
+        # matched-but-needs_review — see _apply_match). Setting Input.value or
+        # Select.value programmatically posts a Changed message that is only
+        # processed on a later event-loop tick — by the time on_input_changed/
+        # on_select_changed runs, this snapshot distinguishes "that Changed
+        # event is just an echo of our own prefill" (value still matches —
+        # keep the flag) from a genuine user edit (value differs — clear it).
         self._ai_filled_snapshot: dict[str, str] = {}
 
     def _set_status(self, message: str, kind: str = "") -> None:
@@ -240,11 +250,21 @@ class CampaignFormScreen(BaseScreen):
     def on_select_changed(self, event: Select.Changed) -> None:
         # Changing a select withdraws a pending discard confirmation.
         self._discard_confirming = False
-        event.select.remove_class("field-flagged")
+        selector = f"#{event.select.id}"
+        if self._ai_filled_snapshot.get(selector) == event.value:
+            pass  # the prefill's own (deferred) Changed echo — keep the flag
+        else:
+            self._ai_filled_snapshot.pop(selector, None)
+            # A genuine edit to an AI-assist prefill no longer needs review —
+            # the user's own eyes are on it.
+            event.select.remove_class("field-flagged")
         if event.select.id == "field-location":
             self._location_mode_changed(event.value)
-        elif event.select.id == "field-location-results":
-            self._location_result_picked(event.value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "field-location-results":
+            return
+        self._location_result_picked(event.option_index)
 
     def _show(self, selectors: tuple[str, ...], visible: bool) -> None:
         for selector in selectors:
@@ -342,6 +362,15 @@ class CampaignFormScreen(BaseScreen):
         self, query: str, results: list | None, error: str | None
     ) -> None:
         self._search_in_flight = False
+        # Stale-search guard: the user may have switched the Location select
+        # away from "Search location online…" (or the form may have already
+        # been submitted/locked) while this ran in its worker thread. Drop the
+        # result silently rather than reveal+focus a picker the user has
+        # moved on from, or re-enable a field a successful submit just locked.
+        locked = getattr(self, "_created", False) or getattr(self, "_saved", False)
+        stale = locked or self.query_one("#field-location", Select).value != SEARCH_ONLINE
+        if stale:
+            return
         self.query_one("#field-location-query", Input).disabled = False
         if error is not None:
             self._set_status(error, "error")
@@ -352,23 +381,24 @@ class CampaignFormScreen(BaseScreen):
         if not results:
             self._set_status(f"No locations found for '{query}'.", "warn")
             return
-        picker = self.query_one("#field-location-results", Select)
-        picker.set_options(
-            [
-                (f"{item.get('name', '?')} (geoUrn {item.get('geoUrn', '?')})",
-                 (item.get("name"), item.get("geoUrn")))
-                for item in results
-            ]
+        self._search_results = results
+        picker = self.query_one("#field-location-results", OptionList)
+        picker.clear_options()
+        picker.add_options(
+            Option(f"{item.get('name', '?')} (geoUrn {item.get('geoUrn', '?')})")
+            for item in results
         )
+        picker.highlighted = 0
         self._show(_RESULT_IDS, True)
         picker.focus()
         noun = "location" if len(results) == 1 else "locations"
         self._set_status(f"{len(results)} {noun} found — pick one.")
 
-    def _location_result_picked(self, value: object) -> None:
-        if not isinstance(value, tuple):
-            return  # Select.BLANK (prompt) — nothing picked yet
-        name, geo_urn = value
+    def _location_result_picked(self, index: int) -> None:
+        if not 0 <= index < len(self._search_results):
+            return
+        item = self._search_results[index]
+        name, geo_urn = item.get("name"), item.get("geoUrn")
         if not name or not geo_urn:
             return
         self._location_overrides[str(name)] = str(geo_urn)
@@ -480,68 +510,129 @@ def _set_select(screen, selector: str, value: str | None, default: str, options)
     screen.query_one(selector, Select).value = value if value in options else default
 
 
-def fill_form_from_extraction(screen: CampaignFormScreen, result) -> list[str]:
+# The five fields fill_form_from_extraction can flag for review, plus the
+# hint Statics it can show — reset at the start of every run so a re-run
+# whose new description no longer mentions a field doesn't leave a stale
+# amber flag / "You said: …" hint from an earlier run.
+_FLAGGABLE_FIELDS = ("#field-daily", "#field-message",
+                     "#field-location", "#field-industry", "#field-network")
+_HINT_SELECTORS = ("#hint-location", "#hint-industry", "#hint-network")
+
+
+def _clear_ai_flags(screen: CampaignFormScreen) -> None:
+    """Reset the previous run's flags/hints before a fresh one is applied."""
+    for selector in _FLAGGABLE_FIELDS:
+        screen.query_one(selector).remove_class("field-flagged")
+    for selector in _HINT_SELECTORS:
+        hint = screen.query_one(selector, Static)
+        hint.update("")
+        hint.display = False
+    # The snapshot only exists to distinguish this run's own prefill echo from
+    # a genuine edit (see on_input_changed); an entry surviving from an
+    # earlier run has nothing left to protect once its flag is gone.
+    screen._ai_filled_snapshot.clear()
+
+
+def fill_form_from_extraction(screen: CampaignFormScreen, result) -> tuple[int, list[str]]:
     """Prefill the form from a parsed AI-assist result (analogous to :func:`fill_form`).
 
     A field the description didn't mention (``None``) is left untouched, so a
-    prior manual edit survives a re-run. Returns the ordered list of field-id
-    selectors the extraction pipeline flagged for review (a fuzzy match that
-    fell back to the default, a repaired ``{name}`` placeholder, a clamped
-    daily limit) — each flagged widget also gets the ``field-flagged`` CSS
-    class, cleared the moment the user edits it (see ``on_input_changed``/
+    prior manual edit survives a re-run — but any flag/hint that field carried
+    from an *earlier* run is cleared first (see :func:`_clear_ai_flags`), so a
+    re-run whose new description drops a mention doesn't leave a stale one
+    behind. Returns ``(applied, flagged)``: ``applied`` is how many of the 8
+    campaign fields the extraction actually populated (mentioned, whether
+    matched cleanly or only well enough to flag); ``flagged`` is the ordered
+    list of field-id selectors it flagged for review (a fuzzy match that fell
+    back to the default, a repaired ``{name}`` placeholder, a clamped daily
+    limit) — each flagged widget also gets the ``field-flagged`` CSS class,
+    cleared the moment the user edits it (see ``on_input_changed``/
     ``on_select_changed`` above).
     """
+    _clear_ai_flags(screen)
+
     data = result.data
+    applied = 0
     flagged: list[str] = []
 
     if data.name:
         screen.query_one("#field-name", Input).value = data.name
+        applied += 1
     if data.description is not None:
         screen.query_one("#field-description", Input).value = data.description
+        applied += 1
     if data.keywords is not None:
         screen.query_one("#field-keywords", Input).value = data.keywords
+        applied += 1
 
     if data.daily_limit is not None:
         value = str(data.daily_limit)
         screen.query_one("#field-daily", Input).value = value
+        applied += 1
         if "daily_limit" in result.flagged_fields:
             flagged.append("#field-daily")
             screen._ai_filled_snapshot["#field-daily"] = value
 
     if data.message_template is not None:
         screen.query_one("#field-message", Input).value = data.message_template
+        applied += 1
         if "message_template" in result.flagged_fields:
             flagged.append("#field-message")
             screen._ai_filled_snapshot["#field-message"] = data.message_template
 
-    flagged.extend(_apply_match(screen, "#field-location", "#hint-location", result.location_match))
-    flagged.extend(_apply_match(screen, "#field-industry", "#hint-industry", result.industry_match))
-    flagged.extend(_apply_match(screen, "#field-network", "#hint-network", result.network_match))
+    for field_selector, hint_selector, match in (
+        ("#field-location", "#hint-location", result.location_match),
+        ("#field-industry", "#hint-industry", result.industry_match),
+        ("#field-network", "#hint-network", result.network_match),
+    ):
+        mentioned, flagged_selector = _apply_match(screen, field_selector, hint_selector, match)
+        if mentioned:
+            applied += 1
+        if flagged_selector:
+            flagged.append(flagged_selector)
 
     for selector in flagged:
         screen.query_one(selector).add_class("field-flagged")
 
-    return flagged
+    return applied, flagged
 
 
-def _apply_match(screen, field_selector: str, hint_selector: str, match) -> list[str]:
+def _apply_match(
+    screen, field_selector: str, hint_selector: str, match
+) -> tuple[bool, str | None]:
     """Apply one fuzzy-match result to its Select + hint Static; flag on miss.
 
     Never invents an option: a matched name is one of the field's own curated
     choices (or, for location, promoted via the same override map an online
     search pick uses); an unmatched mention leaves the field at its default
-    and surfaces the model's raw words as a hint instead.
+    and surfaces the model's raw words as a hint instead. A matched name can
+    still need review (``match.needs_review``, e.g. a containment/ratio guess
+    rather than a verbatim echo) — the value is applied AND the field is
+    flagged/hinted, same as the unmatched case. Returns ``(mentioned,
+    flagged_selector)``: ``mentioned`` is whether the extraction said
+    anything about this field at all; ``flagged_selector`` is
+    ``field_selector`` when it needs review, else ``None``.
     """
     hint = screen.query_one(hint_selector, Static)
     if match.raw_text is None:
-        return []  # not mentioned — nothing to apply or hint at
+        return False, None  # not mentioned — nothing to apply or hint at
     if match.matched_display_name:
         if field_selector == "#field-location":
             screen._refresh_location_options(selected=match.matched_display_name)
         else:
             screen.query_one(field_selector, Select).value = match.matched_display_name
+        if match.needs_review:
+            # The value assignment above queues a deferred Select.Changed
+            # "echo" (processed on a later event-loop tick); this snapshot
+            # lets on_select_changed tell that echo apart from a genuine user
+            # edit so the flag/hint set here survive it (mirrors
+            # _ai_filled_snapshot's existing use for #field-daily/#field-message).
+            screen._ai_filled_snapshot[field_selector] = match.matched_display_name
+            hint.update(Text(f"You said: '{match.raw_text}' — review this guess."))
+            hint.display = True
+            return True, field_selector
         hint.display = False
-        return []
+        return True, None
     hint.update(Text(f"You said: '{match.raw_text}'"))
     hint.display = True
-    return [field_selector]
+    return True, field_selector

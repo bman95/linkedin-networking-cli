@@ -14,8 +14,8 @@ screen, so the pipeline is extracted here as an embeddable widget:
   / :class:`AutomationRunPanel.Finished`.
 - :class:`ConfirmBar` is the interaction-design rule made widget: every
   confirmation is a **visible, focused button** — reach it with arrows/tab,
-  Enter confirms, esc cancels — never a "press the same chord twice" pattern
-  (owner rule, 2026-07-09; accelerator keys remain as optional shortcuts).
+  Enter confirms, esc cancels — never a "press the same chord twice" pattern,
+  and (2026-07-10) never a letter/ctrl-chord shortcut either.
 - :func:`run_with_linkedin` is the shared browser wrapper (enter
   ``LinkedInAutomation``, log in, honor stops requested before/during login).
 
@@ -58,10 +58,11 @@ class RunSpec:
     """One requested automation run, as the host screen defines it.
 
     ``action_label`` names the flow in the typed-error headline ("…during
-    {action_label}") and lets a repeated accelerator press confirm the run it
-    armed; ``confirm`` is the one-line confirmation summary; ``body`` is the
-    zero-argument coroutine function doing the work (the browser-free test
-    seam); ``render`` turns the result dict into the summary text.
+    {action_label}") and lets a repeated same-action request confirm the run
+    it armed (see :meth:`AutomationRunPanel.request`); ``confirm`` is the
+    one-line confirmation summary; ``body`` is the zero-argument coroutine
+    function doing the work (the browser-free test seam); ``render`` turns
+    the result dict into the summary text.
     """
 
     action_label: str
@@ -214,7 +215,8 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
     def compose(self) -> ComposeResult:
         yield RichLog(id="run-log", highlight=False, markup=False, wrap=True)
         # The confirm control: a visible, focused Start button — arrows/tab +
-        # Enter first; the host's accelerator re-invocation also confirms.
+        # Enter; a re-invoked same-action request also confirms it (see
+        # AutomationRunPanel.request).
         yield ConfirmBar("Start", id="run-confirm")
         # The stop control (issue #43): visible and focused while a run is
         # active so a bare Enter requests the stop.
@@ -251,8 +253,10 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
         """Arm the confirmation for ``spec`` (or confirm a re-invoked one).
 
         A repeated request for the *same* action while its confirmation is
-        armed confirms it — so accelerator users keep a two-press path — while
-        a request for a different action re-arms with the new spec.
+        armed confirms it — so re-activating Start/Run-now a second time
+        (tabbing back to it and pressing Enter again, rather than moving to
+        the confirm bar's own focused button) still completes — while a
+        request for a different action re-arms with the new spec.
         """
         if self._active:
             return
@@ -314,7 +318,7 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
             self._leave_confirming = True
             self.set_status(
                 "Run in progress — leaving does not stop it; use the Stop "
-                "button (Enter or s) to stop after the current profile. "
+                "button (it holds focus) to stop after the current profile. "
                 "Press esc again to leave anyway.",
                 "warn",
             )
@@ -342,7 +346,7 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
         # Focus lands on the stop control while the run is active, so a bare
         # Enter requests the stop (owner rule: arrows + Enter first).
         stop.focus()
-        self.set_status("Running…  Enter (or s) stops after the current profile.")
+        self.set_status("Running…  Enter stops after the current profile.")
         # Capture the app on the UI thread for the worker's progress marshaling.
         self._app_ref = self.app
         self.post_message(self.Started(self))

@@ -10,13 +10,14 @@ issue #42 folded the standalone Execute/Check screens in here — a focusable
 - **Check acceptances** runs the smart connection checker for this campaign,
   on the same log surface.
 - Edit / Activate–Deactivate / Export CSV / Delete are the classic manage
-  actions, now visible list items as well as accelerator keys.
+  actions, now visible list items.
 
-Interaction design (owner rule, 2026-07-09): every action is reachable with
-arrows + Enter alone — the letter keys (``r`` run, ``c`` check, ``e`` edit,
-``a`` active, ``x`` export, ``d`` delete) are optional accelerators, never the
-only path. Confirmations are focused inline confirms (Enter confirms, esc
-cancels), not "press the same chord twice" patterns.
+Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+every action is reachable with arrows + Enter alone over the focusable ACTIONS
+list — there are no letter-key shortcuts. Confirmations are focused inline
+confirms (Enter confirms, esc cancels), not "press the same chord twice"
+patterns — including Delete's own confirm, which no longer has an
+accelerator-repeat shortcut either.
 
 The read is blocking SQLite, so it runs in the same threaded-worker discipline
 as the other data screens; the mutating actions (toggle/delete) likewise run
@@ -32,7 +33,6 @@ from pathlib import Path
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Label, ListItem, ListView, Static
 
@@ -157,14 +157,14 @@ class CampaignDetail:
     performance: str
 
 
-# The right-column actions: (item id suffix, title, accelerator).
-ACTIONS: tuple[tuple[str, str, str], ...] = (
-    ("run", "Run now", "r"),
-    ("check", "Check acceptances", "c"),
-    ("edit", "Edit", "e"),
-    ("toggle", "Toggle active", "a"),
-    ("export", "Export CSV", "x"),
-    ("delete", "Delete", "d"),
+# The right-column actions: (item id suffix, title).
+ACTIONS: tuple[tuple[str, str], ...] = (
+    ("run", "Run now"),
+    ("check", "Check acceptances"),
+    ("edit", "Edit"),
+    ("toggle", "Toggle active"),
+    ("export", "Export CSV"),
+    ("delete", "Delete"),
 )
 
 
@@ -173,31 +173,14 @@ class CampaignDetailScreen(BaseScreen):
 
     BINDINGS = [
         ("escape", "back", "Back"),
-        # Accelerators over the focusable ACTIONS list (owner rule: arrows +
-        # Enter are the primary path; letters are optional shortcuts).
-        Binding("r", "run_now", "Run now"),
-        Binding("c", "check", "Check acceptances"),
-        Binding("e", "edit", "Edit"),
-        Binding("a", "toggle_active", "Toggle active"),
-        Binding("x", "export", "Export CSV"),
-        Binding("d", "delete", "Delete"),
-        # Stop accelerator for an active run (the Stop button is the primary path).
-        ("s", "stop", "Stop"),
-        ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Campaign"
 
     HINTS = (
-        ("↑↓ enter", "actions"),
-        ("r", "run"),
-        ("c", "check"),
-        ("e", "edit"),
-        ("a", "active"),
-        ("x", "export"),
-        ("d", "delete"),
+        ("↑↓", "actions"),
+        ("enter", "select"),
         ("esc", "back"),
-        ("q", "quit"),
     )
 
     def __init__(
@@ -251,7 +234,7 @@ class CampaignDetailScreen(BaseScreen):
                             id=f"action-{key}",
                             classes="action-item",
                         )
-                        for key, title, _ in ACTIONS
+                        for key, title in ACTIONS
                     ),
                     id="detail-actions",
                 )
@@ -436,7 +419,8 @@ class CampaignDetailScreen(BaseScreen):
             return
         if not self._active:
             self.panel.set_status(
-                "Campaign is inactive — activate it (a) before running.", "error"
+                "Campaign is inactive — activate it (Toggle active) before running.",
+                "error",
             )
             return
         self._automation_settings = self._resolve_settings()
@@ -510,9 +494,6 @@ class CampaignDetailScreen(BaseScreen):
             self._campaign_id, self.panel.progress, stop_event=self.panel.stop_event
         )
         return map_check_stats(stats)
-
-    def action_stop(self) -> None:
-        self.panel.request_stop()
 
     def on_automation_run_panel_finished(self, event: AutomationRunPanel.Finished) -> None:
         # A run/check changes the campaign's counters — refresh the left column
@@ -591,11 +572,7 @@ class CampaignDetailScreen(BaseScreen):
             return
         bar = self.query_one("#detail-delete-confirm", ConfirmBar)
         if bar.armed:
-            # Repeated accelerator press confirms (d, d) — the primary path is
-            # the focused Delete button the first press revealed.
-            bar.disarm()
-            self._do_delete()
-            return
+            return  # already armed; the focused confirm button is the only path
         # A destructive action never fires on a single activation: arm the
         # focused inline confirm (Enter confirms, esc cancels).
         self._set_status(

@@ -27,7 +27,7 @@ Screen {
     scrollbar-background: $surface;
     scrollbar-background-hover: $surface;
     scrollbar-background-active: $surface;
-    scrollbar-color: $panel-lighten-2;
+    scrollbar-color: $panel-lighten-1;
     scrollbar-color-hover: $primary;
     scrollbar-color-active: $secondary;
 }
@@ -80,7 +80,7 @@ DataTable > .datatable--header {
 /* Muted selection (Claude Code uses a desaturated selection blue, not a bright
  * brand bar): a low-alpha brand tint keeps the row calm but clearly current. */
 DataTable > .datatable--cursor {
-    background: $primary 30%;
+    background: $primary 25%;
     color: $foreground;
     text-style: bold;
 }
@@ -244,7 +244,7 @@ HomeScreen.narrow #home-wordmark-fallback {
 }
 
 /* New Campaign / Refresh: visible, focusable buttons below the table (owner
- * rule, 2026-07-09) — tab + Enter reach them; n/r remain accelerators. */
+ * rule, 2026-07-09) — tab + Enter reach them; the buttons are the only path. */
 #campaigns-toolbar {
     height: auto;
     margin: 0 4 1 4;
@@ -304,7 +304,7 @@ HomeScreen.narrow #home-wordmark-fallback {
 }
 
 /* Refresh: a visible, focusable button below the table (owner rule,
- * 2026-07-09) — tab + Enter reach it; r remains an accelerator. */
+ * 2026-07-09) — tab + Enter reach it; the button is the only path. */
 #dashboard-refresh {
     margin: 1 0 0 0;
 }
@@ -326,7 +326,7 @@ HomeScreen.narrow #home-wordmark-fallback {
 }
 
 /* Refresh: this screen's sole focusable widget (owner rule, 2026-07-09) — tab +
- * Enter reach it; r remains an accelerator. */
+ * Enter reach it; the button is the only path. */
 #settings-refresh {
     margin: 1 0 0 0;
 }
@@ -363,7 +363,7 @@ HomeScreen.narrow #home-wordmark-fallback {
 #run-body Select {
     width: 76;
     border: none;
-    border-left: thick $panel-lighten-2;
+    border-left: thick $panel;
     background: $panel;
     padding: 0 1;
 }
@@ -409,7 +409,7 @@ SelectOverlay > .option-list--option-highlighted {
 }
 
 /* Create/Save: a visible, focusable button below the fields (owner rule,
- * 2026-07-09) — tab + Enter reach it; ctrl+s remains an accelerator. Left/right
+ * 2026-07-09) — tab + Enter reach it; the button is the only path. Left/right
  * margin matches #form-body's own gutter since the button is a sibling, not a
  * child, of that scroll container. */
 #form-submit {
@@ -526,7 +526,7 @@ ConfirmBar Button {
     min-width: 0;
     padding: 0 2;
     border: none;
-    border-left: thick $panel-lighten-2;
+    border-left: thick $panel;
     background: $panel;
     color: $text;
     text-style: none;
@@ -568,7 +568,7 @@ ConfirmBar .confirm-no {
     min-width: 0;
     padding: 0 2;
     border: none;
-    border-left: thick $panel-lighten-2;
+    border-left: thick $panel;
     background: $panel;
     color: $text;
     text-style: none;
@@ -620,7 +620,7 @@ ConfirmBar .confirm-no {
 #ai-assist-panel Select {
     width: 76;
     border: none;
-    border-left: thick $panel-lighten-2;
+    border-left: thick $panel-lighten-1;
     background: $panel-lighten-1;
     padding: 0 1;
 }
@@ -636,7 +636,7 @@ ConfirmBar .confirm-no {
 #ai-assist-input {
     height: 5;
     border: none;
-    border-left: thick $panel-lighten-2;
+    border-left: thick $panel-lighten-1;
     background: $panel-lighten-1;
 }
 #ai-assist-input:focus {
@@ -696,4 +696,28 @@ ConfirmBar .confirm-no {
 #form-body Input.field-flagged,
 #form-body Select.field-flagged {
     border-left: thick $warning;
+}
+
+/* ── issue #49: location search results (OptionList, not Select) ───────── */
+
+/* Replaces an earlier Select whose auto-prepended blank sentinel silently ate
+ * the natural Enter (open) / Enter (pick) keyboard sequence. Sized like the
+ * rest of the campaign form and coloured like SelectOverlay above (an
+ * elevated panel with the same muted selection tint) — one picker idiom,
+ * whether the list floats over a field or sits inline in the form; capped so
+ * a long result list can't push the rest of the form around. */
+#field-location-results {
+    width: 76;
+    height: auto;
+    max-height: 8;
+    border: round $panel-lighten-2;
+    background: $panel;
+}
+#field-location-results:focus {
+    border: round $primary;
+}
+#field-location-results > .option-list--option-highlighted {
+    background: $primary 25%;
+    color: $foreground;
+    text-style: bold;
 }

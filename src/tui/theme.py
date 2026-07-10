@@ -10,13 +10,12 @@ The TUI's look is split deliberately:
   reads the tokens defined here.
 
 **Palette direction.** Anchored on LinkedIn's brand blue (kept identical to the
-classic CLI for cross-surface coherence), but built out into a calm, modern
-terminal palette in the spirit of the dark schemes that define 2025/2026
-terminal aesthetics (Tokyo Night, Catppuccin): a deep, slightly *cool* neutral
-base layered by elevation, soft pastel-leaning accents used with restraint, and
-desaturated semantic colours that harmonise rather than shout. The brand blue
-stays the identity (solid fills, focus, active); a brighter blue carries text
-accents where the deep brand blue would read low-contrast on dark.
+classic CLI for cross-surface coherence), but built out into a true-black
+terminal palette: an OLED-black base (background/surface sit at or near
+``#000000``), with elevation carried by near-neutral dark panels rather than
+by lightening a cool grey-blue. The brand blue stays the identity (solid
+fills, focus, active); a brighter blue carries text accents where the deep
+brand blue would read low-contrast on black.
 """
 
 from __future__ import annotations
@@ -39,17 +38,17 @@ LINKEDIN_THEME = Theme(
     success="#4FB477",         # calm green: healthy/active states, good rates
     warning="#E0A65B",         # amber: quota approaching, caution states
     error="#E5615B",           # soft red: error / degraded states
-    foreground="#E4E9F0",      # body text — a touch cool, not stark white
-    background="#11151A",      # app background — deep, cool, calm
-    surface="#161B22",         # screen surface (one step up from background)
-    panel="#1C222B",           # elevated cards / panels (one more step up)
+    foreground="#E6E8EB",      # body text — neutral, not stark white
+    background="#000000",      # app background — true black
+    surface="#050506",         # screen surface — effectively true black
+    panel="#101114",           # elevated cards / panels — near-neutral dark
     dark=True,
     variables={
         # Muted captions and status lines (the ``$text-muted`` token). The
         # dimmest tier (eyebrows) uses Textual's built-in ``$text-disabled``, and
         # raised hover surfaces use the auto-generated ``$surface-lighten-1`` —
         # both resolvable at first CSS parse, unlike brand-new custom variables.
-        "text-muted": "#8A95A6",
+        "text-muted": "#7E858F",
         "block-cursor-foreground": "#FFFFFF",
     },
 )

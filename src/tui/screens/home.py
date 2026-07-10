@@ -7,11 +7,11 @@ idiom is borrowed straight from Claude Code's own list component — a ``❯``
 pointer in the accent colour and the selected row's title recoloured, with **no**
 background bar or border.
 
-Navigation is fast: ``↑``/``↓`` + ``enter``, the number keys jump straight to a
-destination, and the command palette (ctrl+p) reaches every registered
-destination — including the palette-only ones (issue #42 shrank home to four:
-Dashboard · Campaigns · New Campaign · Settings; running and checking live on
-the campaign detail screen now).
+Navigation is fast: ``↑``/``↓`` + ``enter`` over the list, and the (no longer
+advertised, but still functional) command palette ``ctrl+p`` reaches every
+registered destination — including the palette-only ones (issue #42 shrank
+home to four: Dashboard · Campaigns · New Campaign · Settings; running and
+checking live on the campaign detail screen now).
 
 The workspace summary is a DB/settings read, so it follows the threaded-worker
 race discipline (``docs/tui-migration.md`` §6): the app is captured on the UI
@@ -19,7 +19,11 @@ thread, a monotonic generation token drops superseded loads, and late callbacks
 after quit are no-ops.
 
 This screen is the app's base; it has nowhere to pop back to, so it does not
-inherit ``BaseScreen``'s ``escape`` binding. ``q`` quits.
+inherit ``BaseScreen``'s ``escape`` binding. Instead ``esc`` quits, guarded
+like the dirty-form discard pattern elsewhere in the TUI: the first press arms
+it (shown in the workspace-summary line) and disarms on any other key; only a
+second, immediate ``esc`` exits (owner rule, 2026-07-09: no bare single-key
+quit anywhere, including home).
 """
 
 from __future__ import annotations
@@ -59,10 +63,9 @@ POINTER = "❯"
 # art is therefore the sharpest portable option.)
 
 HINTS = (
-    (f"1-{len(HOME_ITEMS)} ↑↓", "navigate"),
+    ("↑↓", "navigate"),
     ("enter", "open"),
-    ("q", "quit"),
-    ("ctrl+p", "more"),
+    ("esc", "quit"),
 )
 
 
@@ -70,14 +73,19 @@ class HomeScreen(WorkerGuardMixin, Screen):
     """Curated home: brand masthead, live summary + keyboard-first navigation."""
 
     BINDINGS = [
-        ("q", "app.quit", "Quit"),
-        # Number keys jump straight to a destination (1-indexed over HOME_ITEMS,
-        # the home slice of the shared registry in ``tui.nav``).
-        *(
-            Binding(str(i + 1), f"open({i})", item.title, show=False)
-            for i, item in enumerate(HOME_ITEMS)
-        ),
+        # Not shown: the armed/disarmed quit guard (see action_request_quit)
+        # replaces its own hint text into the workspace-summary line instead.
+        Binding("escape", "request_quit", "Quit", show=False),
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Double-esc quit guard (owner rule, 2026-07-09): the first esc arms
+        # it and borrows #home-status to say so; any other key disarms it
+        # (see on_key). _status_text is the workspace-summary line to restore
+        # on disarm, kept in sync by _populate rather than re-queried.
+        self._quit_confirming = False
+        self._status_text = "Loading workspace…"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="home"):
@@ -145,16 +153,27 @@ class HomeScreen(WorkerGuardMixin, Screen):
         key = (event.item.id or "").removeprefix("nav-")
         self._open_key(key)
 
-    def action_open(self, index: int) -> None:
-        """Number-key jump: open the nav item at ``index`` (0-based)."""
-        if 0 <= index < len(HOME_ITEMS):
-            HOME_ITEMS[index].push(self.app)
-
     def _open_key(self, key: str) -> None:
         for item in HOME_ITEMS:
             if item.key == key:
                 item.push(self.app)
                 return
+
+    # ── quit guard (esc, esc) ───────────────────────────────────────────────
+
+    def action_request_quit(self) -> None:
+        if self._quit_confirming:
+            self.app.exit()
+            return
+        self._quit_confirming = True
+        self.query_one("#home-status", Static).update("Press esc again to quit.")
+
+    def on_key(self, event) -> None:
+        # Any key other than the arming esc itself disarms the guard — a
+        # second, immediate esc is the only thing that quits.
+        if event.key != "escape" and self._quit_confirming:
+            self._quit_confirming = False
+            self.query_one("#home-status", Static).update(self._status_text)
 
     # ── workspace summary (threaded load) ─────────────────────────────────
 
@@ -213,7 +232,11 @@ class HomeScreen(WorkerGuardMixin, Screen):
                               used_today=None, active_limits=None, db_ok=False)
 
     def _populate(self, summary: HomeSummary) -> None:
-        self.query_one("#home-status", Static).update(summary.line())
+        self._status_text = summary.line()
+        # A refresh mid-quit-confirmation must not clobber the "press esc
+        # again" prompt out from under an already-armed guard.
+        if not self._quit_confirming:
+            self.query_one("#home-status", Static).update(self._status_text)
 
 
 @dataclass(frozen=True)

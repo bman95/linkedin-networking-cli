@@ -64,7 +64,7 @@ PEAK_THR = 0.03                    # min peak energy, fraction of profile max
 # ---------------------------------------------------------------------------
 # Palette (snap every visible pixel to nearest; dark -> surface background)
 # ---------------------------------------------------------------------------
-SURFACE = (22, 27, 34)
+SURFACE = (5, 5, 6)
 NAVY = (4, 39, 129)
 WHITE = (235, 247, 255)
 LIGHT = (75, 180, 252)

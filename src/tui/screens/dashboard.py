@@ -54,25 +54,22 @@ class DashboardData:
 class DashboardScreen(BaseScreen):
     """Overview of campaigns, contacts and connection stats.
 
-    Interaction design (owner rule, 2026-07-09): Refresh is a visible, focusable
-    button below the recent-campaigns table — reachable with tab + Enter — with
-    ``r`` kept as an optional accelerator, never the only path.
+    Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+    Refresh is a visible, focusable button below the recent-campaigns table —
+    tab + Enter is the only path to it.
     """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("r", "refresh", "Refresh"),
-        ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Dashboard"
 
     HINTS = (
-        ("enter", "open campaign"),
+        ("↑↓", "rows"),
+        ("enter", "open"),
+        ("tab", "buttons"),
         ("esc", "back"),
-        ("r", "refresh"),
-        ("q", "quit"),
-        ("ctrl+p", "commands"),
     )
 
     RECENT_COLUMNS = ("Name", "Status", "Sent", "Accepted", "Rate")
@@ -234,7 +231,7 @@ class DashboardScreen(BaseScreen):
         self._fill_recent(data.recent)
         if data.stats.get("total_campaigns", 0) == 0:
             status.update(
-                "No campaigns yet. Use Create Campaign (ctrl+p, or 3 on Home) to add one."
+                "No campaigns yet. Use New Campaign on Home to add one."
             )
         else:
             status.update("Updated.")

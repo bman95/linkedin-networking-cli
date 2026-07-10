@@ -103,12 +103,15 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self._pending_description: str | None = None
         self._pending_model: str | None = None
         self._stop_event: threading.Event | None = None
+        # Set once the host campaign was successfully created; a late
+        # extraction must not write into the now-locked form (see lock()).
+        self._locked = False
 
     # ── compose ───────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Button(
-            "✨ Describe your campaign in plain language",
+            "Describe your campaign in plain language",
             id="ai-assist-toggle",
             classes="flat-button",
         )
@@ -262,7 +265,14 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self._expanded = not self._expanded
         self.query_one("#ai-assist-body").display = self._expanded
         if self._expanded:
-            self.query_one("#ai-assist-input", TextArea).focus()
+            # The model select is the first interactive control in local mode
+            # (Tab order otherwise skipped straight to the TextArea below it);
+            # in hosted mode it's hidden, so the TextArea is first instead.
+            model_select = self.query_one("#ai-assist-model-select", Select)
+            if model_select.display:
+                model_select.focus()
+            else:
+                self.query_one("#ai-assist-input", TextArea).focus()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "ai-assist-input":
@@ -510,6 +520,23 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             )
             return True
         return False
+
+    def lock_panel(self) -> None:
+        """Disable every control once the host campaign was created.
+
+        Named ``lock_panel`` (not ``lock``): Textual's own ``Widget`` already
+        owns a ``.lock`` instance attribute (an internal ``RLock``), which
+        would silently shadow a same-named method here.
+
+        Called by the host screen's ``_done()`` alongside locking the form
+        fields: a late extraction landing after a successful create must not
+        write into the locked form (the host also guards its own handler),
+        and disabling the panel's own controls additionally blocks a new run
+        from ever starting.
+        """
+        self._locked = True
+        for widget in self.query("Button, Input, Select, TextArea"):
+            widget.disabled = True
 
     # ── helpers ───────────────────────────────────────────────────────────
 

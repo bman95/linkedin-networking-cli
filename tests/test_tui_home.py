@@ -162,15 +162,55 @@ async def test_home_shows_mascot(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
-async def test_home_number_key_opens_destination(db_manager: DatabaseManager):
-    """Pressing a number key jumps straight to the matching screen."""
+async def test_home_nav_reaches_campaigns_via_arrows_and_enter(db_manager: DatabaseManager):
+    """Arrows + Enter reach every destination (owner rule, 2026-07-09: number-
+    key jumps were removed; the ListView is the only navigation path left)."""
+    from textual.widgets import ListView
+
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
-        await pilot.press("2")  # 2 -> Campaigns
+        nav = app.screen.query_one("#home-nav", ListView)
+        while nav.index != 1:  # Campaigns is the second home item
+            await pilot.press("down")
+        await pilot.press("enter")
         await pilot.pause()
         assert isinstance(app.screen, CampaignsScreen)
+
+
+@pytest.mark.unit
+async def test_home_esc_quit_guard_needs_two_presses(db_manager: DatabaseManager):
+    """First esc arms the quit guard (shown in the workspace-summary line)
+    without quitting; a second, immediate esc quits. Any other key disarms
+    it, so a stray esc doesn't linger as an accidental trap."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, HomeScreen)
+        text = await wait_home_status(pilot, "ready")  # summary settled first
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.screen is screen  # first esc does not quit
+        armed = str(app.screen.query_one("#home-status", Static).render())
+        assert "Press esc again to quit" in armed
+        assert app.is_running
+
+        # Any other key disarms it and restores the summary line.
+        await pilot.press("down")
+        await pilot.pause()
+        restored = str(app.screen.query_one("#home-status", Static).render())
+        assert restored == text
+        assert app.is_running
+
+        # Two esc presses in a row quit.
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not app.is_running
 
 
 # ── campaign-centric navigation (issue #42) ─────────────────────────────────

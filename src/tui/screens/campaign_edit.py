@@ -3,7 +3,7 @@
 Reuses the shared campaign form (``campaign_form``) — same fields, validation, and
 mapping as Create — but pre-fills it from the existing campaign and persists via
 ``DatabaseManager.update_campaign``. Reached from the campaign detail screen's
-``e`` action. The prefill read and the save write both run off the UI thread in
+Edit action. The prefill read and the save write both run off the UI thread in
 their own worker groups, under the established race discipline; on success the
 form locks and ``esc`` returns to the detail screen, which reloads on resume.
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from textual import work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.widgets import Button, Static
 
 from database.models import Campaign
@@ -27,17 +26,15 @@ logger = get_logger(__name__)
 class CampaignEditScreen(CampaignFormScreen):
     """Pre-filled campaign form that updates an existing campaign.
 
-    Interaction design (owner rule, 2026-07-09): a visible, focusable "Save"
-    button sits below the fields — reachable with tab + Enter — with ``ctrl+s``
-    kept as an optional accelerator, never the only path.
+    Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+    a visible, focusable "Save" button sits below the fields — tab + Enter is
+    the only path to it.
     """
 
     BINDINGS = [
         # "back" (not app.pop_screen): the shared form owns esc so a dirty form
         # warns before discarding (see CampaignFormScreen.action_back).
         ("escape", "back", "Back"),
-        Binding("ctrl+s", "save", "Save", priority=True),
-        ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Edit Campaign"
@@ -45,10 +42,9 @@ class CampaignEditScreen(CampaignFormScreen):
     STATUS_ID = "#edit-status"
 
     HINTS = (
-        ("ctrl+s", "save"),
-        ("esc", "cancel"),
-        ("q", "quit"),
-        ("ctrl+p", "commands"),
+        ("tab", "fields"),
+        ("enter", "activate"),
+        ("esc", "back"),
     )
 
     def __init__(self, db_manager: DatabaseManager | None, campaign_id: int) -> None:
@@ -136,6 +132,8 @@ class CampaignEditScreen(CampaignFormScreen):
             self._set_status(f"Error saving campaign: {error}", "error")
             return
         self._saved = True
-        for widget in self.query("#form-body Input, #form-body Select, #form-submit"):
+        for widget in self.query(
+            "#form-body Input, #form-body Select, #form-body OptionList, #form-submit"
+        ):
             widget.disabled = True
         self._set_status(f"✓ Campaign '{name}' updated. Press esc to return.", "good")

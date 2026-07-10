@@ -49,18 +49,23 @@ class SettingsData:
 class SettingsScreen(BaseScreen):
     """Read-only view of the application's effective configuration.
 
-    Interaction design (owner rule, 2026-07-09): Refresh is a visible, focusable
-    button below the sections — reachable with tab + Enter — with ``r`` kept as
-    an optional accelerator, never the only path.
+    Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
+    Refresh is a visible, focusable button below the sections — tab + Enter is
+    the only path to it.
     """
 
     BINDINGS = [
         ("escape", "app.pop_screen", "Back"),
-        ("r", "refresh", "Refresh"),
-        ("q", "app.quit", "Quit"),
     ]
 
     SCREEN_TITLE = "Settings"
+
+    HINTS = (
+        # The Refresh button is this screen's sole focusable widget and holds
+        # focus on mount, so Enter alone activates it — no movement key needed.
+        ("enter", "refresh"),
+        ("esc", "back"),
+    )
 
     def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
