@@ -55,16 +55,16 @@ respect them.
   `AppSettings()` construction) are synchronous/blocking and may touch disk, so
   every data load runs in a `@work(thread=True, exclusive=True)` worker with the
   full safety contract in §6.
-- **Arrows + Enter first, everywhere (owner rule, 2026-07-09; issue #49).**
-  Every user-facing action on every screen must be a visible, focusable element
-  (list item or button) reachable with ↑/↓/tab and activated with Enter.
-  Letter/number/ctrl-chord keys (`n`, `r`, `e`/`a`/`x`/`d`, `ctrl+s`, `ctrl+r`, …)
-  may stay as optional accelerators shown in the hint bar, but never as the sole
-  trigger for an action — a screen with no on-screen affordance for one of its
-  actions is a bug. Destructive or side-effecting confirmations use a focused
-  inline confirm (`ConfirmBar`: Enter confirms, esc cancels; a repeated
-  accelerator press also confirms) rather than a "press the same chord twice"
-  pattern. Exempted: `esc` itself, already the universal Back/Cancel key on
+- **Arrows + Enter only, everywhere (owner rule, 2026-07-09; hardened
+  2026-07-10).** Every user-facing action on every screen must be a visible,
+  focusable element (list item or button) reachable with ↑/↓/tab and activated
+  with Enter. Keyboard shortcuts were removed entirely on 2026-07-10 — no
+  letter accelerators, no ctrl-chords, no home number keys, no `q` (quit is a
+  double-`esc` guard on the home screen). The built-in `ctrl+p` command
+  palette stays functional but unadvertised. A screen with no on-screen
+  affordance for one of its actions is a bug. Destructive or side-effecting
+  confirmations use a focused inline confirm (`ConfirmBar`: Enter confirms,
+  esc cancels) rather than a "press the same chord twice" pattern. Exempted: `esc` itself, already the universal Back/Cancel key on
   every screen, may still warn-then-repeat (e.g. the dirty-form discard guard,
   the mid-run leave warning) — that is a navigation safety check, not a
   hidden-shortcut action needing its own widget. Applied first to the
@@ -135,13 +135,13 @@ side effects); write and automation flows follow.
    see §3) — but it's kept for a future standalone flow and exercised
    directly by tests.
 
-   **Interaction design (owner rule, 2026-07-09): arrows + Enter first.** Every
-   action is a visible, focusable element (list item or button); letter keys
-   (`r`/`c`/`e`/`a`/`x`/`d`, `s` for stop, `ctrl+r` on the run screens) are
-   optional accelerators, never the only path. Confirmations use a focused
-   inline confirm (`ConfirmBar`: Enter confirms, esc cancels; a repeated
-   accelerator press also confirms) — this superseded the earlier two-press
-   `ctrl+r` pattern. The browser run stays **user-initiated**: nothing runs
+   **Interaction design (owner rule, 2026-07-09; hardened 2026-07-10): arrows +
+   Enter only.** Every action is a visible, focusable element (list item or
+   button); the letter/ctrl accelerators that briefly existed
+   (`r`/`c`/`e`/`a`/`x`/`d`, `s`, `ctrl+r`, `ctrl+s`) were removed on
+   2026-07-10. Confirmations use a focused inline confirm (`ConfirmBar`: Enter
+   confirms, esc cancels) — this superseded the earlier two-press `ctrl+r`
+   pattern. The browser run stays **user-initiated**: nothing runs
    until the user confirms the armed run. `run_body` (and the detail's
    `run_now_body` / `check_body`) are the seams tests override to exercise the
    run/log/summary/error pipeline without a browser; the live run itself is
@@ -149,7 +149,7 @@ side effects); write and automation flows follow.
    (issue #43): the engine loops take a `threading.Event`-style `stop_event`
    polled **between profiles** (never mid-send), and the run surface shows a
    focusable "Stop after current profile" button (focused while running, so
-   Enter stops; `s` is the accelerator) that returns a normal partial summary
+   Enter stops) that returns a normal partial summary
    with `status: "cancelled"`. Leaving the screen still does *not* stop the
    run; `esc` after completion returns.
 4. **Cutover (done, issue #47).** Every classic main-menu flow had a TUI

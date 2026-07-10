@@ -108,11 +108,24 @@ and uses two complementary mechanisms, selected by how the browser launches:
 Only one mechanism is *read* per run (the persistent profile when present,
 otherwise `~/.linkedin-networking-cli/session.json`). Writing is not exclusive:
 `login` writes `session.json` on a confirmed login, and `close_browser` writes
-it whenever the run confirmed an authenticated session (`is_authenticated`) —
+it whenever the run's session is still believed healthy (`is_authenticated`) —
 persistent runs included — so a later transient run can resume a session a
 persistent run established. `close_browser` deliberately *skips* the write when
 no authenticated session was confirmed (crash-recovery and failed-login
-teardowns), so a logged-out context never clobbers a still-good `session.json`.
+teardowns) **and** when the session was compromised mid-run: a detected
+CAPTCHA/checkpoint/logout calls `_mark_session_compromised()` (clearing
+`is_authenticated`), and as a belt-and-braces the write is also skipped when
+the page is sitting on a login/challenge URL at close — so a degraded context
+never clobbers a still-good `session.json`.
+
+**Cross-process profile lock.** The persistent profile is guarded by
+`<app_dir>/browser_profile.lock` (PID inside): `start_browser` acquires it
+before `force_close_chrome`, so cleanup only ever kills *orphaned* Chrome from
+a crashed run. A lock naming a live PID raises `BrowserProfileBusyError`
+(surfaced as a clean "profile in use" message) instead of killing a concurrent
+TUI/`linkedin-run` session; a dead-PID lock is stale and reclaimed. The lock
+is released in `close_browser`'s teardown (and on a failed `start_browser`),
+and held across `_refresh_context`'s crash-recovery relaunch.
 
 ### File Structure Context
 
