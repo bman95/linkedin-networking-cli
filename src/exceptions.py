@@ -13,7 +13,8 @@ Exception Hierarchy:
         ├── SelectorNotFoundException (element not found on page)
         ├── RateLimitExceededException (connection limits reached)
         ├── CaptchaDetectedException (captcha challenge detected)
-        └── UnexpectedLandingException (navigation landed somewhere unexpected)
+        ├── UnexpectedLandingException (navigation landed somewhere unexpected)
+        └── BrowserProfileBusyError (persistent Chrome profile held by another process)
 """
 
 
@@ -241,3 +242,22 @@ class UnexpectedLandingException(LinkedInAutomationError):
         if details:
             base_msg += f" ({', '.join(details)})"
         return base_msg
+
+
+class BrowserProfileBusyError(LinkedInAutomationError):
+    """Exception raised when another live process already holds the
+    persistent Chrome profile lock.
+
+    Raised when ``start_browser`` finds ``browser_profile.lock`` naming a PID
+    that is still alive: killing that process' Chrome (as the ordinary
+    stale-lock cleanup would) could corrupt a legitimate concurrent run —
+    e.g. the TUI and a cron-scheduled ``linkedin-run`` both targeting the
+    same profile. A dead-PID (stale) lock is cleaned up silently instead;
+    this is only raised for a live owner.
+
+    Example:
+        raise BrowserProfileBusyError(
+            "Browser profile in use by process 12345; wait or stop it first"
+        )
+    """
+    pass

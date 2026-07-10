@@ -57,7 +57,9 @@ from config.settings import AppSettings
 from database.models import Campaign, Contact, ContactStatus
 from database.operations import DatabaseManager
 from exceptions import (
+    BrowserProfileBusyError,
     CaptchaDetectedException,
+    LinkedInAutomationError,
     LoginFailedException,
     NotAuthenticatedException,
     SelectorNotFoundException,
@@ -194,6 +196,107 @@ def force_close_chrome(user_data_dir: str | None = None) -> None:
         _clear_stale_singleton_locks(Path(user_data_dir))
 
 
+# Cross-process lock guarding the persistent Chrome profile. Two of our own
+# processes (the TUI and a cron-scheduled ``linkedin-run``) can target the
+# SAME on-disk profile; without this, ``force_close_chrome`` above would kill
+# a live, legitimate owner's Chrome out from under it. The lock lives
+# alongside the profile directory (its parent — the app dir) rather than
+# inside it, so it is never mistaken for Chrome's own profile contents.
+_PROFILE_LOCK_NAME = "browser_profile.lock"
+
+
+def _profile_lock_path(user_data_dir: str) -> Path:
+    """The lockfile path for ``user_data_dir``'s persistent profile."""
+    return Path(user_data_dir).parent / _PROFILE_LOCK_NAME
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True if ``pid`` names a live process (any owner, not just ours).
+
+    ``os.kill(pid, 0)`` sends no signal — it only probes whether the PID is
+    joinable. ``ProcessLookupError`` means the process is gone (a stale
+    lock); ``PermissionError`` means it exists but we lack permission to
+    signal it — still alive, so treated as such rather than mistaken for a
+    stale lock.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_pid(lock_path: Path) -> int | None:
+    """Best-effort read of the PID stored in the lockfile; None on any problem."""
+    try:
+        content = lock_path.read_text(encoding="utf-8").strip()
+        return int(content)
+    except (OSError, ValueError):
+        return None
+
+
+def acquire_profile_lock(user_data_dir: str) -> Path:
+    """Claim the cross-process lock on ``user_data_dir``'s persistent profile.
+
+    A missing or stale lock (its PID no longer alive) is cleaned up and
+    claimed for our own PID, written atomically (write-temp then
+    ``os.replace``, so a concurrent reader never observes a partial write). A
+    lock whose PID IS alive raises :class:`BrowserProfileBusyError` instead of
+    being silently cleared — that PID owns a legitimate, possibly concurrent
+    run, and clearing its lock would let ``force_close_chrome`` kill its
+    Chrome out from under it.
+
+    Returns the lock path (for :func:`release_profile_lock`).
+    """
+    lock_path = _profile_lock_path(user_data_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_pid = _read_lock_pid(lock_path)
+    if (
+        existing_pid is not None
+        and existing_pid != os.getpid()
+        and _pid_is_alive(existing_pid)
+    ):
+        raise BrowserProfileBusyError(
+            f"The browser profile at {user_data_dir!r} is already in use by "
+            f"process {existing_pid} (e.g. another linkedin-tui/linkedin-run "
+            "run). Wait for it to finish, or stop it, before starting a new one."
+        )
+    if existing_pid is not None:
+        # Stale (dead-PID) lock or our own leftover — safe to clear.
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("Could not remove stale profile lock %s: %s", lock_path, exc)
+
+    tmp_path = lock_path.with_name(f"{lock_path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(str(os.getpid()), encoding="utf-8")
+    os.replace(tmp_path, lock_path)
+    return lock_path
+
+
+def release_profile_lock(user_data_dir: str) -> None:
+    """Release our profile lock, only if it still names our own PID.
+
+    Best-effort and never raises: called from ``close_browser``'s teardown,
+    which must complete regardless. Never unlinks a lock some other (live)
+    process has since claimed.
+    """
+    lock_path = _profile_lock_path(user_data_dir)
+    if _read_lock_pid(lock_path) != os.getpid():
+        return
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not remove profile lock %s: %s", lock_path, exc)
+
+
 @dataclass
 class LinkedInProfile:
     """Data class for LinkedIn profile information"""
@@ -230,6 +333,10 @@ class LinkedInAutomation:
         # Sliding-window per-minute action cap, built lazily from settings so
         # an env override applied after construction still takes effect.
         self._rate_limiter: RateLimiter | None = None
+        # The persistent profile's user_data_dir while we hold its
+        # cross-process lock (see acquire_profile_lock); None when no lock is
+        # held (transient launch path, or before start_browser runs).
+        self._locked_user_data_dir: str | None = None
 
     def _get_rate_limiter(self) -> RateLimiter:
         """Return the action rate limiter, building it from settings once."""
@@ -250,6 +357,42 @@ class LinkedInAutomation:
             min_s=auto["action_delay_min"],
             max_s=auto["action_delay_max"],
         )
+
+    def _mark_session_compromised(self) -> None:
+        """Clear ``is_authenticated`` after a mid-run captcha/checkpoint/logout.
+
+        ``is_authenticated`` is set once by :meth:`login` and is otherwise a
+        one-way flag; a challenge or logout detected later in the SAME run
+        would otherwise leave it stuck True, so ``close_browser`` would
+        persist ``session.json`` from a compromised session — clobbering a
+        previously-good file with cookies from a session that just got
+        flagged. Call this from every call site that detects a mid-run
+        challenge/logout (never from :meth:`login` itself, which only sets
+        the flag once a session is actually confirmed).
+        """
+        if self.is_authenticated:
+            logger.warning(
+                "Marking session compromised (mid-run captcha/checkpoint/"
+                "logout detected); session.json will not be overwritten on close"
+            )
+        self.is_authenticated = False
+
+    def _page_on_challenge_wall(self) -> bool:
+        """Best-effort: is the current page sitting on a login/challenge URL?
+
+        Belt-and-braces backstop for :meth:`close_browser`'s session-write
+        guard: reuses the same challenge/login path patterns the navigation
+        guard uses (``landed_on_challenge``) so a missed
+        ``_mark_session_compromised`` call site is still caught directly from
+        the page's own URL right before the write.
+        """
+        if self.page is None:
+            return False
+        try:
+            url = self.page.url
+        except Exception:
+            return False
+        return landed_on_challenge(str(url)) is not None
 
     async def _refresh_context(self) -> Page:
         """Close and reopen the browser context, keeping the persistent profile.
@@ -273,6 +416,23 @@ class LinkedInAutomation:
         Returns the fresh ``Page``.
         """
         logger.warning("Refreshing browser context to recover from a wedged renderer")
+        # Invariant: the cross-process profile lock is held across the WHOLE
+        # close+relaunch below, never released in between. close_browser then
+        # start_browser back-to-back would otherwise open a window — between
+        # the release and the re-acquire — where a concurrent run could grab
+        # the now-free profile and force_close_chrome our own relaunch out
+        # from under it. Stash the lock dir and clear the attribute so
+        # close_browser's own release (in its finally) is skipped; the lock
+        # file stays on disk naming our PID for the whole gap.
+        # start_browser's acquire_profile_lock treats an existing same-PID
+        # lock as our own leftover and reclaims it. If start_browser itself
+        # then fails, its own failure-path release cleans the lock up.
+        locked_user_data_dir = self._locked_user_data_dir
+        self._locked_user_data_dir = None
+        if locked_user_data_dir is not None:
+            logger.debug(
+                "Holding profile lock on %s across close+relaunch", locked_user_data_dir
+            )
         await self.close_browser()
         # Drop any partial handles so start_browser launches from scratch rather
         # than reusing a half-dead context.
@@ -319,6 +479,31 @@ class LinkedInAutomation:
         await self.close_browser()
 
     async def start_browser(self):
+        """Initialize the browser, releasing the profile lock if this fails.
+
+        Delegates to :meth:`_start_browser_unlocked` for the actual launch
+        mechanics (see its docstring). Wrapped here — not just in
+        ``__aenter__`` — so a direct ``start_browser()`` call is covered too,
+        not only the ``async with`` path: any exception raised after the
+        cross-process profile lock (``acquire_profile_lock``) was
+        successfully acquired must release it before propagating, or the lock
+        file is left on disk naming a live PID and falsely blocks every other
+        run until this process dies.
+        """
+        try:
+            await self._start_browser_unlocked()
+        except Exception:
+            # _locked_user_data_dir is only set AFTER a successful
+            # acquire_profile_lock call, so a BrowserProfileBusyError raised
+            # by the acquire itself leaves it None here — this release is
+            # then a no-op and the exception propagates untouched, exactly as
+            # before.
+            if self._locked_user_data_dir is not None:
+                release_profile_lock(self._locked_user_data_dir)
+                self._locked_user_data_dir = None
+            raise
+
+    async def _start_browser_unlocked(self):
         """Initialize Playwright browser with enhanced session management.
 
         Session persistence relies on two complementary mechanisms, chosen by
@@ -406,9 +591,21 @@ class LinkedInAutomation:
             persistent_kwargs = launch_kwargs.copy()
             persistent_kwargs.update(context_options)
             logger.info("Using persistent context with user data dir %s", user_data_dir)
+            # Claim the cross-process profile lock BEFORE force_close_chrome:
+            # a live PID in the lock means another of our own processes (the
+            # TUI, a cron linkedin-run) legitimately owns this profile right
+            # now, and force_close_chrome killing its Chrome would corrupt
+            # that run. A stale (dead-PID) lock is cleaned up and claimed;
+            # only a live owner raises. Not caught below — a busy profile
+            # must abort start_browser, not silently fall back to a
+            # transient (session.json) launch that would let a second run
+            # proceed against the same account concurrently.
+            acquire_profile_lock(user_data_dir)
+            self._locked_user_data_dir = user_data_dir
             # Free the profile before launching: kill any Chrome still holding it
-            # and (on POSIX) drop stale single-instance locks, so the launch
-            # below can't abort with "ProcessSingleton" and bounce the browser.
+            # (now known to be an orphan, not a locked-in live owner) and (on
+            # POSIX) drop stale single-instance locks, so the launch below
+            # can't abort with "ProcessSingleton" and bounce the browser.
             force_close_chrome(user_data_dir)
             try:
                 logger.info("Launching persistent Chrome…")
@@ -528,6 +725,18 @@ class LinkedInAutomation:
     # which frees the driver subprocess — and leak a process per crash.
     _CLOSE_STEP_TIMEOUT_S = 10
 
+    # "modal_not_found" outcomes (see _attempt_connect) SINCE THE LAST
+    # sent/possibly_sent, not necessarily back-to-back: the counter only
+    # resets on a real (or possible) send, so an interleaved "existing" /
+    # "email_required" / "blocked" / "send_failed" does not reset it either —
+    # it just doesn't advance it. Once it reaches this threshold the whole
+    # send loop aborts. A soft "modal_not_found" alone lets the run burn
+    # through its entire worklist "successfully" without sending a single
+    # invitation (e.g. LinkedIn UI language unsupported, or markup changed) —
+    # a run this consistently unproductive is a signal to stop and let a human
+    # look, not to keep silently failing every profile.
+    _MODAL_NOT_FOUND_ABORT_THRESHOLD = 5
+
     async def _close_step(self, awaitable, what: str):
         """Run one teardown step, bounded and best-effort (never raises).
 
@@ -551,13 +760,41 @@ class LinkedInAutomation:
         each step keeps the teardown total — every handle gets a bounded close
         attempt, and ``stop`` (which frees the driver subprocess) always runs.
         """
+        # The cross-process profile lock is released in the finally below —
+        # after the session write and teardown steps, so a concurrent run
+        # cannot acquire the profile (and force-kill this Chrome) while the
+        # storage_state write is still in flight. Every step is bounded, so
+        # the finally is always reached whenever close_browser actually runs.
+        # A start_browser that raises before returning (so this method is
+        # never called — e.g. __aenter__ propagating the failure) is instead
+        # covered by start_browser's own failure-path release; between the
+        # two, the lock can never outlive the process that failed to launch
+        # or that closed cleanly.
+        try:
+            await self._close_browser_steps()
+        finally:
+            if self._locked_user_data_dir is not None:
+                release_profile_lock(self._locked_user_data_dir)
+                self._locked_user_data_dir = None
+
+    async def _close_browser_steps(self):
         if self.context:
             # Only persist session.json when this run actually confirmed an
             # authenticated session. close_browser also runs on crash recovery
             # and failed-login teardowns, where the context may be logged out —
             # writing its storage_state then would clobber a still-good
-            # session.json with a degraded one.
-            if self.is_authenticated:
+            # session.json with a degraded one. Belt-and-braces: is_authenticated
+            # is set once by login() and only cleared at the specific call sites
+            # that detect a mid-run captcha/checkpoint/logout
+            # (_mark_session_compromised); if a call site is ever missed, check
+            # the page's own URL directly before writing.
+            if self.is_authenticated and self._page_on_challenge_wall():
+                logger.info(
+                    "Skipping session.json write on close: the page is sitting "
+                    "on a login/challenge URL despite is_authenticated=True; "
+                    "preserving the existing session file"
+                )
+            elif self.is_authenticated:
                 await self._close_step(
                     self._write_session_state(self.context),
                     "storage_state",
@@ -820,6 +1057,8 @@ class LinkedInAutomation:
         # leaks the counter nor mixes ring-buffer evidence across campaigns.
         reset_diagnostics_run()
 
+        from .interactions import detect_captcha
+
         try:
             if progress_callback:
                 progress_callback("Starting profile search...")
@@ -834,6 +1073,29 @@ class LinkedInAutomation:
             walked_any = False
             async for page_count in self._walk_search_pages(campaign, progress_callback):
                 walked_any = True
+
+                # Inline CAPTCHA can render on the results page without a URL
+                # bounce (the landing guard only catches URL-level challenges).
+                # Mirrors search_and_connect's per-page check (parity, issue).
+                if await detect_captcha(self.page):
+                    logger.warning("CAPTCHA detected on search results; stopping")
+                    captcha_exc = CaptchaDetectedException(
+                        "CAPTCHA detected on search results page"
+                    )
+                    try:
+                        captcha_exc.evidence = await capture_error_context(
+                            self.page,
+                            "search_profiles_captcha",
+                            exc=captcha_exc,
+                            context={"campaign": campaign.name, "page": page_count},
+                        )
+                    except Exception as capture_exc:  # pragma: no cover - defensive
+                        logger.error(
+                            "Evidence capture failed for search_profiles_captcha: %s",
+                            capture_exc,
+                        )
+                    raise captcha_exc
+
                 profiles_before_page = len(profiles)
 
                 # Legacy UI: structured result elements with a stable attribute
@@ -904,6 +1166,8 @@ class LinkedInAutomation:
                     "⚠️ Challenge or wrong landing detected during search — "
                     "stopping to protect the account"
                 )
+            if isinstance(challenge, (CaptchaDetectedException, NotAuthenticatedException)):
+                self._mark_session_compromised()
             raise
         except Exception as e:
             logger.error(f"Search failed: {str(e)}")
@@ -1096,6 +1360,9 @@ class LinkedInAutomation:
         scan_done = False  # stop walking result pages
         stop_all = False  # also skip the profile-page fallback pass
         stopped_reason: str | None = None  # set on an account-safety stop
+        # Consecutive "modal_not_found" streak (see _MODAL_NOT_FOUND_ABORT_THRESHOLD).
+        consecutive_modal_not_found = 0
+        modal_not_found_exhausted = False
 
         # Inter-session cooldown notice (advisory; mirrors the profile path).
         self._emit_cooldown_notice(automation_settings, progress_callback)
@@ -1125,6 +1392,7 @@ class LinkedInAutomation:
                             "⚠️ CAPTCHA detected — stopping automation to protect "
                             "the account"
                         )
+                    self._mark_session_compromised()
                     stopped_reason = "captcha"
                     stop_all = True
                     break
@@ -1283,6 +1551,7 @@ class LinkedInAutomation:
                             if isinstance(challenge, CaptchaDetectedException)
                             else "challenge"
                         )
+                        self._mark_session_compromised()
                         scan_done = stop_all = True
                         break
                     except builtins.TimeoutError:
@@ -1333,6 +1602,7 @@ class LinkedInAutomation:
                             sent_count += 1
                         else:
                             possibly_sent_count += 1
+                        consecutive_modal_not_found = 0  # a real send breaks the streak
                         # Random delay between connections (mirrors the profile path).
                         # A possibly_sent may have refreshed the browser, so its
                         # delay is a page-independent wall-clock sleep. The wait
@@ -1371,6 +1641,15 @@ class LinkedInAutomation:
                     # and released the reserved slot. Don't defer — the profile path
                     # would only re-hit the same wall.
                     failed_count += 1
+                    if result.outcome == "modal_not_found":
+                        consecutive_modal_not_found += 1
+                        if (
+                            consecutive_modal_not_found
+                            >= self._MODAL_NOT_FOUND_ABORT_THRESHOLD
+                        ):
+                            modal_not_found_exhausted = True
+                            scan_done = stop_all = True
+                            break
 
                 if scan_done:
                     break
@@ -1412,6 +1691,17 @@ class LinkedInAutomation:
                 stopped_reason = stopped_reason or fb.get("stopped_reason")
 
             self.db_manager.update_campaign_stats(campaign.id)
+            if modal_not_found_exhausted:
+                # The invitation modal never appeared for
+                # _MODAL_NOT_FOUND_ABORT_THRESHOLD profiles in a row — abort
+                # loudly instead of returning a normal-looking summary that
+                # hides a run which sent nothing useful.
+                raise LinkedInAutomationError(
+                    "Invitation modal not found "
+                    f"{self._MODAL_NOT_FOUND_ABORT_THRESHOLD} times in a row — "
+                    "LinkedIn UI language unsupported or markup changed; "
+                    "aborting to avoid a useless run"
+                )
             return {
                 "sent": sent_count,
                 "possibly_sent": possibly_sent_count,
@@ -1441,6 +1731,8 @@ class LinkedInAutomation:
                     "⚠️ Challenge or wrong landing detected — stopping to protect "
                     "the account"
                 )
+            if isinstance(challenge, (CaptchaDetectedException, NotAuthenticatedException)):
+                self._mark_session_compromised()
             raise
         # No catch-all here: an unexpected error must propagate to the CLI's failure
         # handler. Swallowing it into a partial-counter return would let
@@ -1557,6 +1849,9 @@ class LinkedInAutomation:
         failed_count = 0
         existing_count = 0
         stopped_reason: str | None = None  # set on an account-safety stop
+        # Consecutive "modal_not_found" streak (see _MODAL_NOT_FOUND_ABORT_THRESHOLD).
+        consecutive_modal_not_found = 0
+        modal_not_found_exhausted = False
 
         # Persisted, restart-safe daily cap. The count is keyed by the local
         # day, so quitting and reopening the CLI cannot blow past the limit,
@@ -1734,6 +2029,7 @@ class LinkedInAutomation:
                         progress_callback(
                             "⚠️ CAPTCHA detected — stopping automation to protect the account"
                         )
+                    self._mark_session_compromised()
                     stopped_reason = "captcha"
                     break
 
@@ -1817,6 +2113,7 @@ class LinkedInAutomation:
                     else:
                         possibly_sent_count += 1
                     consecutive_failures = 0  # successful action resets backoff
+                    consecutive_modal_not_found = 0  # a real send breaks the streak
                     # A possibly_sent already refreshed the browser if it crashed;
                     # the inter-connection delay is a wall-clock pause, so use
                     # asyncio.sleep when the page may be mid-refresh and
@@ -1849,6 +2146,18 @@ class LinkedInAutomation:
                 # released the reserved slot. These do NOT bump the consecutive-
                 # failure backoff counter (only hard exceptions do).
                 failed_count += 1
+                if result.outcome == "modal_not_found":
+                    consecutive_modal_not_found += 1
+                    if (
+                        consecutive_modal_not_found
+                        >= self._MODAL_NOT_FOUND_ABORT_THRESHOLD
+                    ):
+                        # A bare `break` (not a raise) so it exits the `for`
+                        # loop directly without being caught by the `except
+                        # Exception` below; the abort is raised once outside
+                        # the loop, after campaign stats are updated.
+                        modal_not_found_exhausted = True
+                        break
                 continue
 
             except (CaptchaDetectedException, NotAuthenticatedException) as challenge:
@@ -1874,6 +2183,7 @@ class LinkedInAutomation:
                     if isinstance(challenge, CaptchaDetectedException)
                     else "challenge"
                 )
+                self._mark_session_compromised()
                 break
             except builtins.TimeoutError:
                 # The interaction watchdog fired: a wedged renderer exceeded the
@@ -1949,6 +2259,18 @@ class LinkedInAutomation:
 
         # Update campaign statistics
         self.db_manager.update_campaign_stats(campaign.id)
+
+        if modal_not_found_exhausted:
+            # The invitation modal never appeared for
+            # _MODAL_NOT_FOUND_ABORT_THRESHOLD profiles in a row — abort
+            # loudly instead of returning a normal-looking summary that hides
+            # a run which sent nothing useful.
+            raise LinkedInAutomationError(
+                "Invitation modal not found "
+                f"{self._MODAL_NOT_FOUND_ABORT_THRESHOLD} times in a row — "
+                "LinkedIn UI language unsupported or markup changed; "
+                "aborting to avoid a useless run"
+            )
 
         return {
             "sent": sent_count,
@@ -2923,6 +3245,23 @@ class LinkedInAutomation:
         no_marks = "".join(c for c in decomposed if not unicodedata.combining(c))
         return " ".join(no_marks.casefold().split())
 
+    @staticmethod
+    def _name_matches_exactly(name_norm: str, aria: str) -> bool:
+        """True when ``name_norm`` appears in ``aria`` as a delimited phrase.
+
+        Bounded on both sides by a non-word character or the string edge, so
+        a short name cannot match merely because it happens to be a substring
+        of a longer, unrelated name (e.g. "ana gomez" is a plain substring of
+        "juliana gomez", which would wrongly match under naive containment).
+        Covers both an aria-label that IS exactly the name (``aria == name``)
+        and one where the name is embedded in a template sentence ("Invita a
+        {Name} a conectar" / "Invite {Name} to connect").
+        """
+        if not name_norm:
+            return False
+        pattern = r"(?:^|\W)" + re.escape(name_norm) + r"(?:$|\W)"
+        return re.search(pattern, aria) is not None
+
     async def _find_connect_control(self, profile: "LinkedInProfile"):
         """Find the Connect/Pending control for THIS profile (SDUI layout, 2026).
 
@@ -2930,6 +3269,15 @@ class LinkedInAutomation:
         carry the person's name in their ``aria-label`` (e.g. "Invita a
         {Name} a conectar"), which disambiguates the real action from the
         "People also viewed" sidebar that is full of other Connect buttons.
+
+        Two-pass name match: an exact (delimited-phrase) match is tried first
+        across all controls; only when NO control matches exactly does the
+        loose substring-containment match run as a fallback. Plain
+        containment alone can pick an unrelated, longer name whose aria-label
+        happens to contain this profile's (shorter) name as a substring — the
+        exact pass avoids that whenever a real match exists, and the fallback
+        preserves the previous (more permissive) behavior for aria-label
+        shapes the exact pattern doesn't cover.
 
         Returns ``(handle, kind)`` where kind is 'connect', 'pending' or 'none'.
         """
@@ -2942,7 +3290,7 @@ class LinkedInAutomation:
         # the same control exists in both the top card and the scroll-only
         # sticky header, prefer the lower one (the top card), which is never
         # overlapped by the floating "Probar Premium" promo.
-        async def match(keywords) -> Any | None:
+        async def match(keywords, *, exact: bool) -> Any | None:
             controls = await self.page.query_selector_all(
                 sel.CONNECT_CONTROL.css
             )
@@ -2950,7 +3298,12 @@ class LinkedInAutomation:
             best_y = -1.0
             for ctrl in controls:
                 aria = self._normalize(await ctrl.get_attribute("aria-label"))
-                if name_norm in aria and any(k in aria for k in keywords):
+                name_ok = (
+                    self._name_matches_exactly(name_norm, aria)
+                    if exact
+                    else name_norm in aria
+                )
+                if name_ok and any(k in aria for k in keywords):
                     try:
                         if not await ctrl.is_visible():
                             continue
@@ -2962,6 +3315,11 @@ class LinkedInAutomation:
                         continue
             return best
 
+        async def match_either_pass(keywords) -> Any | None:
+            return await match(keywords, exact=True) or await match(
+                keywords, exact=False
+            )
+
         # Stay at the top of the page so the top-card action (visible in a
         # 1080px viewport) is used, with no sticky header / promo overlapping.
         try:
@@ -2971,10 +3329,10 @@ class LinkedInAutomation:
 
         # SDUI action controls render shortly after load, so poll a few times.
         for _ in range(5):
-            connect = await match(("conectar", "connect"))
+            connect = await match_either_pass(("conectar", "connect"))
             if connect:
                 return connect, "connect"
-            pending = await match(("pendiente", "pending"))
+            pending = await match_either_pass(("pendiente", "pending"))
             if pending:
                 return pending, "pending"
             await self.page.wait_for_timeout(1000)

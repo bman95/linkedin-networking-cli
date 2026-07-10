@@ -16,6 +16,7 @@ import pytest
 
 from cli.automation_errors import describe_automation_error, evidence_reference
 from exceptions import (
+    BrowserProfileBusyError,
     CaptchaDetectedException,
     LinkedInAutomationError,
     NotAuthenticatedException,
@@ -115,6 +116,16 @@ class TestDescribeAutomationError:
             )
         }
         assert len(headlines) == 5
+
+    def test_browser_profile_busy_uses_dedicated_branch(self):
+        exc = BrowserProfileBusyError(
+            "The browser profile at '/x/browser_data' is already in use by "
+            "process 4242; wait or stop it first."
+        )
+        headline, evidence = describe_automation_error(exc, "campaign execution")
+        assert "profile" in headline.lower()
+        assert "4242" in headline
+        assert "Evidence" in evidence
 
     def test_unrecognized_automation_error_uses_base_branch(self):
         # A LinkedInAutomationError subtype not enumerated above still gets a

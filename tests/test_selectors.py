@@ -189,6 +189,23 @@ class TestFailLoud:
         assert type(call.kwargs["exc"]).__name__ == "SelectorNotFoundException"
 
     @pytest.mark.asyncio
+    async def test_captured_bundle_is_attached_to_the_exception(self):
+        # The evidence dict capture_error_context returns must land on the
+        # raised exception, not just be captured and discarded — the CLI/TUI
+        # error mapping reads exc.evidence to point the user at the artifacts.
+        s = Selector("x", ["a"])
+        page = _page({})
+        bundle = {"screenshot": "/art/x.png", "dom": "/art/x.html"}
+        with patch(
+            "automation.selectors.capture_error_context",
+            new=AsyncMock(return_value=bundle),
+        ):
+            with pytest.raises(SelectorNotFoundException) as excinfo:
+                await s.locate(page, required=True)
+
+        assert excinfo.value.evidence == bundle
+
+    @pytest.mark.asyncio
     async def test_fail_loud_helper_records_timeout(self):
         # The wait_for_selector-timeout path calls fail_loud directly so the
         # capture+raise behavior is identical to a required locate.

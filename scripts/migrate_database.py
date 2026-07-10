@@ -32,10 +32,11 @@ import sys
 from pathlib import Path
 
 # Add src directory to path
-sys.path.append(str(Path(__file__).parent / "src"))
+sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from sqlmodel import select
 
+from config.settings import AppSettings
 from database.models import Campaign
 from database.operations import DatabaseManager
 
@@ -203,8 +204,10 @@ def main():
     args = parser.parse_args()
 
     try:
-        # Initialize database manager
-        db_manager = DatabaseManager()
+        # Initialize database manager against the real app database (not a
+        # relative path in whatever directory this script happens to run
+        # from).
+        db_manager = DatabaseManager(str(AppSettings().db_path))
 
         # Run migration
         migrate_campaigns(db_manager, dry_run=args.dry_run)

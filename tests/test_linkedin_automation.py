@@ -5,6 +5,7 @@ Tests LinkedInAutomation class with mocked Playwright interactions.
 """
 
 import asyncio
+import os
 import threading
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -602,6 +603,8 @@ class TestSearchProfiles:
             mock_linkedin_automation,
             '_extract_profile_info',
             return_value=mock_profile
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
         ):
             profiles = await mock_linkedin_automation.search_profiles(campaign, limit=10)
 
@@ -619,14 +622,39 @@ class TestSearchProfiles:
         def progress_callback(message):
             callback_calls.append(message)
 
-        await mock_linkedin_automation.search_profiles(
-            campaign,
-            limit=10,
-            progress_callback=progress_callback
-        )
+        with patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            await mock_linkedin_automation.search_profiles(
+                campaign,
+                limit=10,
+                progress_callback=progress_callback
+            )
 
         assert len(callback_calls) > 0
         assert any("Starting profile search" in call for call in callback_calls)
+
+    @pytest.mark.asyncio
+    async def test_search_profiles_captcha_stops_and_raises(
+        self, mock_linkedin_automation
+    ):
+        """Parity with search_and_connect: an inline CAPTCHA on the results
+        page must stop the walk and raise, not be misread as 'no profiles'."""
+        from exceptions import CaptchaDetectedException
+
+        campaign = Campaign(name="Test")
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(return_value=[])
+
+        with patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=True)
+        ):
+            with pytest.raises(CaptchaDetectedException):
+                await mock_linkedin_automation.search_profiles(campaign, limit=10)
+
+        # A CAPTCHA is a genuine mid-run challenge — the session must be
+        # marked compromised (issue #2's guard) so close_browser doesn't
+        # persist a challenged session.json.
+        assert mock_linkedin_automation.is_authenticated is False
 
 
 # ============================================================================
@@ -1077,6 +1105,249 @@ class TestForceCloseChrome:
 
 
 # ============================================================================
+# Cross-Process Browser-Profile Lock Tests
+# ============================================================================
+
+@pytest.mark.unit
+class TestBrowserProfileLock:
+    """Cross-process lock guarding the persistent Chrome profile (issue: a
+    live concurrent run — e.g. the TUI vs. a cron ``linkedin-run`` — must not
+    have its Chrome killed by ``force_close_chrome``)."""
+
+    @staticmethod
+    def _dead_pid() -> int:
+        """A PID guaranteed to be dead (spawned then reaped)."""
+        import subprocess
+
+        proc = subprocess.Popen(["true"])
+        pid = proc.pid
+        proc.wait()
+        return pid
+
+    def test_stale_lock_is_cleaned_and_acquired(self, tmp_path):
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(str(self._dead_pid()), encoding="utf-8")
+
+        acquire_profile_lock(str(user_data_dir))
+
+        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    def test_no_existing_lock_is_acquired(self, tmp_path):
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        assert not lock_path.exists()
+
+        acquire_profile_lock(str(user_data_dir))
+
+        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    def test_live_pid_lock_raises_busy_error(self, tmp_path):
+        import subprocess
+
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+        from exceptions import BrowserProfileBusyError
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        proc = subprocess.Popen(["sleep", "5"])
+        try:
+            lock_path.write_text(str(proc.pid), encoding="utf-8")
+
+            with pytest.raises(BrowserProfileBusyError, match=str(proc.pid)):
+                acquire_profile_lock(str(user_data_dir))
+
+            # Untouched: a live owner's lock must not be cleared.
+            assert lock_path.read_text(encoding="utf-8").strip() == str(proc.pid)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_own_pid_lock_is_treated_as_reacquirable(self, tmp_path):
+        """A lock already naming our own PID (e.g. a retried start_browser)
+        is not treated as busy."""
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+        acquire_profile_lock(str(user_data_dir))
+
+        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    def test_release_only_removes_our_own_lock(self, tmp_path):
+        from automation.linkedin import _profile_lock_path, release_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text("999999999", encoding="utf-8")  # not our PID
+
+        release_profile_lock(str(user_data_dir))
+
+        assert lock_path.exists()  # left alone — not ours to remove
+
+    @pytest.mark.asyncio
+    async def test_close_browser_releases_the_lock(
+        self, mock_linkedin_automation, tmp_path
+    ):
+        from automation.linkedin import _profile_lock_path
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+        mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
+        mock_linkedin_automation.context = None
+        mock_linkedin_automation.browser = None
+        mock_linkedin_automation.playwright = None
+
+        await mock_linkedin_automation.close_browser()
+
+        assert not lock_path.exists()
+        assert mock_linkedin_automation._locked_user_data_dir is None
+
+    @pytest.mark.asyncio
+    async def test_start_browser_propagates_busy_lock_before_force_close(
+        self, db_manager, app_settings, monkeypatch
+    ):
+        """A busy profile aborts start_browser entirely — it must not be
+        swallowed into a silent fallback to the transient launch path, which
+        would let a second run proceed against the same account."""
+        from automation import linkedin as linkedin_module
+        from exceptions import BrowserProfileBusyError
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+        playwright, browser, context = TestBrowserHardening._patched_playwright(
+            monkeypatch, persistent_pages=[]
+        )
+        force_close_called = []
+        monkeypatch.setattr(
+            linkedin_module,
+            "force_close_chrome",
+            lambda *a, **k: force_close_called.append((a, k)),
+        )
+        monkeypatch.setattr(
+            linkedin_module,
+            "acquire_profile_lock",
+            Mock(side_effect=BrowserProfileBusyError("profile busy")),
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        with pytest.raises(BrowserProfileBusyError):
+            await automation.start_browser()
+
+        assert force_close_called == []
+        playwright.chromium.launch_persistent_context.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_browser_releases_lock_when_both_launch_paths_fail(
+        self, db_manager, app_settings, monkeypatch, tmp_path
+    ):
+        """If the persistent launch AND the transient fallback launch both
+        raise, the profile lock acquired earlier must not survive
+        start_browser — otherwise it stays on disk naming this (still-alive)
+        process's PID and falsely blocks every later run, including this
+        same process's own next attempt (regression: __aexit__/close_browser
+        never runs when start_browser itself raises, so the lock used to
+        leak)."""
+        from automation import linkedin as linkedin_module
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        monkeypatch.setenv("PLAYWRIGHT_BROWSER_CHANNEL", "chrome")
+        # Keep the lock file off the real home dir (app_settings.app_dir is
+        # otherwise always the real ~/.linkedin-networking-cli).
+        app_settings.app_dir = tmp_path
+
+        playwright = AsyncMock()
+        playwright.chromium.launch_persistent_context = AsyncMock(
+            side_effect=Exception("persistent context unavailable")
+        )
+        playwright.chromium.launch = AsyncMock(
+            side_effect=Exception("transient launch unavailable")
+        )
+        playwright.stop = AsyncMock()
+        starter = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(
+            linkedin_module, "async_playwright", lambda: AsyncMock(start=starter)
+        )
+        monkeypatch.setattr(
+            linkedin_module, "force_close_chrome", lambda *a, **k: None
+        )
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        user_data_dir = app_settings.get_browser_settings()["user_data_dir"]
+
+        with pytest.raises(Exception, match="transient launch unavailable"):
+            await automation.start_browser()
+
+        lock_path = _profile_lock_path(user_data_dir)
+        assert not lock_path.exists()
+        assert automation._locked_user_data_dir is None
+
+        # A subsequent acquire from the same process must succeed — the
+        # earlier failure did not leave a self-blocking lock behind.
+        acquire_profile_lock(user_data_dir)
+        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    @pytest.mark.asyncio
+    async def test_refresh_context_holds_profile_lock_across_close_and_relaunch(
+        self, mock_linkedin_automation, tmp_path
+    ):
+        """_refresh_context must not release the lock between close_browser
+        and start_browser — a concurrent run grabbing the freed profile in
+        that window would force-kill our own relaunch (acquire_profile_lock's
+        live-PID check). close_browser is exercised for real here (context/
+        browser/playwright are all None, so its teardown steps no-op); only
+        start_browser is mocked, letting us observe the lock file's state at
+        the moment start_browser is invoked."""
+        from automation.linkedin import _profile_lock_path
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+        mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
+        mock_linkedin_automation.context = None
+        mock_linkedin_automation.browser = None
+        mock_linkedin_automation.playwright = None
+
+        observed = {}
+
+        async def _fake_start():
+            # The lock file must still be here, naming our own PID, when
+            # start_browser runs — close_browser must not have released it.
+            observed["lock_exists"] = lock_path.exists()
+            observed["locked_dir_during_start"] = mock_linkedin_automation._locked_user_data_dir
+            mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
+
+        with patch.object(
+            mock_linkedin_automation, "start_browser", new=AsyncMock(side_effect=_fake_start)
+        ) as start:
+            await mock_linkedin_automation._refresh_context()
+
+        start.assert_awaited_once()
+        assert observed["lock_exists"] is True
+        # close_browser's own release was skipped (the attribute was stashed
+        # to None before close_browser ran), so start_browser sees no lock to
+        # reclaim via self._locked_user_data_dir — it re-derives it itself.
+        assert observed["locked_dir_during_start"] is None
+        assert lock_path.exists()
+        assert mock_linkedin_automation._locked_user_data_dir == str(user_data_dir)
+
+
+# ============================================================================
 # LinkedInProfile Dataclass Tests
 # ============================================================================
 
@@ -1151,6 +1422,34 @@ class TestNormalize:
         name = LinkedInAutomation._normalize("Martí Altimira Cebrian")
         aria = LinkedInAutomation._normalize("Invita a Martí Altimira Cebrian a conectar")
         assert name in aria
+
+
+@pytest.mark.unit
+class TestNameMatchesExactly:
+    """The exact/delimited-phrase name match used as _find_connect_control's
+    first pass, ahead of the loose substring-containment fallback."""
+
+    def test_exact_equal_name_matches(self):
+        assert LinkedInAutomation._name_matches_exactly("ana gomez", "ana gomez")
+
+    def test_name_embedded_in_template_sentence_matches(self):
+        aria = LinkedInAutomation._normalize("Invita a Ana Gomez a conectar")
+        assert LinkedInAutomation._name_matches_exactly("ana gomez", aria)
+
+    def test_name_embedded_in_english_template_matches(self):
+        aria = LinkedInAutomation._normalize("Invite Ana Gomez to connect")
+        assert LinkedInAutomation._name_matches_exactly("ana gomez", aria)
+
+    def test_short_name_inside_a_longer_unrelated_name_does_not_match(self):
+        # "ana gomez" is a plain substring of "juliana gomez" (juli+ana gomez)
+        # — the exact/delimited match must NOT be fooled by this.
+        aria = LinkedInAutomation._normalize("Invita a Juliana Gomez a conectar")
+        assert not LinkedInAutomation._name_matches_exactly("ana gomez", aria)
+
+    def test_empty_name_never_matches(self):
+        assert not LinkedInAutomation._name_matches_exactly(
+            "", "invita a ana gomez a conectar"
+        )
 
 
 # ============================================================================
@@ -2646,6 +2945,8 @@ class TestNavigationGuardWiring:
         ) as guarded, patch.object(
             mock_linkedin_automation, "_extract_profiles_new_ui",
             new=AsyncMock(return_value=[]),
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
         ):
             await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
@@ -2668,6 +2969,8 @@ class TestNavigationGuardWiring:
         ) as verify, patch.object(
             mock_linkedin_automation, "_extract_profiles_new_ui",
             new=AsyncMock(return_value=[]),
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
         ):
             await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
@@ -2758,6 +3061,8 @@ class TestNavigationGuardWiring:
         ), patch.object(
             mock_linkedin_automation, "_extract_profiles_new_ui",
             new=AsyncMock(return_value=[]),
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
         ):
             await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
@@ -2843,6 +3148,8 @@ class TestNavigationGuardWiring:
         ) as guarded, patch.object(
             mock_linkedin_automation, "_extract_profiles_new_ui",
             new=AsyncMock(return_value=[]),
+        ), patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
         ):
             await mock_linkedin_automation.search_profiles(campaign, limit=1)
 
@@ -3098,6 +3405,66 @@ class TestNavigationGuardWiring:
         ctx.close.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_close_browser_skips_write_when_page_on_challenge_wall(
+        self, mock_linkedin_automation
+    ):
+        """Belt-and-braces: is_authenticated=True but the page is sitting on a
+        challenge/login URL — the write must still be skipped even if a
+        _mark_session_compromised call site was somehow missed."""
+        ctx = AsyncMock()
+        mock_linkedin_automation.context = ctx
+        mock_linkedin_automation.is_authenticated = True
+        mock_linkedin_automation.page.url = (
+            "https://www.linkedin.com/checkpoint/challenge/"
+        )
+        write = AsyncMock()
+        with patch.object(
+            mock_linkedin_automation, "_write_session_state", new=write
+        ):
+            await mock_linkedin_automation.close_browser()
+
+        write.assert_not_awaited()
+        ctx.close.assert_awaited_once()
+
+    def test_mark_session_compromised_clears_authenticated_flag(
+        self, mock_linkedin_automation
+    ):
+        mock_linkedin_automation.is_authenticated = True
+        mock_linkedin_automation._mark_session_compromised()
+        assert mock_linkedin_automation.is_authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_mid_run_captcha_in_search_and_connect_prevents_session_write(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A CAPTCHA detected mid-run clears is_authenticated (issue: it is
+        otherwise a one-way flag), so close_browser does not overwrite a
+        still-good session.json with cookies from a challenged session."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Compromise"})
+
+        async def _walk(campaign, progress_callback=None):
+            yield 1
+
+        auto._walk_search_pages = _walk
+        monkeypatch.setattr(
+            "automation.interactions.detect_captcha", AsyncMock(return_value=True)
+        )
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert result["stopped_reason"] == "captcha"
+        assert auto.is_authenticated is False
+
+        ctx = AsyncMock()
+        auto.context = ctx
+        write = AsyncMock()
+        with patch.object(auto, "_write_session_state", new=write):
+            await auto.close_browser()
+        write.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_invite_flow_runs_under_run_bounded(self, mock_linkedin_automation):
         """The connect-click + modal-poll page work is bounded by run_bounded too.
 
@@ -3331,6 +3698,86 @@ class TestLimitModalResolution:
         mock_linkedin_automation.page.query_selector.assert_awaited_once_with(
             sel.LIMIT_MODAL.css
         )
+
+
+@pytest.mark.unit
+class TestFindConnectControl:
+    """_find_connect_control disambiguates the profile's own Connect control
+    from unrelated 'People also viewed' sidebar entries by name (issue: a
+    short name can otherwise match as a plain substring of a longer,
+    unrelated name)."""
+
+    @staticmethod
+    def _control(aria_label, y=0.0, visible=True):
+        ctrl = AsyncMock()
+        ctrl.get_attribute = AsyncMock(return_value=aria_label)
+        ctrl.is_visible = AsyncMock(return_value=visible)
+        ctrl.bounding_box = AsyncMock(return_value={"y": y})
+        return ctrl
+
+    @pytest.mark.asyncio
+    async def test_exact_match_wins_over_a_substring_false_positive(
+        self, mock_linkedin_automation
+    ):
+        """A short profile name ('Ana Gomez') must not resolve to a sidebar
+        control for an unrelated longer name ('Juliana Gomez') whose
+        aria-label happens to contain it as a plain substring — even when
+        that wrong control is positioned lower (the old y-based tie-break
+        would otherwise have picked it, since both used to match equally
+        under plain containment)."""
+        wrong = self._control("Invita a Juliana Gomez a conectar", y=500.0)
+        right = self._control("Invita a Ana Gomez a conectar", y=100.0)
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(
+            return_value=[wrong, right]
+        )
+        mock_linkedin_automation.page.evaluate = AsyncMock()
+        mock_linkedin_automation.page.wait_for_timeout = AsyncMock()
+
+        profile = LinkedInProfile(
+            name="Ana Gomez", profile_url="https://www.linkedin.com/in/ana/"
+        )
+        control, kind = await mock_linkedin_automation._find_connect_control(profile)
+
+        assert kind == "connect"
+        assert control is right
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_containment_when_no_exact_match_exists(
+        self, mock_linkedin_automation
+    ):
+        """When no control matches the name as a delimited phrase, the loose
+        substring fallback still runs — preserving the previous behavior for
+        aria-label shapes the exact pass doesn't cover."""
+        # "ana" is a plain substring of "banana" with no boundary on either
+        # side, so the exact pass finds nothing here; the fallback still does.
+        loose = self._control("Banana conectar", y=0.0)
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(
+            return_value=[loose]
+        )
+        mock_linkedin_automation.page.evaluate = AsyncMock()
+        mock_linkedin_automation.page.wait_for_timeout = AsyncMock()
+
+        profile = LinkedInProfile(
+            name="Ana", profile_url="https://www.linkedin.com/in/ana/"
+        )
+        control, kind = await mock_linkedin_automation._find_connect_control(profile)
+
+        assert kind == "connect"
+        assert control is loose
+
+    @pytest.mark.asyncio
+    async def test_no_match_at_all_returns_none(self, mock_linkedin_automation):
+        mock_linkedin_automation.page.query_selector_all = AsyncMock(return_value=[])
+        mock_linkedin_automation.page.evaluate = AsyncMock()
+        mock_linkedin_automation.page.wait_for_timeout = AsyncMock()
+
+        profile = LinkedInProfile(
+            name="Nobody Here", profile_url="https://www.linkedin.com/in/nobody/"
+        )
+        control, kind = await mock_linkedin_automation._find_connect_control(profile)
+
+        assert control is None
+        assert kind == "none"
 
 
 @pytest.mark.unit
@@ -3893,6 +4340,110 @@ class TestSearchAndConnect:
 
         with pytest.raises(RuntimeError, match="boom"):
             await auto.search_and_connect(campaign, limit=10)
+
+
+@pytest.mark.unit
+class TestModalNotFoundCircuitBreaker:
+    """5 consecutive modal_not_found outcomes abort the run instead of
+    completing "successfully" having sent nothing (an unsupported LinkedIn UI
+    language or a markup change can otherwise silently burn a whole run)."""
+
+    # Reuses TestSearchAndConnect's card-scan wiring helper (same idiom as
+    # TestFingerprintConsistency._patched_playwright above): it takes no
+    # class-specific state, only `self` positionally.
+    _wire = TestSearchAndConnect._wire
+
+    @staticmethod
+    def _profile(i):
+        return LinkedInProfile(
+            name=f"Person {i}",
+            profile_url=f"https://www.linkedin.com/in/person{i}/",
+        )
+
+    @classmethod
+    def _profiles(cls, n):
+        return [cls._profile(i) for i in range(n)]
+
+    @pytest.mark.asyncio
+    async def test_card_pass_aborts_after_threshold(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        from exceptions import LinkedInAutomationError
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Modal"})
+        # 6 connectable cards on one page — more than the abort threshold, to
+        # prove it fires at exactly 5 and never reaches the 6th.
+        pairs = self._wire(
+            auto,
+            [(self._profile(i), "connect") for i in range(6)],
+            monkeypatch,
+        )
+        auto._attempt_connect = AsyncMock(return_value=ConnectResult("modal_not_found"))
+        auto.send_connection_requests = AsyncMock()  # fallback must never run
+
+        with pytest.raises(LinkedInAutomationError, match="modal not found"):
+            await auto.search_and_connect(campaign, limit=10)
+
+        assert auto._attempt_connect.await_count == 5
+        auto.send_connection_requests.assert_not_called()
+        assert len(pairs) == 6  # sanity: the pool had more cards than the threshold
+
+    @pytest.mark.asyncio
+    async def test_card_pass_streak_resets_on_a_send(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A real send between modal_not_found runs resets the streak, so a
+        run that is mostly-but-not-entirely unproductive does not abort."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Modal"})
+        self._wire(
+            auto,
+            [(self._profile(i), "connect") for i in range(9)],
+            monkeypatch,
+        )
+        outcomes = (
+            [ConnectResult("modal_not_found")] * 4
+            + [ConnectResult("sent", total_today=1)]
+            + [ConnectResult("modal_not_found")] * 4
+        )
+        auto._attempt_connect = AsyncMock(side_effect=outcomes)
+        auto.send_connection_requests = AsyncMock()
+
+        result = await auto.search_and_connect(campaign, limit=10)
+
+        assert auto._attempt_connect.await_count == 9
+        assert result["sent"] == 1
+        assert result["failed"] == 8
+
+    @pytest.mark.asyncio
+    async def test_profile_pass_aborts_after_threshold(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """The profile-page loop (send_connection_requests) enforces its own
+        independent streak."""
+        from exceptions import LinkedInAutomationError
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Modal"})
+        button = AsyncMock()
+        auto._find_connect_control = AsyncMock(return_value=(button, "connect"))
+        auto._attempt_connect = AsyncMock(return_value=ConnectResult("modal_not_found"))
+
+        with patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            with pytest.raises(LinkedInAutomationError, match="modal not found"):
+                await auto.send_connection_requests(campaign, self._profiles(6))
+
+        assert auto._attempt_connect.await_count == 5
 
 
 @pytest.mark.unit

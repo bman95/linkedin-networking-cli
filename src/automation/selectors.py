@@ -190,7 +190,7 @@ class Selector:
         # self-enforcing: a regression inside diagnostics must never replace the
         # selector-missing failure with an unrelated error.
         try:
-            await capture_error_context(
+            not_found.evidence = await capture_error_context(
                 page,
                 f"selector_not_found_{self.name}",
                 exc=not_found,

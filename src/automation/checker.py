@@ -7,8 +7,15 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from exceptions import (
+    CaptchaDetectedException,
+    NotAuthenticatedException,
+    UnexpectedLandingException,
+)
 from utils.logging import get_logger
 
+from .interactions import detect_captcha
+from .navigation import navigate_guarded
 from .scraping import get_contact_info
 
 logger = get_logger(__name__)
@@ -28,6 +35,13 @@ async def smart_connection_checker(
     ``stop_event`` (a ``threading.Event``-like flag, issue #43) is polled
     between profiles; once set, the walk ends at the next safe point and the
     partial stats carry ``"stopped": True``.
+
+    A challenge/login wall on the connections page — a URL-level bounce
+    (guarded navigation) or an in-page CAPTCHA widget — raises the matching
+    typed exception (``CaptchaDetectedException`` / ``NotAuthenticatedException``
+    / ``UnexpectedLandingException``) instead of returning a clean empty
+    result: a walled page read as "no connections found" would both misreport
+    to the user and let the scroll loop hammer keypresses against a checkpoint.
 
     Returns:
         Dict with counts: {"checked": int, "newly_accepted": int, "updated": int},
@@ -59,12 +73,30 @@ async def smart_connection_checker(
     connections_url = "https://www.linkedin.com/mynetwork/invite-connect/connections/"
 
     try:
-        await automation.page.goto(connections_url, timeout=60000)
+        # Guarded navigation (same as the search flows): resilient goto ->
+        # settle -> surf -> landing guard. A challenge/login bounce raises a
+        # typed exception with evidence instead of silently landing on a wall.
+        automation.page = await navigate_guarded(
+            automation.page,
+            connections_url,
+            strict_path="/mynetwork/invite-connect/connections",
+            context={"campaign_id": campaign_id},
+            **automation._nav_kwargs(),
+        )
         if progress_callback:
             progress_callback(f"Opened connections page: {connections_url}")
 
         # Wait for page to load
         await automation.page.wait_for_timeout(5000)
+
+        # An in-page CAPTCHA can render without a URL bounce (the landing
+        # guard above only catches URL-level challenges) — without this check
+        # the page reads as "no connections found" and the scroll loop below
+        # would hammer keypresses against a checkpoint.
+        if await detect_captcha(automation.page):
+            raise CaptchaDetectedException(
+                "CAPTCHA detected on the connections page"
+            )
 
         # Focus on "Recently added" section
         recent_added = await automation.page.query_selector('[data-view-name="connections-profile"]')
@@ -86,13 +118,19 @@ async def smart_connection_checker(
             limit_url = None
 
         # Start checking connections
-        stats = await _check_connections_page(
+        stats, updated_campaign_ids = await _check_connections_page(
             automation,
             pending_contacts,
             limit_url,
             progress_callback,
             stop_event=stop_event,
         )
+
+        # Refresh the persisted stats (e.g. total_accepted) for every campaign
+        # that had a contact updated, so the Campaigns/Detail screens don't
+        # show a stale count until the next unrelated write happens to touch it.
+        for updated_campaign_id in updated_campaign_ids:
+            automation.db_manager.update_campaign_stats(updated_campaign_id)
 
         # A stopped walk already announced itself; a "completed" line on top
         # would contradict the stop acknowledgement in the progress stream.
@@ -103,6 +141,26 @@ async def smart_connection_checker(
 
         return stats
 
+    except (
+        CaptchaDetectedException,
+        NotAuthenticatedException,
+        UnexpectedLandingException,
+    ) as challenge:
+        # A challenge/login wall (or a wrong landing) must not be swallowed
+        # into a clean empty result — re-raise so the run stops loudly,
+        # mirroring the search flows' handling in linkedin.py.
+        logger.warning(
+            "Connections checker hit a challenge/wrong landing; aborting: %s",
+            challenge,
+        )
+        if progress_callback:
+            progress_callback(
+                "⚠️ Challenge or wrong landing detected while checking "
+                "connections — stopping to protect the account"
+            )
+        if isinstance(challenge, (CaptchaDetectedException, NotAuthenticatedException)):
+            automation._mark_session_compromised()
+        raise
     except Exception as e:
         logger.error(f"Error in smart connection checker: {e}")
         if progress_callback:
@@ -116,10 +174,16 @@ async def _check_connections_page(
     limit_url: str | None,
     progress_callback: Callable | None = None,
     stop_event: Any | None = None,
-) -> dict[str, int]:
-    """Check the connections page and update database for newly accepted connections."""
+) -> tuple[dict[str, int], set[int]]:
+    """Check the connections page and update database for newly accepted connections.
+
+    Returns ``(stats, updated_campaign_ids)``: the campaign ids are those
+    whose contact was actually updated during the walk, so the caller can
+    refresh each affected campaign's persisted stats.
+    """
 
     stats = {"checked": 0, "newly_accepted": 0, "updated": 0}
+    updated_campaign_ids: set[int] = set()
     finish_process = False
 
     def _stop_requested() -> bool:
@@ -174,6 +238,14 @@ async def _check_connections_page(
             stats["truncated"] = True
             break
         scroll_rounds += 1
+
+        # A challenge can render mid-walk without a URL bounce; check between
+        # scroll rounds so the keypress-mashing loop below never hammers a
+        # checkpoint that appeared after the initial navigation.
+        if await detect_captcha(automation.page):
+            raise CaptchaDetectedException(
+                "CAPTCHA detected while checking connections"
+            )
 
         # Scroll down to load more connections. A full scroll phase takes tens
         # of seconds, and it is pure loading — no DB writes — so the stop flag
@@ -243,6 +315,7 @@ async def _check_connections_page(
                     await _update_accepted_connection(automation, contact, progress_callback)
                     stats["newly_accepted"] += 1
                     stats["updated"] += 1
+                    updated_campaign_ids.add(contact.campaign_id)
 
                 # Check if we've reached our limit
                 if limit_url and profile_url == limit_url:
@@ -267,7 +340,7 @@ async def _check_connections_page(
                 progress_callback("Reached end of connections list")
             break
 
-    return stats
+    return stats, updated_campaign_ids
 
 
 async def _update_accepted_connection(

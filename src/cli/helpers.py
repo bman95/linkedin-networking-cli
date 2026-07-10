@@ -81,6 +81,9 @@ def contacts_csv_filename(campaign_name: str) -> str:
     safe = "".join(
         c if c.isalnum() or c in ("-", "_") else "_" for c in campaign_name
     ).strip("_") or "campaign"
+    # Campaign.name is unbounded; truncate so the final filename can't
+    # exceed common filesystem limits (255 bytes).
+    safe = safe[:80]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{safe}_contacts_{timestamp}.csv"
 

@@ -14,6 +14,7 @@ import pytest
 
 from cli.helpers import (
     campaign_get_field,
+    contacts_csv_filename,
     csv_value,
     effective_daily_limit,
     mask_api_key,
@@ -72,6 +73,22 @@ class TestCampaignGetField:
         data = {"name": "Demo"}
         assert campaign_get_field(data, "name") == "Demo"
         assert campaign_get_field(data, "missing", 7) == 7
+
+
+@pytest.mark.unit
+class TestContactsCsvFilename:
+    def test_normal_name_is_untruncated(self):
+        filename = contacts_csv_filename("SF Engineers")
+        assert filename.startswith("SF_Engineers_contacts_")
+
+    def test_unbounded_name_is_truncated(self):
+        # Campaign.name is unbounded; the sanitized name must be truncated
+        # so the final filename stays well under filesystem limits (255
+        # bytes on most POSIX filesystems).
+        filename = contacts_csv_filename("x" * 1000)
+        assert len(filename.encode("utf-8")) < 255
+        safe_part = filename.split("_contacts_")[0]
+        assert safe_part == "x" * 80
 
 
 @pytest.mark.unit

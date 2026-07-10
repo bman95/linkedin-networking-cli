@@ -19,11 +19,32 @@ from automation.checker import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_navigate_guarded(monkeypatch):
+    """checker.py now drives the connections-page goto through
+    navigate_guarded (same guarded navigation the search flows use). Its full
+    retry/settle/surf/guard machinery is exercised in test_navigation.py; here
+    it is a thin pass-through (still calling page.goto, so existing goto-based
+    assertions keep working) unless a test overrides it to raise.
+    """
+    async def _navigate(page, url, **kwargs):
+        await page.goto(url)
+        return page
+
+    monkeypatch.setattr(
+        "automation.checker.navigate_guarded", AsyncMock(side_effect=_navigate)
+    )
+
+
 def _automation(authenticated=True, pending=None):
     automation = MagicMock()
     automation.is_authenticated = authenticated
+    automation._nav_kwargs = MagicMock(return_value={})
+    automation._recover = AsyncMock()
+    automation._mark_session_compromised = MagicMock()
 
     page = AsyncMock()
+    page.url = "https://www.linkedin.com/mynetwork/invite-connect/connections/"
     page.goto = AsyncMock()
     page.wait_for_timeout = AsyncMock()
     page.query_selector = AsyncMock(return_value=None)
@@ -36,6 +57,7 @@ def _automation(authenticated=True, pending=None):
     db = MagicMock()
     db.get_contacts_by_status.return_value = pending or []
     db.update_contact = MagicMock()
+    db.update_campaign_stats = MagicMock()
     automation.db_manager = db
     return automation
 
@@ -118,6 +140,90 @@ class TestSmartChecker:
         }
         assert "sent" in queried
         assert "possibly_sent" in queried
+
+
+@pytest.mark.unit
+class TestChallengeSafety:
+    """A challenge/checkpoint on the connections page must raise loudly, not
+    read as a clean 'no connections found' — and must not let the scroll
+    loop hammer keypresses against it."""
+
+    @pytest.mark.asyncio
+    async def test_post_navigation_captcha_raises_instead_of_clean_empty(
+        self, monkeypatch
+    ):
+        from exceptions import CaptchaDetectedException
+
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        monkeypatch.setattr(
+            "automation.checker.detect_captcha", AsyncMock(return_value=True)
+        )
+
+        with pytest.raises(CaptchaDetectedException):
+            await smart_connection_checker(automation, 1)
+
+        # Marked compromised so close_browser doesn't persist a challenged
+        # session (issue #2's guard, reused here).
+        automation._mark_session_compromised.assert_called_once()
+        # Never reached the scroll/keypress loop.
+        automation.page.keyboard.press.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mid_scroll_captcha_raises_before_hammering_keypresses(
+        self, monkeypatch
+    ):
+        """A challenge that appears AFTER the initial landing (e.g. between
+        scroll rounds) is caught before that round's keypress-mashing."""
+        from exceptions import CaptchaDetectedException
+
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        # First call is the post-navigation check (clean); the round-top
+        # check on the first scroll round then finds the challenge.
+        monkeypatch.setattr(
+            "automation.checker.detect_captcha",
+            AsyncMock(side_effect=[False, True]),
+        )
+
+        with pytest.raises(CaptchaDetectedException):
+            await smart_connection_checker(automation, 1)
+
+        automation.page.keyboard.press.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_navigation_challenge_raises_and_marks_compromised(
+        self, monkeypatch
+    ):
+        """A URL-level challenge bounce from the guarded navigation is
+        re-raised (not swallowed into a clean-empty result) too."""
+        from exceptions import NotAuthenticatedException
+
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+
+        async def _raise_wall(page, url, **kwargs):
+            raise NotAuthenticatedException("session expired")
+
+        monkeypatch.setattr(
+            "automation.checker.navigate_guarded", AsyncMock(side_effect=_raise_wall)
+        )
+
+        with pytest.raises(NotAuthenticatedException):
+            await smart_connection_checker(automation, 1)
+
+        automation._mark_session_compromised.assert_called_once()
 
 
 @pytest.mark.unit
@@ -246,13 +352,24 @@ class TestSmartCheckerWalk:
     @pytest.mark.asyncio
     async def test_walk_marks_accepted_and_enriches_contact(self, monkeypatch):
         url = "https://www.linkedin.com/in/jane/"
-        contact = SimpleNamespace(id=7, name="Jane", status="sent", profile_url=url)
+        contact = SimpleNamespace(
+            id=7, campaign_id=1, name="Jane", status="sent", profile_url=url
+        )
         automation = _automation(pending=[contact])
         _set_limit(automation, None)
         # A "Recently added" element to focus, then one matching connection card
         # whose href carries tracking params (must be normalized to match).
+        # Only the "Recently added" selector resolves to an element; every
+        # other query_selector call (including the CAPTCHA-detection probes)
+        # must see None.
         recent = AsyncMock()
-        automation.page.query_selector = AsyncMock(return_value=recent)
+
+        async def _query_selector(selector):
+            if selector == '[data-view-name="connections-profile"]':
+                return recent
+            return None
+
+        automation.page.query_selector = AsyncMock(side_effect=_query_selector)
         automation.page.query_selector_all = AsyncMock(
             return_value=[_connection_el(url + "?trk=foo")]
         )
@@ -272,6 +389,9 @@ class TestSmartCheckerWalk:
         assert update["email"] == "j@x.com"
         assert update["phone"] == "555"
         assert "NYC" in update["notes"]
+        # Stale Campaign.total_accepted fix: the affected campaign's stats are
+        # refreshed after the reconciliation pass.
+        automation.db_manager.update_campaign_stats.assert_called_once_with(1)
 
     @pytest.mark.asyncio
     async def test_walk_stops_at_connection_limit(self):
@@ -313,7 +433,7 @@ class TestSmartCheckerWalk:
         """A failure while enriching the accepted contact is caught, not raised."""
         url = "https://www.linkedin.com/in/jane/"
         contact = SimpleNamespace(
-            id=9, name="Jane", status="possibly_sent", profile_url=url,
+            id=9, campaign_id=1, name="Jane", status="possibly_sent", profile_url=url,
         )
         automation = _automation(pending=[contact])
         _set_limit(automation, None)
@@ -331,7 +451,9 @@ class TestSmartCheckerWalk:
     async def test_update_closes_tab_when_enrichment_fails(self):
         """The enrichment tab is closed even when goto blows up (no tab leak)."""
         url = "https://www.linkedin.com/in/jane/"
-        contact = SimpleNamespace(id=5, name="Jane", status="sent", profile_url=url)
+        contact = SimpleNamespace(
+            id=5, campaign_id=1, name="Jane", status="sent", profile_url=url
+        )
         automation = _automation(pending=[contact])
         _set_limit(automation, None)
         automation.page.query_selector = AsyncMock(return_value=None)

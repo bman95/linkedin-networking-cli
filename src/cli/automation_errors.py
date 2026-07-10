@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from exceptions import (
+    BrowserProfileBusyError,
     CaptchaDetectedException,
     LinkedInAutomationError,
     NotAuthenticatedException,
@@ -105,6 +106,8 @@ def describe_automation_error(
             "A required page element was not found — stopped. LinkedIn's page "
             "structure may have changed, or the page failed to load."
         )
+    elif isinstance(exc, BrowserProfileBusyError):
+        headline = f"Browser profile in use by another run — stopped. {exc}"
     elif isinstance(exc, LinkedInAutomationError):
         headline = f"Automation stopped during {action_label}: {exc}"
     else:
