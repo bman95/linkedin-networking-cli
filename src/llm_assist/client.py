@@ -99,11 +99,19 @@ class LLMClient:
     def _chat_call(self, payload: dict[str, Any]) -> str:
         body = self._post("/v1/chat/completions", payload)
         try:
-            return body["choices"][0]["message"]["content"]
+            content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMResponseError(
                 "The endpoint's response was missing the expected fields."
             ) from exc
+        # A provider can return "content": null (or a non-string value) —
+        # present, but not usable. Treat that the same as a missing field
+        # rather than letting a bad type reach json.loads() downstream.
+        if not isinstance(content, str):
+            raise LLMResponseError(
+                "The endpoint's response was missing the expected fields."
+            )
+        return content
 
     # ── model listing (local/Ollama only) ───────────────────────────────
 

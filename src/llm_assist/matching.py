@@ -7,6 +7,20 @@ resolves that to one of the existing curated display names (the same ones
 ``src/tui/screens/campaign_form.py`` already offers), or reports "no good
 match" so the caller can leave the field at its safe default and flag it for
 review instead of guessing.
+
+Matching policy, in order:
+1. Exact match, case-insensitive — the only confident outcome
+   (``needs_review=False``). The model echoed a curated name verbatim.
+2. Unambiguous word-boundary containment — accepted, but ALWAYS flagged for
+   review. It's usually right, but it's still an inference (e.g. "India"
+   picking a single Indian city, or "2nd degree" picking the one network
+   option that happens to mention it), not something the model stated
+   verbatim.
+3. difflib ratio above ``_MATCH_CUTOFF`` — accepted, but ALWAYS flagged for
+   review, same reasoning as containment. The cutoff is deliberately high
+   (0.75): a low cutoff lets unrelated candidates (e.g. "government" ~0.61
+   "Entertainment") through as confident matches.
+4. Below cutoff — no match; the field is left unset and flagged.
 """
 
 from __future__ import annotations
@@ -21,7 +35,7 @@ from automation.linkedin_mappings import (
 )
 
 _ANY = "Any"
-_MATCH_CUTOFF = 0.6
+_MATCH_CUTOFF = 0.75
 
 
 @dataclass(frozen=True)
@@ -46,29 +60,37 @@ def _match(raw_text: str | None, candidates: list[str]) -> MatchResult:
     text = raw_text.strip()
     text_lower = text.lower()
 
-    # Word-boundary containment first: a short colloquial mention ("Mexico
-    # City", "Boston") is very often a whole-word span of a longer curated
-    # name ("Mexico City Metropolitan Area", "Greater Boston Area") — the
+    # Exact match, case-insensitive: the model echoed a curated name
+    # verbatim — the only outcome trusted without a review flag.
+    for candidate in candidates:
+        if text_lower == candidate.lower():
+            return MatchResult(candidate, text, False)
+
+    # Word-boundary containment: a short colloquial mention ("Mexico City",
+    # "Boston") is very often a whole-word span of a longer curated name
+    # ("Mexico City Metropolitan Area", "Greater Boston Area") — the
     # dominant pattern in this app's location vocabulary. difflib's ratio
     # penalizes exactly this case (it's length-sensitive: "mexico city" vs
     # "mexico city metropolitan area" scores 0.55, just under cutoff, even
     # though it's a perfect match) — caught via live testing against a real
     # local model. Only trust an UNAMBIGUOUS containment match; if more than
     # one candidate contains it, fall through to ratio matching instead of
-    # guessing (never silently pick wrong).
+    # guessing (never silently pick wrong). Still an inference, not a
+    # verbatim match, so it's always flagged for review.
     contained = [c for c in candidates if _word_containment(text_lower, c.lower())]
     if len(contained) == 1:
-        return MatchResult(contained[0], text, False)
+        return MatchResult(contained[0], text, True)
 
     # difflib's ratio is also case-sensitive (e.g. "software" vs "Computer
     # Software" scores 0.56 on casing alone, below the cutoff) — compare
-    # lowercased, but report back the curated list's original casing.
+    # lowercased, but report back the curated list's original casing. An
+    # accepted ratio match is always flagged for review too.
     lowered_to_candidate = {candidate.lower(): candidate for candidate in candidates}
     best = difflib.get_close_matches(
         text_lower, list(lowered_to_candidate.keys()), n=1, cutoff=_MATCH_CUTOFF
     )
     if best:
-        return MatchResult(lowered_to_candidate[best[0]], text, False)
+        return MatchResult(lowered_to_candidate[best[0]], text, True)
     return MatchResult(None, text, True)
 
 

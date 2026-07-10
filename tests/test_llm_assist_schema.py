@@ -71,3 +71,11 @@ class TestExtractionJsonSchema:
 
     def test_forbids_additional_properties(self):
         assert EXTRACTION_JSON_SCHEMA["additionalProperties"] is False
+
+    def test_required_lists_every_property(self):
+        # OpenAI strict mode requires every property to appear in
+        # "required" — optionality is expressed via each property's own
+        # nullable type instead.
+        assert EXTRACTION_JSON_SCHEMA["required"] == sorted(
+            EXTRACTION_JSON_SCHEMA["properties"].keys()
+        )

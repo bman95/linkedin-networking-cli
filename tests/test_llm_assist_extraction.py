@@ -8,7 +8,7 @@ import json
 import pytest
 
 from llm_assist.errors import LLMAssistCancelled, LLMResponseError
-from llm_assist.extraction import extract_campaign_fields
+from llm_assist.extraction import _parse, extract_campaign_fields
 
 
 class _FakeClient:
@@ -127,6 +127,63 @@ class TestExtractCampaignFieldsRepair:
         )
         result = extract_campaign_fields("desc", client)
         assert result.data.name == "Fixed"
+
+    def test_none_content_triggers_repair_then_succeeds(self):
+        # A misbehaving client could hand back None instead of raising —
+        # must not crash json.loads(None), just trigger the repair retry
+        # like any other unparseable response.
+        client = _FakeClient([None, _payload(name="Fixed")])
+        result = extract_campaign_fields("desc", client)
+        assert result.data.name == "Fixed"
+        assert result.repaired is True
+
+    def test_none_content_twice_raises_response_error(self):
+        client = _FakeClient([None, None])
+        with pytest.raises(LLMResponseError):
+            extract_campaign_fields("desc", client)
+
+
+@pytest.mark.unit
+class TestParse:
+    """Direct coverage of the ``_parse`` helper's input guards."""
+
+    def test_none_raises_value_error(self):
+        with pytest.raises(ValueError, match="expected a string response"):
+            _parse(None)
+
+    def test_non_string_raises_value_error(self):
+        with pytest.raises(ValueError, match="expected a string response"):
+            _parse({"already": "a dict"})
+
+
+@pytest.mark.unit
+class TestParseCodeFenceTolerance:
+    def test_plain_json_still_parses(self):
+        result = _parse(_payload(name="Plain"))
+        assert result.name == "Plain"
+
+    def test_json_fenced_with_json_tag(self):
+        raw = f"```json\n{_payload(name='Fenced')}\n```"
+        result = _parse(raw)
+        assert result.name == "Fenced"
+
+    def test_json_fenced_without_tag(self):
+        raw = f"```\n{_payload(name='Fenced')}\n```"
+        result = _parse(raw)
+        assert result.name == "Fenced"
+
+    def test_prose_wrapped_json(self):
+        raw = f"Here's what I extracted:\n\n{_payload(name='Prose')}\n\nLet me know!"
+        result = _parse(raw)
+        assert result.name == "Prose"
+
+    def test_genuinely_broken_input_still_raises(self):
+        with pytest.raises(ValueError, match="not valid JSON"):
+            _parse("this is not json at all, sorry")
+
+    def test_broken_input_with_unbalanced_braces_still_raises(self):
+        with pytest.raises(ValueError, match="not valid JSON"):
+            _parse("{not actually valid json")
 
 
 @pytest.mark.unit

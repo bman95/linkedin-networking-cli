@@ -33,3 +33,9 @@ class ExtractedCampaign(BaseModel):
 #: JSON schema payload for schema-constrained decoding (Ollama's ``format`` /
 #: OpenAI-style ``response_format``). Computed once at import time.
 EXTRACTION_JSON_SCHEMA: dict[str, Any] = ExtractedCampaign.model_json_schema()
+
+# OpenAI strict mode requires every property to be listed in "required";
+# optionality is expressed via each property's own nullable (anyOf-null)
+# type, not by omission from this list — every field here is still
+# ``None``-able per the model above.
+EXTRACTION_JSON_SCHEMA["required"] = sorted(EXTRACTION_JSON_SCHEMA["properties"].keys())

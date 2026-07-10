@@ -164,6 +164,22 @@ class TestChatJson:
             with pytest.raises(LLMResponseError):
                 client.chat_json([{"role": "user", "content": "x"}], {})
 
+    def test_null_content_raises_response_error(self):
+        # A provider can return "content": null instead of omitting the
+        # field entirely — must not reach json.loads(None) downstream.
+        client = LLMClient(_config())
+        body = {"choices": [{"message": {"content": None}}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            with pytest.raises(LLMResponseError):
+                client.chat_json([{"role": "user", "content": "x"}], {})
+
+    def test_non_string_content_raises_response_error(self):
+        client = LLMClient(_config())
+        body = {"choices": [{"message": {"content": {"unexpected": "object"}}}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            with pytest.raises(LLMResponseError):
+                client.chat_json([{"role": "user", "content": "x"}], {})
+
     def test_api_key_sent_as_bearer_header(self):
         client = LLMClient(_config(api_key="sk-test"))
         body = {"choices": [{"message": {"content": "{}"}}]}

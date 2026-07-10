@@ -10,8 +10,10 @@ chains — the mandatory human-review step in the TUI is the real backstop.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -127,11 +129,44 @@ def _parse_with_repair(
 
 
 def _parse(raw: str) -> ExtractedCampaign:
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"not valid JSON: {exc}") from exc
+    if not isinstance(raw, str):
+        # Defense in depth: the client already rejects non-string content,
+        # but any other caller of this parser gets the same uniform
+        # ValueError -> repair-retry handling instead of a raw TypeError.
+        raise ValueError(f"expected a string response, got {type(raw).__name__}")
+    payload = _loads_tolerant(raw)
     try:
         return ExtractedCampaign.model_validate(payload)
     except ValidationError as exc:
         raise ValueError(str(exc)) from exc
+
+
+_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+
+
+def _loads_tolerant(raw: str) -> Any:
+    """Parse ``raw`` as JSON, tolerating how a chat model commonly wraps its
+    answer: a markdown code fence, or leading/trailing prose around the
+    object. Each fallback is tried only after the previous one fails,
+    cheapest (and least likely to mask a genuine error) first.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        last_exc = exc
+
+    fenced = _FENCE_RE.match(raw.strip())
+    if fenced is not None:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+
+    raise ValueError(f"not valid JSON: {last_exc}") from last_exc
