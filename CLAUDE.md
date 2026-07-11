@@ -53,6 +53,14 @@ linkedin-run --campaign <id-or-name> [--max N]
 **Configuration (`src/config/`)**:
 - `settings.py` - AppSettings class managing environment variables and app configuration
 - Browser settings, automation parameters, and credential validation
+- The Rate Limiting tunables (`EDITABLE_SETTINGS`: connection delays, default
+  daily limit, cooldown, search limit) are editable from the TUI's Settings
+  screen and persist to `~/.linkedin-networking-cli/config.json`
+  (`AppSettings.save_overrides`). Precedence: `config.json` > env > default —
+  an in-app edit must win even when `.env` also sets the value. Credentials,
+  browser identity, and LLM keys stay env-only. There is no configurable
+  weekly invitation limit (removed 2026-07-11); LinkedIn's own weekly-limit
+  modal is still detected and handled reactively.
 
 ### Data Flow
 

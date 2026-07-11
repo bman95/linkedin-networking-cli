@@ -345,6 +345,19 @@ def contact_status(request):
 # ============================================================================
 
 @pytest.fixture(autouse=True)
+def isolate_app_home(tmp_path, monkeypatch):
+    """Point ``Path.home()`` at a per-test temp directory.
+
+    ``AppSettings()`` creates ``~/.linkedin-networking-cli`` on construction
+    and ``get_automation_settings`` reads persisted setting overrides from
+    ``config.json`` there. Without this, tests would pollute the real home
+    directory and inherit whatever overrides the developer's own app has
+    saved, making default-value assertions flaky.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def isolate_diagnostics_artifacts(tmp_path, monkeypatch):
     """Redirect diagnostics artifact writes into a per-test temp directory.
 

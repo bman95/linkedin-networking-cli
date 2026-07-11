@@ -1,13 +1,16 @@
-"""Read-only Settings screen (issue #24).
+"""Settings screen (issue #24).
 
-Shows the live configuration the classic CLI surfaces under Settings —
-credentials status, browser, rate limiting, and data locations — using the same
-labels for parity. It is strictly informational: secrets are never displayed
-(email masked, password shown only as Set / Not set).
+Shows the live configuration — credentials status, browser, rate limiting, and
+data locations. The **Rate Limiting** section is editable: its values persist
+to ``config.json`` via :meth:`AppSettings.save_overrides` and override the
+``.env`` values from the next run on (owner rule, 2026-07-11: settings must be
+changeable in the app, not only via ``.env``). Everything else stays
+informational: secrets are never displayed (email masked, password shown only
+as Set / Not set) and credentials/browser identity remain env-only.
 
 ``AppSettings()`` creates the app directory on construction (a filesystem
-write), and the quota read is blocking SQLite, so the load runs in a threaded
-worker with the same race discipline as the other screens.
+write), and the quota read is blocking SQLite, so the load — and the save —
+run in threaded workers with the same race discipline as the other screens.
 """
 
 from __future__ import annotations
@@ -15,10 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Label, Static
 
 from cli.helpers import mask_api_key, mask_email
 from database.operations import DatabaseManager
@@ -27,6 +31,22 @@ from utils.logging import get_logger
 from .base import BaseScreen
 
 logger = get_logger(__name__)
+
+# The editable Rate Limiting fields: (AppSettings override key, input id,
+# label). Keys match ``config.settings.EDITABLE_SETTINGS``; labels keep the
+# classic CLI vocabulary (issue #46: the env daily value is only the fallback
+# when a campaign sets no limit, and is labelled as such).
+EDITABLE_FIELDS = (
+    ("connection_delay_min", "field-delay-min", "Connection Delay Min (seconds)"),
+    ("connection_delay_max", "field-delay-max", "Connection Delay Max (seconds)"),
+    (
+        "daily_connection_limit",
+        "field-daily-fallback",
+        "Default Daily Limit (fallback when a campaign sets none)",
+    ),
+    ("connection_cooldown", "field-cooldown", "Inter-session Cooldown (seconds)"),
+    ("search_limit", "field-search-limit", "Search Limit"),
+)
 
 
 @dataclass(frozen=True)
@@ -38,7 +58,6 @@ class SettingsData:
     password_state: str
     browser: dict
     automation: dict
-    weekly_limit: int
     used_today: int | None
     used_week: int | None
     paths: dict
@@ -47,11 +66,11 @@ class SettingsData:
 
 
 class SettingsScreen(BaseScreen):
-    """Read-only view of the application's effective configuration.
+    """Effective configuration, with an editable Rate Limiting section.
 
     Interaction design (owner rule, 2026-07-09; no accelerators, 2026-07-10):
-    Refresh is a visible, focusable button below the sections — tab + Enter is
-    the only path to it.
+    the rate-limit inputs, Save and Refresh are all plain focusable widgets —
+    tab + Enter is the only path to them.
     """
 
     BINDINGS = [
@@ -61,15 +80,15 @@ class SettingsScreen(BaseScreen):
     SCREEN_TITLE = "Settings"
 
     HINTS = (
-        # The Refresh button is this screen's sole focusable widget and holds
-        # focus on mount, so Enter alone activates it — no movement key needed.
-        ("enter", "refresh"),
+        ("tab", "fields"),
+        ("enter", "activate"),
         ("esc", "back"),
     )
 
     def __init__(self, db_manager: DatabaseManager | None) -> None:
         super().__init__()
         self._db_manager = db_manager
+        self._save_in_flight = False
 
     def compose_body(self) -> ComposeResult:
         with Container(id="settings-body"):
@@ -82,6 +101,8 @@ class SettingsScreen(BaseScreen):
             ):
                 with Container(classes="settings-section", id=f"section-{section_id}"):
                     yield Static(title, classes="settings-section-title")
+                    if section_id == "limits":
+                        yield from self._compose_limits()
                     # markup=False: bodies render filesystem paths and env-derived
                     # values (executable path, user-data dir, …) that could
                     # contain Rich markup characters; treat them literally so a
@@ -90,6 +111,17 @@ class SettingsScreen(BaseScreen):
             yield Button("Refresh", id="settings-refresh", classes="flat-button")
         yield Static("Loading settings…", id="settings-status", classes="status-line")
 
+    def _compose_limits(self) -> ComposeResult:
+        """The editable Rate Limiting fields plus their Save button.
+
+        The trailing ``#body-limits`` Static (yielded by the section loop)
+        stays for the usage counters, which remain read-only.
+        """
+        for _key, input_id, label in EDITABLE_FIELDS:
+            yield Label(label, classes="field-label")
+            yield Input(type="integer", id=input_id)
+        yield Button("Save", id="settings-save", classes="flat-button")
+
     def on_mount(self) -> None:
         self.load_settings()
 
@@ -97,15 +129,26 @@ class SettingsScreen(BaseScreen):
         if event.button.id == "settings-refresh":
             event.stop()
             self.action_refresh()
+        elif event.button.id == "settings-save":
+            event.stop()
+            self.save_settings()
 
     def action_refresh(self) -> None:
-        self.query_one("#settings-status", Static).update("Refreshing…")
+        self._set_status("Refreshing…")
         self.load_settings()
 
     def load_settings(self) -> None:
         self._run_load(*self.begin_load())
 
-    @work(thread=True, exclusive=True)
+    def _set_status(self, message: str, kind: str = "") -> None:
+        status = self.query_one("#settings-status", Static)
+        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
+        # Text() renders literally: messages can carry raw exception text.
+        status.update(Text(message))
+
+    # ── load ──────────────────────────────────────────────────────────────
+
+    @work(thread=True, exclusive=True, group="settings-load")
     def _run_load(self, app: App, generation: int) -> None:
         try:
             data = self._gather()
@@ -155,7 +198,6 @@ class SettingsScreen(BaseScreen):
             password_state="Set" if has_password else "Not set",
             browser=browser,
             automation=automation,
-            weekly_limit=settings.weekly_invitation_limit,
             used_today=used_today,
             used_week=used_week,
             paths={
@@ -169,16 +211,18 @@ class SettingsScreen(BaseScreen):
         )
 
     def _populate(self, data: SettingsData | None, error: str | None) -> None:
-        status = self.query_one("#settings-status", Static)
         if error is not None:
             for section_id in ("credentials", "browser", "limits", "data", "ai_assist"):
                 self.query_one(f"#body-{section_id}", Static).update("")
-            status.update("Settings unavailable.")
+            self._set_status("Settings unavailable.", "error")
             return
 
         assert data is not None
         self._render_sections(data)
-        status.update("Read-only view — values come from environment variables (.env).")
+        self._set_status(
+            "Rate limits are editable — Save persists them to config.json "
+            "(overrides .env). Other sections mirror .env."
+        )
 
     def _render_sections(self, data: SettingsData) -> None:
         self.query_one("#body-credentials", Static).update(
@@ -197,26 +241,22 @@ class SettingsScreen(BaseScreen):
             f"User Data Dir: {b.get('user_data_dir')}"
         )
 
+        # Editable fields show the *effective* values (config.json override,
+        # else env, else default) so what you see is what the next run uses.
         a = data.automation
-        # The per-campaign daily_limit is the enforced daily cap; the env value
-        # is only its fallback, so it is labelled as such and today's usage is
-        # never shown against it (issue #46). The weekly budget is LinkedIn's
-        # actually-binding constraint (DESIGN-PROPOSALS.md §4).
-        usage_lines = ""
+        for key, input_id, _label in EDITABLE_FIELDS:
+            self.query_one(f"#{input_id}", Input).value = str(a.get(key, ""))
+
+        # The per-campaign daily_limit is the enforced daily cap; the value
+        # above is only its fallback, so today's usage is never shown against
+        # it (issue #46). The weekly count is informational — there is no
+        # configured weekly budget anymore.
+        usage_lines = []
         if data.used_today is not None:
-            usage_lines = f"Used Today: {data.used_today}\n"
+            usage_lines.append(f"Used Today: {data.used_today}")
         if data.used_week is not None:
-            usage_lines += f"Used This Week: {data.used_week}/{data.weekly_limit}\n"
-        self.query_one("#body-limits", Static).update(
-            f"Connection Delay: {a.get('connection_delay_min')}-"
-            f"{a.get('connection_delay_max')} seconds\n"
-            f"Default Daily Limit (fallback when a campaign sets none): "
-            f"{a.get('daily_connection_limit')}\n"
-            f"Weekly Invitation Limit: {data.weekly_limit}\n"
-            f"{usage_lines}"
-            f"Inter-session Cooldown: {a.get('connection_cooldown')} seconds\n"
-            f"Search Limit: {a.get('search_limit')}"
-        )
+            usage_lines.append(f"Used This Week: {data.used_week}")
+        self.query_one("#body-limits", Static).update("\n".join(usage_lines))
 
         p = data.paths
         self.query_one("#body-data", Static).update(
@@ -232,4 +272,73 @@ class SettingsScreen(BaseScreen):
             f"Base URL: {llm.get('base_url')}\n"
             f"Model: {llm.get('model') or 'not set (local falls back to a RAM-based default)'}\n"
             f"API Key: {data.llm_api_key_state}"
+        )
+
+    # ── save ──────────────────────────────────────────────────────────────
+
+    def save_settings(self) -> None:
+        if self._save_in_flight:
+            return
+        values, error = self._read_fields()
+        if error is not None:
+            message, selector = error
+            self._set_status(message, "error")
+            self.query_one(selector, Input).focus()
+            return
+        assert values is not None  # error is None ⇒ values is present
+        self._save_in_flight = True
+        self._set_status("Saving…")
+        self._run_save(self.app, values)
+
+    def _read_fields(self) -> tuple[dict | None, tuple[str, str] | None]:
+        """Validate the editable fields into an override dict.
+
+        Returns ``(values, None)`` on success or ``(None, (message, selector))``
+        on the first failure so the caller can show it and focus the field.
+        """
+        values: dict[str, int] = {}
+        for key, input_id, label in EDITABLE_FIELDS:
+            raw = self.query_one(f"#{input_id}", Input).value.strip()
+            try:
+                values[key] = int(raw)
+            except ValueError:
+                return None, (f"{label} must be a whole number.", f"#{input_id}")
+
+        checks = (
+            (values["connection_delay_min"] < 0,
+             "Connection Delay Min cannot be negative.", "#field-delay-min"),
+            (values["connection_delay_max"] < values["connection_delay_min"],
+             "Connection Delay Max must be ≥ the minimum.", "#field-delay-max"),
+            (values["daily_connection_limit"] < 1,
+             "Default Daily Limit must be at least 1.", "#field-daily-fallback"),
+            (values["connection_cooldown"] < 0,
+             "Inter-session Cooldown cannot be negative.", "#field-cooldown"),
+            (values["search_limit"] < 1,
+             "Search Limit must be at least 1.", "#field-search-limit"),
+        )
+        for failed, message, selector in checks:
+            if failed:
+                return None, (message, selector)
+        return values, None
+
+    @work(thread=True, exclusive=True, group="settings-save")
+    def _run_save(self, app: App, values: dict) -> None:
+        try:
+            from config.settings import AppSettings
+
+            AppSettings().save_overrides(values)
+        except Exception as exc:
+            logger.debug("Saving settings failed", exc_info=True)
+            self.marshal(app, self._save_done, f"Could not save settings: {exc}")
+            return
+        self.marshal(app, self._save_done, None)
+
+    def _save_done(self, error: str | None) -> None:
+        self._save_in_flight = False
+        if error is not None:
+            self._set_status(error, "error")
+            return
+        self._set_status(
+            "Saved to config.json — the new values apply from the next run.",
+            "good",
         )

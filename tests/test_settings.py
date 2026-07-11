@@ -587,28 +587,74 @@ class TestAutomationSettings:
 
 
 @pytest.mark.unit
-class TestWeeklyInvitationLimit:
-    """Proactive weekly-invitation budget (env WEEKLY_INVITATION_LIMIT)."""
+class TestConfigOverrides:
+    """Persisted setting overrides (config.json, saved from the Settings TUI).
 
-    def test_default_is_100(self, monkeypatch):
-        monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
-        assert AppSettings().weekly_invitation_limit == 100
+    Precedence: config.json > env > default — otherwise editing a value in
+    the app would silently do nothing whenever .env also sets it. The autouse
+    ``isolate_app_home`` fixture points ``Path.home()`` at a temp dir, so each
+    test gets a fresh, empty config.json location.
+    """
 
-    def test_custom_value(self, monkeypatch):
-        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "250")
-        assert AppSettings().weekly_invitation_limit == 250
+    def test_no_file_uses_env_and_defaults(self, monkeypatch):
+        monkeypatch.setenv("SEARCH_LIMIT", "42")
+        monkeypatch.delenv("DAILY_CONNECTION_LIMIT", raising=False)
+        auto = AppSettings().get_automation_settings()
+        assert auto["search_limit"] == 42  # env
+        assert auto["daily_connection_limit"] == 20  # default
 
-    def test_malformed_falls_back_to_default(self, monkeypatch, caplog):
-        """A malformed value degrades to the default (guarded _env_int), not a crash."""
-        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "lots")
+    def test_override_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        settings = AppSettings()
+        settings.config_path.write_text('{"daily_connection_limit": 7}')
+        assert AppSettings().get_automation_settings()["daily_connection_limit"] == 7
+
+    def test_save_overrides_round_trip(self):
+        values = {
+            "connection_delay_min": 3,
+            "connection_delay_max": 9,
+            "daily_connection_limit": 15,
+            "connection_cooldown": 60,
+            "search_limit": 50,
+        }
+        AppSettings().save_overrides(values)
+        auto = AppSettings().get_automation_settings()
+        for key, expected in values.items():
+            assert auto[key] == expected
+
+    def test_save_overrides_rejects_unknown_keys(self):
+        with pytest.raises(ValueError):
+            AppSettings().save_overrides({"linkedin_password": 1})
+
+    def test_save_overrides_preserves_unknown_file_keys(self):
+        settings = AppSettings()
+        settings.config_path.write_text('{"future_section": {"a": 1}}')
+        settings.save_overrides({"search_limit": 33})
+        import json
+
+        stored = json.loads(settings.config_path.read_text())
+        assert stored["future_section"] == {"a": 1}
+        assert stored["search_limit"] == 33
+
+    def test_malformed_file_degrades_to_env(self, monkeypatch, caplog):
+        monkeypatch.setenv("SEARCH_LIMIT", "42")
+        settings = AppSettings()
+        settings.config_path.write_text("{not json")
         with caplog.at_level("WARNING"):
-            assert AppSettings().weekly_invitation_limit == 100
-        assert any(
-            "WEEKLY_INVITATION_LIMIT" in rec.message for rec in caplog.records
-        )
+            auto = AppSettings().get_automation_settings()
+        assert auto["search_limit"] == 42
+        assert any("config.json" in rec.message for rec in caplog.records)
 
-    def test_returns_int(self, app_settings):
-        assert isinstance(app_settings.weekly_invitation_limit, int)
+    def test_non_int_and_unknown_values_ignored(self, monkeypatch):
+        monkeypatch.delenv("SEARCH_LIMIT", raising=False)
+        settings = AppSettings()
+        settings.config_path.write_text(
+            '{"search_limit": "lots", "connection_cooldown": true, "unknown": 5}'
+        )
+        auto = AppSettings().get_automation_settings()
+        assert auto["search_limit"] == 100  # non-int override ignored
+        assert auto["connection_cooldown"] == 0  # bool is not a tunable int
+        assert "unknown" not in auto
 
 
 @pytest.mark.unit

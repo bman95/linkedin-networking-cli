@@ -1547,46 +1547,6 @@ class TestPersistedDailyCap:
         assert any("already reached" in m for m in messages)
 
     @pytest.mark.asyncio
-    async def test_weekly_budget_reached_stops_before_sending(
-        self, mock_linkedin_automation, monkeypatch
-    ):
-        """The run stops before sending once the weekly budget is reached.
-
-        LinkedIn's binding cap is a rolling ~weekly one; the proactive
-        weekly-budget pre-check must stop the loop cleanly before the next
-        invite (mirroring the daily-full stop) rather than sending into it.
-        """
-        from datetime import timedelta
-
-        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
-        monkeypatch.setenv("WEEKLY_INVITATION_LIMIT", "5")
-        db = mock_linkedin_automation.db_manager
-        campaign = db.create_campaign({"name": "Test Campaign"})
-
-        # 5 invites already sent earlier this week, recorded on a PRIOR day so
-        # today's daily count stays 0 — proving the WEEKLY budget (not the daily
-        # cap) is what stops the run.
-        yesterday = (date.today() - timedelta(days=1)).isoformat()
-        for _ in range(5):
-            db.increment_daily_connection_count(yesterday)
-
-        today = date.today().isoformat()
-        assert db.get_daily_connection_count(today) == 0  # daily cap not the cause
-        assert db.get_weekly_connection_count() == 5
-
-        messages = []
-        result = await mock_linkedin_automation.send_connection_requests(
-            campaign, self._profiles(5), progress_callback=messages.append
-        )
-
-        # No new requests sent; the browser was never driven.
-        assert result["sent"] == 0
-        assert not mock_linkedin_automation.page.goto.called
-        # Weekly count untouched and the user was told why the run stopped.
-        assert db.get_weekly_connection_count() == 5
-        assert any("Weekly invitation limit reached" in m for m in messages)
-
-    @pytest.mark.asyncio
     async def test_partial_prior_run_does_not_reset(
         self, mock_linkedin_automation, monkeypatch
     ):

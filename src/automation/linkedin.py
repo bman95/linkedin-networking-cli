@@ -1318,7 +1318,8 @@ class LinkedInAutomation:
         Card handles are valid only until the walk paginates, so each page's cards
         are drained before advancing (Connect clicks open an overlay modal and never
         navigate). The persisted daily cap is shared with the fallback pass, and a
-        day-full / weekly-limit / inline-CAPTCHA / challenge stop ends the run.
+        day-full / LinkedIn weekly-limit-modal / inline-CAPTCHA / challenge stop
+        ends the run.
 
         Trade-off: with no pre-scan, a renderer wedge mid-walk stops the run with the
         later (un-scanned) pages unprocessed; the wedged card itself and the
@@ -1327,7 +1328,7 @@ class LinkedInAutomation:
         ``limit`` caps the *scan* (unique result cards examined); ``max_sends``,
         when given, additionally caps the *invitations sent* this call (confirmed
         + ambiguous sends), across both the card pass and the profile-page
-        fallback. The persisted daily/weekly caps still apply on top.
+        fallback. The persisted daily cap still applies on top.
 
         Returns the same aggregate shape as :meth:`send_connection_requests`, plus
         ``scanned`` (unique cards seen across the result pages) and
@@ -1440,31 +1441,6 @@ class LinkedInAutomation:
                             progress_callback(
                                 f"Daily connection limit reached "
                                 f"({daily_limit}/{daily_limit} used today)"
-                            )
-                        scan_done = stop_all = True
-                        break
-
-                    # Proactive weekly-invitation budget (see
-                    # send_connection_requests): stop cleanly before the next
-                    # invite once the trailing-7-day total reaches the weekly
-                    # budget, mirroring the daily-full stop for this loop.
-                    # Advisory read-check only — unlike the daily cap it is NOT
-                    # enforced atomically by the slot reserve, so concurrent
-                    # runs may each pass at limit-1 (bounded overshoot;
-                    # LinkedIn's own weekly cap is the backstop).
-                    weekly_limit = self.settings.weekly_invitation_limit
-                    weekly_count = self.db_manager.get_weekly_connection_count()
-                    if weekly_count >= weekly_limit:
-                        logger.info(
-                            "Weekly invitation budget reached (%d/%d); stopping "
-                            "the run",
-                            weekly_count,
-                            weekly_limit,
-                        )
-                        if progress_callback:
-                            progress_callback(
-                                f"Weekly invitation limit reached "
-                                f"({weekly_count}/{weekly_limit} used this week)"
                             )
                         scan_done = stop_all = True
                         break
@@ -1826,8 +1802,8 @@ class LinkedInAutomation:
         """Send connection requests to profiles.
 
         ``max_sends``, when given, caps the invitations sent this call
-        (confirmed + ambiguous sends) on top of the persisted daily/weekly
-        limits. The returned dict carries ``stopped_reason``
+        (confirmed + ambiguous sends) on top of the persisted daily
+        limit. The returned dict carries ``stopped_reason``
         (``"captcha"``/``"challenge"`` when the run was cut short to protect
         the account, ``"cancelled"`` on a user stop request, else ``None``).
 
@@ -1924,30 +1900,6 @@ class LinkedInAutomation:
                         progress_callback(
                             f"Daily connection limit reached "
                             f"({daily_limit}/{daily_limit} used today)"
-                        )
-                    break
-
-                # Proactive weekly-invitation budget: LinkedIn's binding cap is a
-                # rolling ~weekly one, otherwise only discovered reactively by
-                # hitting the limit modal mid-run. Stop cleanly before the next
-                # invite once the trailing-7-day total has reached the budget —
-                # mirroring the daily-full stop (a plain break to the return).
-                # Advisory read-check only — unlike the daily cap it is NOT
-                # enforced atomically by the slot reserve, so concurrent runs
-                # may each pass at limit-1 (bounded overshoot; LinkedIn's own
-                # weekly cap is the backstop).
-                weekly_limit = self.settings.weekly_invitation_limit
-                weekly_count = self.db_manager.get_weekly_connection_count()
-                if weekly_count >= weekly_limit:
-                    logger.info(
-                        "Weekly invitation budget reached (%d/%d); stopping the run",
-                        weekly_count,
-                        weekly_limit,
-                    )
-                    if progress_callback:
-                        progress_callback(
-                            f"Weekly invitation limit reached "
-                            f"({weekly_count}/{weekly_limit} used this week)"
                         )
                     break
 

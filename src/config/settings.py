@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -6,6 +7,18 @@ from zoneinfo import TZPATH, available_timezones
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# The automation tunables the Settings screen can edit and persist. Maps the
+# ``get_automation_settings`` key to its env variable, so a persisted override
+# and its env fallback always describe the same knob. Credentials and browser
+# identity stay env-only (secrets / machine-specific), so they are not here.
+EDITABLE_SETTINGS = {
+    "connection_delay_min": "CONNECTION_DELAY_MIN",
+    "connection_delay_max": "CONNECTION_DELAY_MAX",
+    "daily_connection_limit": "DAILY_CONNECTION_LIMIT",
+    "connection_cooldown": "CONNECTION_COOLDOWN",
+    "search_limit": "SEARCH_LIMIT",
+}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -65,17 +78,53 @@ class AppSettings:
             logger.warning("LINKEDIN_PASSWORD environment variable not set")
         return password
 
-    @property
-    def weekly_invitation_limit(self) -> int:
-        """Proactive weekly invitation budget (env ``WEEKLY_INVITATION_LIMIT``).
+    def load_overrides(self) -> dict[str, int]:
+        """Read the persisted setting overrides from ``config.json``.
 
-        LinkedIn's binding constraint is a rolling ~weekly invitation cap, not
-        the per-day one; without this the weekly limit is only discovered
-        reactively by hitting the limit modal mid-run. Parsed with the same
-        guarded ``_env_int`` helper as ``DAILY_CONNECTION_LIMIT`` so a malformed
-        value degrades to the default (100) instead of crashing startup.
+        Only :data:`EDITABLE_SETTINGS` keys holding a plain ``int`` are
+        honored; anything else (missing file, malformed JSON, unknown keys,
+        wrong types) is dropped so a hand-edited or corrupted file degrades to
+        the env/default values instead of crashing startup — the same posture
+        as ``_env_int``.
         """
-        return _env_int("WEEKLY_INVITATION_LIMIT", 100)
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring unreadable %s: %s", self.config_path, exc)
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("Ignoring %s: expected a JSON object", self.config_path)
+            return {}
+        overrides = {}
+        for key in EDITABLE_SETTINGS:
+            value = raw.get(key)
+            # bool is an int subclass; a stray true/false is not a tunable.
+            if isinstance(value, int) and not isinstance(value, bool):
+                overrides[key] = value
+        return overrides
+
+    def save_overrides(self, values: dict[str, int]) -> None:
+        """Persist editable-setting overrides to ``config.json``.
+
+        Merges over the file's existing content (unknown keys survive) so the
+        file can host future sections without this writer clobbering them.
+        """
+        unknown = set(values) - set(EDITABLE_SETTINGS)
+        if unknown:
+            raise ValueError(f"Not editable settings: {sorted(unknown)}")
+        try:
+            existing = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        existing.update(values)
+        self.config_path.write_text(
+            json.dumps(existing, indent=2) + "\n", encoding="utf-8"
+        )
+        logger.info("Saved setting overrides to %s: %s", self.config_path, values)
 
     @staticmethod
     def _normalize_timezone(candidate: str | None) -> str | None:
@@ -232,7 +281,13 @@ class AppSettings:
         return settings
 
     def get_automation_settings(self) -> dict[str, Any]:
-        """Get automation settings"""
+        """Get automation settings.
+
+        Precedence for the :data:`EDITABLE_SETTINGS` keys: a ``config.json``
+        override (saved from the Settings screen) wins over the env variable,
+        which wins over the built-in default — otherwise editing a value in
+        the app would silently do nothing whenever ``.env`` also sets it.
+        """
         settings = {
             "connection_delay_min": _env_int("CONNECTION_DELAY_MIN", 2),
             "connection_delay_max": _env_int("CONNECTION_DELAY_MAX", 5),
@@ -248,6 +303,7 @@ class AppSettings:
             "action_delay_max": _env_int("ACTION_DELAY_MAX", 4),
             "max_actions_per_minute": _env_int("MAX_ACTIONS_PER_MINUTE", 20),
         }
+        settings.update(self.load_overrides())
 
         logger.debug(
             "Automation settings: delay=%s-%ss, daily_limit=%s, cooldown=%ss, "

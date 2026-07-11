@@ -270,15 +270,14 @@ async def test_dashboard_refresh_reachable_by_tab_and_enter(db_manager: Database
 async def test_settings_refresh_reachable_by_tab_and_enter(db_manager: DatabaseManager):
     """Settings previously had no focusable widget at all; Refresh is now one
     (regression guard for the most severe instance the issue #49 sweep found).
-    It is the screen's *only* focusable widget, so Textual's default auto-focus
-    lands on it directly — ``tab_until_focused`` below returns after zero tab
-    presses, which is the expected proof there is now something to focus at
-    all; Enter still drives the actual activation."""
+    The screen now also carries the editable rate-limit inputs and Save, so
+    ``tab_until_focused`` proves Refresh stays tab-reachable behind them;
+    Enter still drives the actual activation."""
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         app.push_screen(SettingsScreen(db_manager))
-        await wait_text(pilot, "#settings-status", "Read-only")
+        await wait_text(pilot, "#settings-status", "editable")
         button = app.screen.query_one("#settings-refresh", Button)
         await tab_until_focused(pilot, button)
         called = []

@@ -256,15 +256,15 @@ async def test_dashboard_recent_orders_and_truncates(db_manager: DatabaseManager
 
 
 @pytest.mark.unit
-async def test_dashboard_week_usage_states(db_manager: DatabaseManager, monkeypatch):
-    """The 'Used This Week' card colours by the weekly budget and degrades to —.
+async def test_dashboard_week_usage_states(db_manager: DatabaseManager):
+    """The 'Used This Week' card shows the plain trailing-7-day count.
 
-    The tile tracks the weekly invitation budget — LinkedIn's actually-binding
-    constraint — not the DAILY_CONNECTION_LIMIT env fallback (issue #46).
+    Informational only — there is no configured weekly budget anymore, so the
+    tile carries no "/limit" and no warn colouring, and degrades to — when the
+    count is unavailable.
     """
     from textual.widgets import Static
 
-    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -272,32 +272,21 @@ async def test_dashboard_week_usage_states(db_manager: DatabaseManager, monkeypa
         screen = app.screen
         await wait_for_status(pilot, screen, "#dashboard-status", "Updated")
         used = screen.query_one("#value-week-usage", Static)
-        # Default weekly budget is 100 and usage is 0 -> "0/100", not warned.
-        assert card_value(screen, "week-usage") == "0/100"
+        assert card_value(screen, "week-usage") == "0"
         assert "-warn" not in used.classes
 
-        # Simulate at-cap: re-populate with used == budget and assert the warn class.
         from tui.screens.dashboard import DashboardData
 
         screen._populate(
-            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=100, weekly_limit=100),
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=42),
             None,
         )
-        assert card_value(screen, "week-usage") == "100/100"
-        assert "-warn" in used.classes
+        assert card_value(screen, "week-usage") == "42"
+        assert "-warn" not in used.classes
 
-        # A non-positive budget blocks every run (enforcement is used >= limit),
-        # so it must warn rather than render neutral.
+        # Count unavailable -> blank dash, neutral.
         screen._populate(
-            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=0, weekly_limit=0),
-            None,
-        )
-        assert card_value(screen, "week-usage") == "0/0"
-        assert "-warn" in used.classes
-
-        # Budget unavailable -> blank dash, neutral.
-        screen._populate(
-            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=None, weekly_limit=None),
+            DashboardData(stats={"total_campaigns": 1}, recent=[], used_week=None),
             None,
         )
         assert card_value(screen, "week-usage") == "—"
@@ -475,7 +464,7 @@ async def test_settings_masks_email_and_hides_password(
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
         body = str(screen.query_one("#body-credentials", Static).render())
         assert "joh***@example.com" in body
         assert "johndoe@example.com" not in body  # never the raw email
@@ -494,35 +483,100 @@ async def test_settings_status_not_configured(db_manager: DatabaseManager, monke
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
         body = str(screen.query_one("#body-credentials", Static).render())
         assert "Status: Not configured" in body
         assert "Password: Not set" in body
 
 
 @pytest.mark.unit
-async def test_settings_renders_rate_limiting_parity(
+async def test_settings_rate_limiting_fields_show_effective_values(
     db_manager: DatabaseManager, monkeypatch
 ):
-    """Rate-limiting labels match the classic CLI vocabulary."""
-    monkeypatch.delenv("WEEKLY_INVITATION_LIMIT", raising=False)
+    """The Rate Limiting inputs are prefilled with the effective values.
+
+    Effective = config.json override > env > default, so what the user sees
+    (and edits) is exactly what the next run uses. Usage counters stay
+    read-only, and there is no weekly limit anymore.
+    """
+    from textual.widgets import Input
+
+    monkeypatch.setenv("SEARCH_LIMIT", "42")
+    monkeypatch.delenv("DAILY_CONNECTION_LIMIT", raising=False)
     app = LinkedInTUI(db_manager=db_manager)
     async with app.run_test() as pilot:
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
+        assert screen.query_one("#field-search-limit", Input).value == "42"  # env
+        assert screen.query_one("#field-daily-fallback", Input).value == "20"  # default
+        assert screen.query_one("#field-delay-min", Input).value == "2"
+        assert screen.query_one("#field-delay-max", Input).value == "5"
+        assert screen.query_one("#field-cooldown", Input).value == "0"
         limits = str(screen.query_one("#body-limits", Static).render())
-        assert "Connection Delay:" in limits
-        # The env value is only the per-campaign fallback and must be labelled
-        # as such; the weekly budget is the binding constraint (issue #46).
-        assert "Default Daily Limit (fallback when a campaign sets none):" in limits
-        assert "Daily Connection Limit:" not in limits
-        assert "Weekly Invitation Limit: 100" in limits
         assert "Used Today: 0" in limits  # db_manager present -> usage shown
-        assert "Used This Week: 0/100" in limits
+        assert "Used This Week: 0" in limits
+        assert "Weekly Invitation Limit" not in limits
         assert "Used Today: 0/" not in limits  # never "used/env-fallback"
-        assert "Search Limit:" in limits
+
+
+@pytest.mark.unit
+async def test_settings_save_persists_overrides(
+    db_manager: DatabaseManager, tmp_path, monkeypatch
+):
+    """Editing a rate limit and activating Save persists it to config.json,
+    and the saved value wins over env on the next read (the whole point of
+    in-app settings: not only changeable via .env)."""
+    import json
+
+    from textual.widgets import Button, Input
+
+    from config.settings import AppSettings
+
+    monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "settings")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
+        screen.query_one("#field-daily-fallback", Input).value = "7"
+        screen.query_one("#settings-save", Button).focus()
+        await pilot.press("enter")
+        await wait_for_status(pilot, screen, "#settings-status", "Saved")
+
+    # tmp_path is the patched home (autouse isolate_app_home fixture).
+    config = json.loads(
+        (tmp_path / ".linkedin-networking-cli" / "config.json").read_text()
+    )
+    assert config["daily_connection_limit"] == 7
+    # The override beats the env value on a fresh read.
+    assert AppSettings().get_automation_settings()["daily_connection_limit"] == 7
+
+
+@pytest.mark.unit
+async def test_settings_save_rejects_invalid_values(
+    db_manager: DatabaseManager, tmp_path
+):
+    """An invalid field blocks the save with an error and writes nothing."""
+    from textual.widgets import Button, Input
+
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "settings")
+        screen = app.screen
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
+        # Max below min is rejected before anything touches the disk.
+        screen.query_one("#field-delay-min", Input).value = "9"
+        screen.query_one("#field-delay-max", Input).value = "3"
+        screen.query_one("#settings-save", Button).focus()
+        await pilot.press("enter")
+        text = await wait_for_status(pilot, screen, "#settings-status", "must be")
+        assert "Connection Delay Max" in text
+
+    assert not (tmp_path / ".linkedin-networking-cli" / "config.json").exists()
 
 
 @pytest.mark.unit
@@ -534,7 +588,7 @@ async def test_settings_ai_assist_local_mode(db_manager: DatabaseManager, monkey
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
         body = str(screen.query_one("#body-ai_assist", Static).render())
         assert "Mode: local" in body
         assert "Base URL: http://localhost:11434" in body
@@ -552,7 +606,7 @@ async def test_settings_ai_assist_hosted_mode_masks_key(
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
         body = str(screen.query_one("#body-ai_assist", Static).render())
         assert "Mode: hosted" in body
         assert "Model: gpt-4o-mini" in body
@@ -593,6 +647,6 @@ async def test_settings_path_with_markup_does_not_crash(
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         screen = app.screen
-        await wait_for_status(pilot, screen, "#settings-status", "Read-only")
+        await wait_for_status(pilot, screen, "#settings-status", "editable")
         body = str(screen.query_one("#body-browser", Static).render())
         assert "/opt/[/]chrome" in body

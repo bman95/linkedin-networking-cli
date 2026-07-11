@@ -79,8 +79,8 @@ side effects); write and automation flows follow.
 
 | Classic flow | TUI screen | Data / deps | Side effects | Status |
 | --- | --- | --- | --- | --- |
-| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_weekly_connection_count`, `AppSettings` | none (read-only) | **done (this PR)** |
-| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** (the classic CLI's standalone "Look up location code (online)" utility was not ported — its purpose, finding a geoUrn to paste elsewhere, is superseded by Create/Edit Campaign's own inline online location search, which turns a result directly into a usable option instead of a code to copy; dropped in the issue #47 cutover) |
+| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
+| Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | `config.json` write (2026-07-11: the Rate Limiting values are editable in-app and persist as overrides via `AppSettings.save_overrides`; precedence config.json > env > default) | **done (this PR)** (the classic CLI's standalone "Look up location code (online)" utility was not ported — its purpose, finding a geoUrn to paste elsewhere, is superseded by Create/Edit Campaign's own inline online location search, which turns a result directly into a usable option instead of a code to copy; dropped in the issue #47 cutover) |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |
 | Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
@@ -181,7 +181,8 @@ gated on a per-flow parity checklist:
     (`joh***@example.com`), "Password: Set/Not set", "Channel", "Executable",
     "Headless Mode", "Viewport", "User Data Dir", "Connection Delay",
     "Default Daily Limit (fallback when a campaign sets none)",
-    "Weekly Invitation Limit", "Used Today", "Used This Week",
+    "Used Today", "Used This Week" (plain trailing-7-day count — the
+    configurable weekly invitation budget was removed on 2026-07-11),
     "Inter-session Cooldown",
     "Search Limit", "App Directory", "Database", "Session Data", "Browser Data".
 - **Behavior parity.** Each migrated flow does what its classic counterpart
@@ -213,7 +214,7 @@ low-contrast on dark. Screens reference **semantic tokens** (`$primary`,
 | `primary` | `#0A66C2` | brand identity: solid fills, focus, active row, accent rule |
 | `secondary` / `accent` | `#4D9FFF` | brighter blue: text accents/links legible on dark |
 | `success` | `#4FB477` | healthy/active states, positive rates |
-| `warning` | `#E0A65B` | amber — usage at/over the weekly invitation budget |
+| `warning` | `#E0A65B` | amber — warnings (e.g. discard-confirm prompts) |
 | `error` | `#E5615B` | soft red — error / degraded states |
 | `background` / `surface` / `panel` | `#11151A` / `#161B22` / `#1C222B` | deep, cool, calm elevation |
 | `foreground` / `text-muted` | `#E4E9F0` / `#8A95A6` | body text / captions |

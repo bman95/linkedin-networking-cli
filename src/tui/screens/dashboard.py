@@ -48,7 +48,6 @@ class DashboardData:
     stats: dict
     recent: list[tuple]  # (name: Text, status, sent, accepted, rate) — ready for add_row
     used_week: int | None
-    weekly_limit: int | None
 
 
 class DashboardScreen(BaseScreen):
@@ -82,9 +81,9 @@ class DashboardScreen(BaseScreen):
         ("success-rate", "Success Rate"),
         ("total-contacts", "Total Contacts"),
         ("pending", "Pending"),
-        # The weekly invitation budget is LinkedIn's actually-binding rate
-        # constraint; the daily cap is per-campaign, so a single global
-        # "used/limit" tile can only be honest at the weekly level (issue #46).
+        # Informational trailing-7-day usage. The daily cap is per-campaign, so
+        # a single global usage tile can only be honest at the weekly level
+        # (issue #46); there is no configured weekly budget to show against it.
         ("week-usage", "Used This Week"),
     )
 
@@ -137,7 +136,7 @@ class DashboardScreen(BaseScreen):
             stats = self._db_manager.get_dashboard_stats()
             campaigns = self._db_manager.get_campaigns(active_only=False)
             contacts = self._db_manager.get_contacts()
-            used_week, weekly_limit = self._load_week_budget()
+            used_week = self._load_week_usage()
         except Exception as exc:  # surface in-place, never crash the UI
             self.marshal_load(
                 app, generation, self._populate, None, f"Error loading dashboard: {exc}"
@@ -145,31 +144,20 @@ class DashboardScreen(BaseScreen):
             return
 
         recent = self._recent_rows(campaigns, contacts)
-        data = DashboardData(
-            stats=stats, recent=recent, used_week=used_week, weekly_limit=weekly_limit
-        )
+        data = DashboardData(stats=stats, recent=recent, used_week=used_week)
         self.marshal_load(app, generation, self._populate, data, None)
 
-    def _load_week_budget(self) -> tuple[int | None, int | None]:
-        """This week's invitation usage and the weekly budget (issue #46).
+    def _load_week_usage(self) -> int | None:
+        """This week's invitation usage (trailing 7 days), or ``None``.
 
-        The weekly budget is the actually-binding LinkedIn constraint
-        (DESIGN-PROPOSALS.md §4); the env daily value is only a per-campaign
-        fallback, so it is never shown as "the" limit. ``AppSettings()`` touches
-        the filesystem (it creates the app dir), so a read-only/sandboxed home
-        can fail; degrade to ``None`` rather than crashing the whole dashboard,
-        consistent with the app's startup posture. Imported lazily so this
-        module stays cheap to import.
+        Purely informational — there is no configured weekly budget anymore.
+        Degrades to ``None`` rather than crashing the whole dashboard.
         """
         try:
-            from config.settings import AppSettings
-
-            used_week = self._db_manager.get_weekly_connection_count()
-            weekly_limit = AppSettings().weekly_invitation_limit
-            return used_week, weekly_limit
+            return self._db_manager.get_weekly_connection_count()
         except Exception:
-            logger.debug("Could not resolve weekly budget; omitting", exc_info=True)
-            return None, None
+            logger.debug("Could not resolve weekly usage; omitting", exc_info=True)
+            return None
 
     @staticmethod
     def _recent_rows(campaigns, contacts) -> list[tuple]:
@@ -267,16 +255,8 @@ class DashboardScreen(BaseScreen):
         self._value("pending").update(str(s.get("total_pending", 0)))
 
         week_value = self._value("week-usage")
-        if data.used_week is None or data.weekly_limit is None:
-            week_value.update("—")
-            week_value.set_classes("stat-value")
-        else:
-            week_value.update(f"{data.used_week}/{data.weekly_limit}")
-            # Warn when at/over the weekly invitation budget — same comparison
-            # the automation enforces (used >= limit), so a non-positive budget
-            # (which blocks every run) warns instead of rendering neutral.
-            at_cap = data.used_week >= data.weekly_limit
-            week_value.set_classes("stat-value -warn" if at_cap else "stat-value")
+        week_value.update("—" if data.used_week is None else str(data.used_week))
+        week_value.set_classes("stat-value")
 
     def _fill_recent(self, rows: list[tuple]) -> None:
         table = self.query_one("#dashboard-recent", DataTable)

@@ -325,10 +325,31 @@ HomeScreen.narrow #home-wordmark-fallback {
     margin-bottom: 1;
 }
 
-/* Refresh: this screen's sole focusable widget (owner rule, 2026-07-09) — tab +
- * Enter reach it; the button is the only path. */
-#settings-refresh {
+/* Refresh/Save: focusable buttons (owner rule, 2026-07-09) — tab + Enter
+ * reach them; buttons are the only path. */
+#settings-refresh,
+#settings-save {
     margin: 1 0 0 0;
+}
+
+/* Editable Rate Limiting fields: same filled, left-accent-rule idiom as the
+ * campaign form, but lightened one step so they read against the elevated
+ * .settings-section panel they sit on. */
+.settings-section Input {
+    width: 60;
+    height: 1;
+    border: none;
+    border-left: thick $panel-lighten-2;
+    background: $panel-lighten-1;
+    padding: 0 1;
+}
+.settings-section Input:focus {
+    border-left: thick $primary;
+    background: $panel-lighten-2;
+}
+/* The usage counters sit below the Save button; give them breathing room. */
+#body-limits {
+    margin-top: 1;
 }
 
 .settings-section-title {
