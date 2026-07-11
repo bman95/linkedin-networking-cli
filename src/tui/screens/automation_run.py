@@ -51,7 +51,7 @@ class AutomationRunScreen(BaseScreen):
     ]
 
     HINTS = (
-        ("tab", "fields"),
+        ("↑↓", "fields"),
         ("enter", "activate"),
         ("esc", "back"),
     )

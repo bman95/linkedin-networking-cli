@@ -57,8 +57,13 @@ respect them.
   full safety contract in §6.
 - **Arrows + Enter only, everywhere (owner rule, 2026-07-09; hardened
   2026-07-10).** Every user-facing action on every screen must be a visible,
-  focusable element (list item or button) reachable with ↑/↓/tab and activated
-  with Enter. Keyboard shortcuts were removed entirely on 2026-07-10 — no
+  focusable element (list item or button) reachable with the arrow keys alone
+  and activated with Enter. Bare arrows move focus between widgets once the
+  focused one is done with the key (`tui.focus_nav`, mixed into `BaseScreen`):
+  lists/tables keep ↑/↓ until the cursor hits their edge, single-line inputs
+  keep only ←/→ for the caret, a closed `Select` opens on Enter (not ↑/↓),
+  and an open dropdown keeps every arrow. Tab still works but is never
+  required. Keyboard shortcuts were removed entirely on 2026-07-10 — no
   letter accelerators, no ctrl-chords, no home number keys, no `q` (quit is a
   double-`esc` guard on the home screen). The built-in `ctrl+p` command
   palette stays functional but unadvertised. A screen with no on-screen

@@ -55,9 +55,8 @@ class CampaignsScreen(BaseScreen):
     SCREEN_TITLE = "Campaigns"
 
     HINTS = (
-        ("↑↓", "rows"),
+        ("↑↓", "move"),
         ("enter", "open"),
-        ("tab", "buttons"),
         ("esc", "back"),
     )
 

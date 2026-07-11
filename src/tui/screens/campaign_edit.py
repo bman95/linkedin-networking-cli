@@ -42,7 +42,7 @@ class CampaignEditScreen(CampaignFormScreen):
     STATUS_ID = "#edit-status"
 
     HINTS = (
-        ("tab", "fields"),
+        ("↑↓", "fields"),
         ("enter", "activate"),
         ("esc", "back"),
     )

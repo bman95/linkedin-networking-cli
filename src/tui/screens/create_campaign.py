@@ -50,7 +50,7 @@ class CreateCampaignScreen(CampaignFormScreen):
     STATUS_ID = "#create-status"
 
     HINTS = (
-        ("tab", "fields"),
+        ("↑↓", "fields"),
         ("enter", "activate"),
         ("esc", "back"),
     )

@@ -65,9 +65,8 @@ class DashboardScreen(BaseScreen):
     SCREEN_TITLE = "Dashboard"
 
     HINTS = (
-        ("↑↓", "rows"),
+        ("↑↓", "move"),
         ("enter", "open"),
-        ("tab", "buttons"),
         ("esc", "back"),
     )
 

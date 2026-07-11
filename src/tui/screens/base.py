@@ -18,6 +18,7 @@ from textual.app import ComposeResult
 from textual.screen import Screen
 from textual.widgets import Static
 
+from ..focus_nav import ArrowFocusMixin
 from .workers import WorkerGuardMixin
 
 # The app mark: a single LinkedIn-blue "in" chip. (An earlier two-tile variant
@@ -50,13 +51,15 @@ def hint_markup(hints: tuple[tuple[str, str], ...]) -> str:
     return "[$text-muted]" + "  ·  ".join(parts) + "[/]"
 
 
-class BaseScreen(WorkerGuardMixin, Screen):
+class BaseScreen(ArrowFocusMixin, WorkerGuardMixin, Screen):
     """A screen with the shared app frame: masthead, body hook, hint bar.
 
     Subclasses set ``SCREEN_TITLE`` and implement :meth:`compose_body` to yield
     their content; the brand masthead and hint bar are added automatically so the
-    chrome stays consistent and in one place. The mixin supplies the threaded-
-    worker guards (``begin_load`` / ``marshal`` / ``marshal_load``).
+    chrome stays consistent and in one place. The mixins supply the threaded-
+    worker guards (``begin_load`` / ``marshal`` / ``marshal_load``) and the
+    arrows-only focus movement (``tui.focus_nav``: bare arrows step between
+    widgets once the focused one is done with them, so Tab is never required).
     """
 
     # Back to the previous screen — surfaced in the hint bar. Quit lives only
