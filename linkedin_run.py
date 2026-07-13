@@ -83,7 +83,11 @@ def main(argv=None):
         print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        logger.error("Unhandled error in linkedin-run: %s", exc, exc_info=True)
+        # INFO, not ERROR: the console handler logs WARNING+ — an ERROR record
+        # with exc_info would dump the very traceback this guard exists to
+        # suppress. Keep the traceback in the file logs; the console stays
+        # clean (same convention as cli.runner's automation-phase guard).
+        logger.info("Unhandled error in linkedin-run: %s", exc, exc_info=True)
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

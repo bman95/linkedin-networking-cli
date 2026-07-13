@@ -146,6 +146,47 @@ class TestMainDispatch:
         assert rc == 130
         assert "Interrupted" in capsys.readouterr().err
 
+    def test_keyboard_interrupt_during_construction_exits_130(self, capsys):
+        """The guard wraps CampaignRunner() construction too — __init__ only
+        catches Exception, so a Ctrl-C during it must reach main()'s guard."""
+        with patch.object(
+            linkedin_run, "CampaignRunner", side_effect=KeyboardInterrupt()
+        ):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 130
+        assert "Interrupted" in capsys.readouterr().err
+
+    def test_db_error_through_real_runner_hits_the_guard(self, capsys):
+        """End-to-end through the real CampaignRunner: a non-ValueError from
+        the db layer during campaign resolution (issue #60's scenario — e.g. a
+        locked SQLite file, which DatabaseManager logs and re-raises) must
+        surface as the one-line ``Error: ...`` contract with exit 1, and no
+        traceback on either stream."""
+
+        class _LockedDB:
+            def get_campaign(self, campaign_id):
+                raise RuntimeError("database is locked")
+
+            def get_campaigns(self, active_only=True):
+                raise RuntimeError("database is locked")
+
+        def _real_runner():
+            runner = object.__new__(CampaignRunner)
+            runner.db_manager = _LockedDB()
+            runner.settings = _settings(valid=True)
+            return runner
+
+        with patch.object(
+            linkedin_run, "CampaignRunner", side_effect=_real_runner
+        ):
+            rc = linkedin_run.main(["--campaign", "1"])
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "Error: database is locked" in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+
 
 # ---------------------------------------------------------------------------
 # Campaign resolution — by id and by name
