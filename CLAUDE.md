@@ -132,11 +132,11 @@ generated per `LinkedInAutomation` instance): `start_browser` acquires it
 before `force_close_chrome`, so cleanup only ever kills *orphaned* Chrome from
 a crashed run. Acquisition is atomic (payload written to a temp file, claimed
 via `os.link`, retried on loss of a race — never a read-check-write), so two
-near-simultaneous starters can never both believe they hold it. A lock naming a live PID raises
-`BrowserProfileBusyError` (surfaced as a clean "profile in use" message)
-instead of killing a concurrent TUI/`linkedin-run` session; a dead-PID lock is
-stale and reclaimed. Reclaiming a *live* lock as "our own" additionally
-requires the token to match, not just the PID — so a second
+near-simultaneous starters can never both believe they hold it. A lock naming
+a live PID raises `BrowserProfileBusyError` (surfaced as a clean "profile in
+use" message) instead of killing a concurrent TUI/`linkedin-run` session; a
+dead-PID lock is stale and reclaimed. Reclaiming a *live* lock as "our own"
+additionally requires the token to match, not just the PID — so a second
 `LinkedInAutomation` instance in the same process (e.g. a concurrent TUI flow)
 is correctly treated as a foreign, live holder rather than silently killing a
 sibling run's Chrome. The lock is released in `close_browser`'s teardown, on a

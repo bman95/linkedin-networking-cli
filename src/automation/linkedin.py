@@ -301,8 +301,16 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
                 existing = _read_lock(lock_path)
                 if existing is not None:
                     existing_pid, existing_token = existing
-                    is_own = existing_pid == os.getpid() and existing_token == token
-                    if not is_own and _pid_is_alive(existing_pid):
+                    if existing_pid == os.getpid() and existing_token == token:
+                        # Already ours (e.g. _refresh_context reacquiring the
+                        # lock it held across its close+relaunch gap). Return
+                        # WITHOUT unlink+relink: the on-disk content is
+                        # already exactly what we would write, and dropping
+                        # the file even briefly would reopen the mid-gap
+                        # window where a concurrent run could claim the
+                        # profile out from under our still-live Chrome.
+                        return lock_path
+                    if _pid_is_alive(existing_pid):
                         raise BrowserProfileBusyError(
                             f"The browser profile at {user_data_dir!r} is "
                             f"already in use by process {existing_pid} (e.g. "
@@ -310,10 +318,9 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
                             "it to finish, or stop it, before starting a new "
                             "one."
                         ) from None
-                # Stale (dead-PID), malformed, or our own leftover — safe to
-                # clear. Retry the atomic claim rather than assuming we can
-                # just overwrite it: another caller may win the race in
-                # between.
+                # Stale (dead-PID) or malformed — safe to clear. Retry the
+                # atomic claim rather than assuming we can just overwrite it:
+                # another caller may win the race in between.
                 try:
                     lock_path.unlink(missing_ok=True)
                 except OSError as exc:
