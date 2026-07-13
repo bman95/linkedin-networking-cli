@@ -302,6 +302,17 @@ async def test_reentering_search_mode_reenables_stale_disabled_input(db_manager:
         screen.query_one("#field-location", Select).value = "Any"
         await pilot.pause()
 
+        # Switching back while the search is *genuinely* still in flight must
+        # keep the input disabled (and unfocused) — only a finished search
+        # unlocks it.
+        screen.query_one("#field-location", Select).value = SEARCH_ONLINE
+        await pilot.pause()
+        query_box = screen.query_one("#field-location-query", Input)
+        assert query_box.disabled
+        assert app.focused is not query_box
+        screen.query_one("#field-location", Select).value = "Any"
+        await pilot.pause()
+
         # The stale result lands and is dropped silently — input stays disabled.
         screen._search_done("Madrid", [MADRID, TOKYO], None)
         await pilot.pause()
