@@ -519,11 +519,11 @@ def _set_select(screen, selector: str, value: str | None, default: str, options)
     screen.query_one(selector, Select).value = value if value in options else default
 
 
-# The five fields fill_form_from_extraction can flag for review, plus the
+# The six fields fill_form_from_extraction can flag for review, plus the
 # hint Statics it can show — reset at the start of every run so a re-run
 # whose new description no longer mentions a field doesn't leave a stale
 # amber flag / "You said: …" hint from an earlier run.
-_FLAGGABLE_FIELDS = ("#field-daily", "#field-message",
+_FLAGGABLE_FIELDS = ("#field-keywords", "#field-daily", "#field-message",
                      "#field-location", "#field-industry", "#field-network")
 _HINT_SELECTORS = ("#hint-location", "#hint-industry", "#hint-network")
 
@@ -554,9 +554,9 @@ def fill_form_from_extraction(screen: CampaignFormScreen, result) -> tuple[int, 
     matched cleanly or only well enough to flag); ``flagged`` is the ordered
     list of field-id selectors it flagged for review (a fuzzy match that fell
     back to the default, a repaired ``{name}`` placeholder, a clamped daily
-    limit) — each flagged widget also gets the ``field-flagged`` CSS class,
-    cleared the moment the user edits it (see ``on_input_changed``/
-    ``on_select_changed`` above).
+    limit, deduped/location-stripped keywords) — each flagged widget also gets
+    the ``field-flagged`` CSS class, cleared the moment the user edits it (see
+    ``on_input_changed``/``on_select_changed`` above).
     """
     _clear_ai_flags(screen)
 
@@ -573,6 +573,9 @@ def fill_form_from_extraction(screen: CampaignFormScreen, result) -> tuple[int, 
     if data.keywords is not None:
         screen.query_one("#field-keywords", Input).value = data.keywords
         applied += 1
+        if "keywords" in result.flagged_fields:
+            flagged.append("#field-keywords")
+            screen._ai_filled_snapshot["#field-keywords"] = data.keywords
 
     if data.daily_limit is not None:
         value = str(data.daily_limit)

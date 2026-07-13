@@ -354,6 +354,39 @@ async def test_daily_limit_flag_persists_then_clears_on_genuine_edit(db_manager:
 
 
 @pytest.mark.unit
+async def test_cleaned_keywords_flag_persists_then_clears_on_genuine_edit(
+    db_manager: DatabaseManager,
+):
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        result = _result(
+            data=_extracted(name="Cleaned", keywords="data engineers"),
+            flagged={"keywords"},
+        )
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: result
+
+        panel.query_one("#ai-assist-input", TextArea).text = "data engineers in Berlin"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        await pilot.pause()
+
+        keywords = screen.query_one("#field-keywords", Input)
+        assert keywords.value == "data engineers"
+        assert keywords.has_class("field-flagged")
+
+        keywords.value = "data engineers, hand edited"
+        await pilot.pause()
+        assert keywords.has_class("field-flagged") is False
+
+
+@pytest.mark.unit
 async def test_rerun_preserves_hand_edited_fields_the_llm_did_not_mention(
     db_manager: DatabaseManager,
 ):

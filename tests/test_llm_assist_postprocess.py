@@ -4,6 +4,7 @@ import pytest
 
 from llm_assist.postprocess import (
     clamp_daily_limit,
+    clean_keywords,
     has_foreign_placeholder,
     repair_name_placeholder,
 )
@@ -86,3 +87,57 @@ class TestClampDailyLimit:
 
     def test_negative_is_clamped_and_flagged(self):
         assert clamp_daily_limit(-10) == (1, True)
+
+
+@pytest.mark.unit
+class TestCleanKeywords:
+    def test_none_is_untouched(self):
+        assert clean_keywords(None) == (None, False)
+
+    def test_clean_input_is_unflagged(self):
+        text = "data engineers, python, kubernetes"
+        assert clean_keywords(text) == (text, False)
+
+    def test_drops_empty_entries(self):
+        cleaned, flagged = clean_keywords("data engineers, , python,")
+        assert cleaned == "data engineers, python"
+        assert flagged is True
+
+    def test_trims_whitespace_around_terms(self):
+        cleaned, flagged = clean_keywords("  data engineers ,  python  ")
+        assert cleaned == "data engineers, python"
+        assert flagged is True
+
+    def test_dedupes_case_insensitively_preserving_first_occurrence(self):
+        cleaned, flagged = clean_keywords("Berlin, python, berlin, PYTHON")
+        assert cleaned == "Berlin, python"
+        assert flagged is True
+
+    def test_drops_terms_that_duplicate_location_text_tokens(self):
+        # Regression case from issue #68: the model leaked "Berlin, Germany"
+        # into keywords despite the prompt saying keywords aren't locations.
+        cleaned, flagged = clean_keywords(
+            "data engineers, Berlin, Germany, technology, data, engineers, "
+            "skills, technical, network, connections, Berlin, Germany",
+            location_text="Berlin",
+        )
+        assert cleaned == (
+            "data engineers, Germany, technology, data, engineers, skills, "
+            "technical, network, connections"
+        )
+        assert flagged is True
+
+    def test_no_location_text_leaves_location_like_terms_alone(self):
+        text = "data engineers, Berlin"
+        assert clean_keywords(text, location_text=None) == (text, False)
+
+    def test_all_terms_dropped_yields_none(self):
+        cleaned, flagged = clean_keywords("Berlin, Germany", location_text="Berlin, Germany")
+        assert cleaned is None
+        assert flagged is True
+
+    def test_multi_word_terms_are_not_dropped_by_single_word_location_tokens(self):
+        text = "data engineers, python"
+        cleaned, flagged = clean_keywords(text, location_text="Berlin")
+        assert cleaned == text
+        assert flagged is False

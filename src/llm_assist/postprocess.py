@@ -57,3 +57,42 @@ def clamp_daily_limit(value: int | None) -> tuple[int | None, bool]:
         return None, False
     clamped = max(1, min(100, value))
     return clamped, clamped != value
+
+
+def clean_keywords(
+    keywords: str | None, location_text: str | None = None
+) -> tuple[str | None, bool]:
+    """Deterministically clean a comma-separated keywords string.
+
+    Small local models routinely return noisy keyword lists despite the
+    prompt's explicit instructions: exact-or-recased duplicates, stray
+    whitespace/empty entries, and terms that just repeat ``location_text``
+    (the prompt already tells the model "not locations — location_text
+    covers those", but 1-4B models ignore it). None of this needs another
+    model call: split on commas, trim, drop empties, case-insensitively
+    dedupe keeping the first occurrence, then drop any term that is itself
+    one of ``location_text``'s whitespace/punctuation-separated tokens.
+    Returns the rejoined string (``None`` if nothing survives) and whether
+    the input actually changed.
+    """
+    if keywords is None:
+        return None, False
+
+    location_tokens = {
+        token.lower() for token in re.split(r"\W+", location_text or "") if token
+    }
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw_term in keywords.split(","):
+        term = raw_term.strip()
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen or key in location_tokens:
+            continue
+        seen.add(key)
+        cleaned.append(term)
+
+    result = ", ".join(cleaned) if cleaned else None
+    return result, result != keywords
