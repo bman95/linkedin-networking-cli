@@ -221,8 +221,15 @@ class TestMainDispatch:
         assert "[SQL:" not in captured.err
         assert "Traceback" not in captured.err
         assert "Traceback" not in captured.out
-        # The "log" half of the contract: the traceback lands in the logger.
+        # The "log" half of the contract: the traceback lands in the logger,
+        # and a one-line ERROR record (no exc_info, so no console traceback)
+        # carries the failure signal into the dedicated errors.log.
         assert any(r.exc_info for r in caplog.records)
+        error_records = [
+            r for r in caplog.records if r.levelno >= logging.ERROR
+        ]
+        assert error_records
+        assert all(not r.exc_info for r in error_records)
 
 
 # ---------------------------------------------------------------------------

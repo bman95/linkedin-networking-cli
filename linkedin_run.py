@@ -83,10 +83,6 @@ def main(argv=None):
         print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
-        # INFO, not ERROR: the console handler logs WARNING+ — an ERROR record
-        # with exc_info would dump the very traceback this guard exists to
-        # suppress. Keep the traceback in the file logs; the console stays
-        # clean (same convention as cli.runner's automation-phase guard).
         # A last-line-of-defense guard must survive hostile exceptions too: a
         # third-party exception whose __str__ raises would crash the guard
         # itself, so compute a safe detail string once and hand only that to
@@ -96,11 +92,20 @@ def main(argv=None):
             detail = str(exc).strip() or exc.__class__.__name__
         except Exception:
             detail = exc.__class__.__name__
-        logger.info("Unhandled error in linkedin-run: %s", detail, exc_info=True)
         # Some exception texts span several lines (SQLAlchemy appends the
-        # statement and a docs link) — keep the stderr contract to one line;
-        # the full detail is already in the file logs.
-        print(f"Error: {detail.splitlines()[0]}", file=sys.stderr)
+        # statement and a docs link) — the console-facing surfaces (stderr and
+        # the ERROR record below, which the console handler also prints) stay
+        # one line; the full detail is kept in the file logs.
+        first_line = detail.splitlines()[0]
+        # Two records on purpose. The one-line ERROR (no exc_info) reaches the
+        # dedicated errors.log so monitoring of unattended runs keeps its
+        # failure signal; the traceback rides an INFO record into the main log
+        # only — an ERROR with exc_info would dump the very traceback this
+        # guard exists to suppress through the WARNING-level console handler
+        # (same reasoning as cli.runner's automation-phase guard).
+        logger.error("linkedin-run failed: %s", first_line)
+        logger.info("Unhandled error in linkedin-run: %s", detail, exc_info=True)
+        print(f"Error: {first_line}", file=sys.stderr)
         return 1
 
 
