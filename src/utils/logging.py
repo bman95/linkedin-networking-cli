@@ -64,6 +64,13 @@ class LoggerSetup:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(console_level)
             console_handler.setFormatter(simple_formatter)
+            # Per-record console opt-out: log with extra={"console": False} to
+            # keep a record in the file logs (e.g. errors.log) without echoing
+            # it to stdout — entry points that own their stdout/stderr
+            # contract (linkedin-run) report failures on stderr themselves.
+            console_handler.addFilter(
+                lambda record: getattr(record, "console", True)
+            )
             root_logger.addHandler(console_handler)
 
         # File handlers

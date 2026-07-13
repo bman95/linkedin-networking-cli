@@ -97,13 +97,17 @@ def main(argv=None):
         # the ERROR record below, which the console handler also prints) stay
         # one line; the full detail is kept in the file logs.
         first_line = detail.splitlines()[0]
-        # Two records on purpose. The one-line ERROR (no exc_info) reaches the
-        # dedicated errors.log so monitoring of unattended runs keeps its
-        # failure signal; the traceback rides an INFO record into the main log
-        # only — an ERROR with exc_info would dump the very traceback this
-        # guard exists to suppress through the WARNING-level console handler
-        # (same reasoning as cli.runner's automation-phase guard).
-        logger.error("linkedin-run failed: %s", first_line)
+        # Two records on purpose, both kept off the console (stdout carries
+        # progress only; the failure goes to stderr via the print below). The
+        # one-line ERROR (no exc_info) reaches the dedicated errors.log so
+        # monitoring of unattended runs keeps its failure signal — it opts out
+        # of the console handler, which would otherwise echo it to stdout.
+        # The traceback rides an INFO record into the main log only — an
+        # ERROR with exc_info would dump the very traceback this guard exists
+        # to suppress (same reasoning as cli.runner's automation-phase guard).
+        logger.error(
+            "linkedin-run failed: %s", first_line, extra={"console": False}
+        )
         logger.info("Unhandled error in linkedin-run: %s", detail, exc_info=True)
         print(f"Error: {first_line}", file=sys.stderr)
         return 1
