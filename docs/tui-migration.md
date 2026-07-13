@@ -91,7 +91,7 @@ side effects); write and automation flows follow.
 | Execute Campaign | `CampaignDetailScreen` → **Run now** (embedded `AutomationRunPanel`) | `LinkedInAutomation.search_and_connect`, Playwright | browser, network, sends | **done** (issue #42: folded into the campaign detail; user-initiated run) |
 | Check Connections | `CampaignDetailScreen` → **Check acceptances** (embedded `AutomationRunPanel`) | `smart_connection_checker` | browser, network | **done** (issue #42: folded into the campaign detail, smart checker only; issue #45 removed the direct per-profile checker everywhere. The classic CLI's "check all campaigns" convenience — looping the same per-campaign checker across every campaign with pending connections in one action — was not ported: it was judged redundant with checking each campaign in turn, and dropped in the issue #47 cutover rather than kept classic-CLI-only) |
 | Extract Profile Data | — | `extract_detailed_profile` | browser, network | **removed entirely (issue #44 removed it from the TUI; the issue #47 cutover deleted the classic CLI's copy too)**. Pending the Voyager rework, see `DESIGN-PROPOSALS.md` §6 |
-| Exit | key binding (`q`) / command palette | — | — | done |
+| Exit | double-`esc` guard (home screen) / command palette | — | — | done |
 
 ## 4. Flow-by-flow migration order, with rationale
 
