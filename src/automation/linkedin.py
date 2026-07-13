@@ -528,10 +528,11 @@ class LinkedInAutomation:
         session is still believed healthy (``is_authenticated``) — persistent
         runs included — so a later transient run can resume the session a
         persistent run established. ``close_browser`` skips the write when no
-        authenticated session was confirmed, when the session was compromised
-        mid-run (a detected CAPTCHA/checkpoint/logout), or when the page is
-        sitting on a login/challenge URL at close — so a degraded context never
-        clobbers a still-good ``session.json``.
+        authenticated session was confirmed this run (including one compromised
+        mid-run by a detected CAPTCHA/checkpoint/logout, which clears
+        ``is_authenticated``), and as a belt-and-braces also skips it when the
+        page is sitting on a login/challenge URL at close — so a degraded
+        context never clobbers a still-good ``session.json``.
         """
         self.playwright = await async_playwright().start()
         browser_settings = self.settings.get_browser_settings()
