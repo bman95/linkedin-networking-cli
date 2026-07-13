@@ -123,6 +123,24 @@ class LLMClient:
         except (KeyError, TypeError) as exc:
             raise LLMResponseError("Couldn't read the model list from the endpoint.") from exc
 
+    def is_model_available(self, model: str) -> bool:
+        """Whether ``model`` is installed, tolerating Ollama's ``name:tag`` form.
+
+        ``/api/tags`` always returns fully qualified entries (e.g.
+        ``gemma3:latest``), but callers commonly configure an untagged model
+        name (``LLM_MODEL=gemma3``, or the *Custom…* input). Without this,
+        an untagged config reads as "not installed" and arms a multi-gigabyte
+        re-pull of a model Ollama would already resolve and serve.
+        """
+        available = self.list_models()
+        if model in available:
+            return True
+        if ":" in model:
+            return False
+        return f"{model}:latest" in available or any(
+            name.partition(":")[0] == model for name in available
+        )
+
     # ── model pull (local/Ollama only) ──────────────────────────────────
 
     def pull_model(

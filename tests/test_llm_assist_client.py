@@ -214,6 +214,41 @@ class TestListModels:
 
 
 @pytest.mark.unit
+class TestIsModelAvailable:
+    def test_exact_match(self):
+        client = LLMClient(_config())
+        body = {"models": [{"name": "gemma3:latest"}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            assert client.is_model_available("gemma3:latest") is True
+
+    def test_untagged_config_matches_latest_tag(self):
+        # LLM_MODEL=gemma3 while Ollama reports "gemma3:latest" — must not
+        # read as "not installed" and arm a needless re-pull.
+        client = LLMClient(_config())
+        body = {"models": [{"name": "gemma3:latest"}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            assert client.is_model_available("gemma3") is True
+
+    def test_untagged_config_matches_any_installed_tag(self):
+        client = LLMClient(_config())
+        body = {"models": [{"name": "gemma3:4b"}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            assert client.is_model_available("gemma3") is True
+
+    def test_tagged_config_does_not_match_a_different_tag(self):
+        client = LLMClient(_config())
+        body = {"models": [{"name": "gemma3:1b"}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            assert client.is_model_available("gemma3:4b") is False
+
+    def test_not_installed_at_all(self):
+        client = LLMClient(_config())
+        body = {"models": [{"name": "llama3:latest"}]}
+        with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
+            assert client.is_model_available("gemma3") is False
+
+
+@pytest.mark.unit
 class TestPullModel:
     def test_streams_progress_events(self):
         client = LLMClient(_config())

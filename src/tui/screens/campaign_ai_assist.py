@@ -219,7 +219,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         if llm_settings.get("mode") != "local":
             return True
         client = self._build_client(llm_settings, model)
-        return model in client.list_models()
+        return client.is_model_available(model)
 
     def perform_pull(
         self, llm_settings: dict[str, Any], model: str, on_progress, should_stop
