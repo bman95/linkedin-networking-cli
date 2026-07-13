@@ -122,6 +122,30 @@ class TestMainDispatch:
             linkedin_run.main(["--help"])
         assert excinfo.value.code == 0
 
+    def test_unexpected_exception_prints_one_liner_and_exits_nonzero(self, capsys):
+        """A non-ValueError raised anywhere in run_noninteractive (e.g. a
+        locked/corrupt SQLite database, which DatabaseManager logs and
+        re-raises rather than swallows) must not leak a raw traceback — it
+        should hit the same one-line ``Error: ...`` contract as every other
+        failure path."""
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = RuntimeError("database is locked")
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc != 0
+        assert rc != 130
+        assert "Error: database is locked" in capsys.readouterr().err
+
+    def test_keyboard_interrupt_exits_130(self, capsys):
+        """Ctrl-C during a scheduled run should exit with the conventional
+        130, not an interpreter-default traceback."""
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = KeyboardInterrupt()
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 130
+        assert "Interrupted" in capsys.readouterr().err
+
 
 # ---------------------------------------------------------------------------
 # Campaign resolution — by id and by name

@@ -14,11 +14,13 @@ import argparse
 import sys
 
 # Initialize logging system first
-from utils.logging import LoggerSetup
+from utils.logging import LoggerSetup, get_logger
 
 LoggerSetup.setup()
 
 from cli.runner import CampaignRunner
+
+logger = get_logger(__name__)
 
 
 def _positive_int(value):
@@ -64,9 +66,26 @@ def main(argv=None):
     """Parse args and run the campaign non-interactively.
 
     Returns a process exit code (0 on success, non-zero on failure).
+
+    Argument parsing (``--help``, missing/invalid args) is left to raise its
+    own ``SystemExit`` uncaught — that is argparse's normal, intentional exit
+    path. Everything after parsing is guarded: an unexpected exception (e.g. a
+    locked/corrupt SQLite database, which ``DatabaseManager`` logs and
+    re-raises rather than swallows) would otherwise print a raw Python
+    traceback instead of the one-line ``Error: ...`` contract the rest of the
+    runner uses, and a Ctrl-C during a scheduled run would otherwise exit with
+    an interpreter-default code instead of the conventional 130.
     """
     args = _build_parser().parse_args(argv)
-    return CampaignRunner().run_noninteractive(args.campaign, args.max)
+    try:
+        return CampaignRunner().run_noninteractive(args.campaign, args.max)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        logger.error("Unhandled error in linkedin-run: %s", exc, exc_info=True)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
