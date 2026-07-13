@@ -132,6 +132,14 @@ class TestExtractCampaignFieldsFlagging:
         assert result.data.keywords == "data engineers, python"
         assert "keywords" not in result.flagged_fields
 
+    def test_keywords_that_are_pure_noise_collapse_to_none_and_stay_flagged(self):
+        client = _FakeClient(
+            [_payload(keywords="Berlin, Germany", location_text="Berlin, Germany")]
+        )
+        result = extract_campaign_fields("desc", client)
+        assert result.data.keywords is None
+        assert "keywords" in result.flagged_fields
+
 
 @pytest.mark.unit
 class TestExtractCampaignFieldsRepair:

@@ -576,6 +576,13 @@ def fill_form_from_extraction(screen: CampaignFormScreen, result) -> tuple[int, 
         if "keywords" in result.flagged_fields:
             flagged.append("#field-keywords")
             screen._ai_filled_snapshot["#field-keywords"] = data.keywords
+    elif "keywords" in result.flagged_fields:
+        # The model DID emit keywords, but the cleanup dropped every term as
+        # noise (duplicates / location echoes) — nothing usable to apply, so
+        # any existing value is left alone, but the field is still flagged so
+        # the user knows the AI had nothing usable for it. No snapshot entry:
+        # the value never changed, so any Changed event is a genuine edit.
+        flagged.append("#field-keywords")
 
     if data.daily_limit is not None:
         value = str(data.daily_limit)

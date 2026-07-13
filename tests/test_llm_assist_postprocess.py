@@ -127,6 +127,30 @@ class TestCleanKeywords:
         )
         assert flagged is True
 
+    def test_whole_location_phrase_copied_as_one_term_is_dropped(self):
+        # The most natural leak: the model repeats the location verbatim as a
+        # single comma-separated entry, not exploded into per-word entries.
+        cleaned, flagged = clean_keywords(
+            "San Francisco Bay Area, Python, Software Engineer",
+            location_text="San Francisco Bay Area",
+        )
+        assert cleaned == "Python, Software Engineer"
+        assert flagged is True
+
+    def test_comma_segment_of_location_is_dropped(self):
+        cleaned, flagged = clean_keywords(
+            "New York, recruiter", location_text="New York, NY"
+        )
+        assert cleaned == "recruiter"
+        assert flagged is True
+
+    def test_punctuation_variant_of_location_phrase_is_dropped(self):
+        cleaned, flagged = clean_keywords(
+            "Berlin - Germany, python", location_text="Berlin, Germany"
+        )
+        assert cleaned == "python"
+        assert flagged is True
+
     def test_no_location_text_leaves_location_like_terms_alone(self):
         text = "data engineers, Berlin"
         assert clean_keywords(text, location_text=None) == (text, False)

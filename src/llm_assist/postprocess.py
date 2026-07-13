@@ -1,6 +1,6 @@
 """Deterministic fixups applied to a parsed :class:`ExtractedCampaign`.
 
-Cheap, rule-based corrections for the two failure modes small models hit most
+Cheap, rule-based corrections for the failure modes small models hit most
 often on these specific fields — never round-tripped back through the LLM.
 """
 
@@ -70,26 +70,44 @@ def clean_keywords(
     (the prompt already tells the model "not locations — location_text
     covers those", but 1-4B models ignore it). None of this needs another
     model call: split on commas, trim, drop empties, case-insensitively
-    dedupe keeping the first occurrence, then drop any term that is itself
-    one of ``location_text``'s whitespace/punctuation-separated tokens.
-    Returns the rejoined string (``None`` if nothing survives) and whether
-    the input actually changed.
+    dedupe keeping the first occurrence, then drop any term that echoes
+    ``location_text`` — a single one of its words ("Berlin"), one of its
+    comma-separated segments ("New York"), or the whole phrase copied
+    verbatim ("San Francisco Bay Area"). The single-word check can
+    false-positive on a legitimate keyword that happens to equal a location
+    word; the mandatory review step (the field is flagged whenever cleanup
+    changed anything) is the backstop for that inherent tradeoff. Returns
+    the rejoined string (``None`` if nothing survives) and whether the
+    input actually changed.
     """
     if keywords is None:
         return None, False
 
-    location_tokens = {
-        token.lower() for token in re.split(r"\W+", location_text or "") if token
-    }
+    location = (location_text or "").lower()
+    # Single words ("berlin", "germany") …
+    location_terms = {token for token in re.split(r"\W+", location) if token}
+    # … comma-separated segments ("new york") …
+    location_terms.update(
+        segment for segment in (" ".join(s.split()) for s in location.split(",")) if segment
+    )
+    # … and the whole phrase, punctuation-normalized ("san francisco bay area").
+    whole = " ".join(token for token in re.split(r"\W+", location) if token)
+    if whole:
+        location_terms.add(whole)
 
     seen: set[str] = set()
     cleaned: list[str] = []
     for raw_term in keywords.split(","):
-        term = raw_term.strip()
+        term = " ".join(raw_term.split())
         if not term:
             continue
         key = term.lower()
-        if key in seen or key in location_tokens:
+        if key in seen or key in location_terms:
+            continue
+        # Punctuation-normalized only for the location check ("Berlin -
+        # Germany" still matches the whole phrase); the dedupe key above
+        # stays exact so "C++" never collides with "C".
+        if " ".join(token for token in re.split(r"\W+", key) if token) in location_terms:
             continue
         seen.add(key)
         cleaned.append(term)

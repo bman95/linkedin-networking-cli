@@ -387,6 +387,44 @@ async def test_cleaned_keywords_flag_persists_then_clears_on_genuine_edit(
 
 
 @pytest.mark.unit
+async def test_pure_noise_keywords_flag_the_field_without_overwriting_it(
+    db_manager: DatabaseManager,
+):
+    """When the cleanup drops every extracted keyword as noise (keywords is
+    None but "keywords" is flagged), the field keeps its existing value and
+    still gets the amber flag — the flag must not be silently swallowed by
+    the "None means unmentioned" guard."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        screen.query_one("#field-keywords", Input).value = "hand typed keywords"
+
+        result = _result(data=_extracted(name="Noise"), flagged={"keywords"})
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: result
+
+        panel.query_one("#ai-assist-input", TextArea).text = "people in Berlin, Germany"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        await pilot.pause()
+
+        keywords = screen.query_one("#field-keywords", Input)
+        assert keywords.value == "hand typed keywords"
+        assert keywords.has_class("field-flagged")
+
+        # A genuine edit still clears the flag (no snapshot entry exists, so
+        # the first Changed event is treated as the user's own).
+        keywords.value = "python"
+        await pilot.pause()
+        assert keywords.has_class("field-flagged") is False
+
+
+@pytest.mark.unit
 async def test_rerun_preserves_hand_edited_fields_the_llm_did_not_mention(
     db_manager: DatabaseManager,
 ):
