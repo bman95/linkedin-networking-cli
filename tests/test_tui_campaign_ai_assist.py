@@ -723,6 +723,57 @@ async def test_hosted_mode_missing_api_key_is_blocked_before_any_call(
         assert calls == []
 
 
+@pytest.mark.unit
+async def test_hosted_consent_gate_fails_closed_when_db_manager_unavailable(
+    db_manager: DatabaseManager, monkeypatch
+):
+    """Issue #63: a degraded app (DatabaseManager init failed, e.g. read-only
+    home) must still require the privacy confirmation before a hosted-mode
+    send — not skip the gate because consent can't be persisted."""
+    monkeypatch.setenv("LLM_API_KEY", "sk-test")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+    app = LinkedInTUI(db_manager=db_manager)
+    app.db_manager = None
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+        assert panel._db_manager is None
+
+        calls = []
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: calls.append(1) or _result(
+            data=_extracted(name="Hosted")
+        )
+
+        panel.query_one("#ai-assist-input", TextArea).text = "recruiters in NYC"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await pilot.pause()
+
+        # Gate shown, no call made yet.
+        notice = panel.query_one("#ai-assist-privacy-notice")
+        assert notice.display is True
+        assert calls == []
+
+        # Confirming runs the extraction (consent can't be persisted, so it
+        # can't be skipped on a later run either — see below).
+        confirm_bar = panel.query_one("#ai-assist-privacy-confirm")
+        confirm_bar.query_one(".confirm-yes", Button).focus()
+        await pilot.press("enter")
+        assert await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        assert calls == [1]
+
+        # A fresh run still shows the notice: nothing was persisted.
+        panel.query_one("#ai-assist-input", TextArea).text = "recruiters in SF"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await pilot.pause()
+        assert notice.display is True
+        assert calls == [1]
+
+
 # ── escape / leave mid-run ──────────────────────────────────────────────
 
 
