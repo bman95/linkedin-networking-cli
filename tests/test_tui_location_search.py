@@ -280,6 +280,62 @@ async def test_stale_search_result_does_not_reveal_or_steal_focus(db_manager: Da
 
 
 @pytest.mark.unit
+async def test_reentering_search_mode_reenables_stale_disabled_input(db_manager: DatabaseManager):
+    """Re-selecting "Search location online…" must re-enable the query input
+    even if it was left disabled by a search that completed after the user
+    had switched away (issue #61).
+
+    Sequence: start a search (disables the input) with Location on "Any"
+    (the user switched away mid-flight) → re-enter search mode while still
+    in flight (input must stay disabled, status says a search is running) →
+    back to "Any" → the stale result lands and is dropped without
+    re-enabling the input (`_search_done`'s stale guard) → switch back to
+    "Search location online…". The input must be enabled and focused, not
+    permanently disabled.
+    """
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        # In-flight search state, as `_start_location_search` leaves it. The
+        # Location select still sits on its default ("Any") — i.e. the user
+        # switched away while the search runs — so no mode change is needed
+        # before the stale completion below.
+        screen._search_in_flight = True
+        screen.query_one("#field-location-query", Input).disabled = True
+
+        # Entering search mode while the search is *genuinely* still in
+        # flight must keep the input disabled (and unfocused), and say a
+        # search is running rather than invite input the field cannot take.
+        screen.query_one("#field-location", Select).value = SEARCH_ONLINE
+        await pilot.pause()
+        query_box = screen.query_one("#field-location-query", Input)
+        assert query_box.disabled
+        assert app.focused is not query_box
+        assert "still running" in str(
+            screen.query_one("#create-status", Static).render()
+        )
+        screen.query_one("#field-location", Select).value = "Any"
+        await pilot.pause()
+
+        # The stale result lands and is dropped silently — input stays disabled.
+        screen._search_done("Madrid", [MADRID, TOKYO], None)
+        await pilot.pause()
+        assert screen.query_one("#field-location-query", Input).disabled
+
+        # Re-entering the search mode must reset the disabled state and show
+        # the normal search prompt again.
+        screen.query_one("#field-location", Select).value = SEARCH_ONLINE
+        await pilot.pause()
+        query_box = screen.query_one("#field-location-query", Input)
+        assert not query_box.disabled
+        assert app.focused is query_box
+        assert "Type a location" in str(
+            screen.query_one("#create-status", Static).render()
+        )
+
+
+@pytest.mark.unit
 async def test_search_requires_db_and_settings(db_manager: DatabaseManager):
     """A degraded app (no DB) refuses the online search with a clear message."""
     app = LinkedInTUI(db_manager=db_manager)

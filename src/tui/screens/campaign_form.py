@@ -277,11 +277,20 @@ class CampaignFormScreen(BaseScreen):
             self._show(_RESULT_IDS, False)
         self._show(_CUSTOM_IDS, value == CUSTOM_GEO)
         if searching:
-            self.query_one("#field-location-query", Input).focus()
-            self._set_status(
-                "Type a location and press enter to search LinkedIn "
-                "(opens a browser and logs in)."
-            )
+            query_input = self.query_one("#field-location-query", Input)
+            # Re-entering this mode must not inherit a stale `disabled` left
+            # behind by a search that finished after the user had switched
+            # away (see `_search_done`'s stale-search guard) — only a search
+            # that is genuinely still running should keep the field disabled.
+            query_input.disabled = self._search_in_flight
+            if query_input.disabled:
+                self._set_status("A location search is still running…")
+            else:
+                query_input.focus()
+                self._set_status(
+                    "Type a location and press enter to search LinkedIn "
+                    "(opens a browser and logs in)."
+                )
         elif value == CUSTOM_GEO:
             self.query_one("#field-location-geourn", Input).focus()
             self._set_status(
