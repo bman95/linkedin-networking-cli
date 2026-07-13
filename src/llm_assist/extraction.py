@@ -82,7 +82,7 @@ def extract_campaign_fields(
     )
 
     flagged: set[str] = set()
-    if template_flagged:
+    if template_flagged or postprocess.has_foreign_placeholder(message_template):
         flagged.add("message_template")
     if daily_limit_flagged:
         flagged.add("daily_limit")

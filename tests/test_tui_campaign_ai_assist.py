@@ -175,6 +175,9 @@ async def test_happy_path_prefills_unflagged_fields_and_focuses_name(db_manager:
         # the old "8 - len(flagged)" formula miscounted unmentioned fields as
         # filled since they're never flagged either).
         assert "Filled 6 of 8" in str(screen.query_one("#create-status", Static).render())
+        # The panel folds back to its toggle so the filled form is what the
+        # user is looking at, with focus handed to the form for review.
+        assert panel.query_one("#ai-assist-body").display is False
         assert app.focused is screen.query_one("#field-name", Input)
 
 
@@ -415,9 +418,12 @@ async def test_rerun_clears_stale_flag_and_hint_when_no_longer_mentioned(
         assert "Atlantis" in str(hint.render())
 
         # Re-run: this time neither daily_limit nor the location is mentioned.
+        # The successful first run folded the panel away, so re-expand it the
+        # way a user would before running again.
         second = _result(data=_extracted(name="Second Pass"))
         panel.perform_extraction = lambda *a, **k: second
 
+        await press_button(pilot, panel, "#ai-assist-toggle")
         panel.query_one("#ai-assist-input", TextArea).text = "software engineers"
         await pilot.pause()
         await press_button(pilot, panel, "#ai-assist-run")
@@ -475,6 +481,9 @@ async def test_extraction_error_leaves_the_manual_form_usable(db_manager: Databa
         await pilot.pause()
 
         assert "Can't reach" in status_text(panel)
+        # Nothing was applied, so the panel stays open with its error visible
+        # (it only folds away after a successful fill).
+        assert panel.query_one("#ai-assist-body").display is True
         assert screen.query_one("#field-name", Input).value == ""
 
         screen.query_one("#field-name", Input).value = "Manual fallback"

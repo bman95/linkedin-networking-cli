@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from llm_assist import prompts
 from llm_assist.errors import LLMAssistCancelled, LLMResponseError
 from llm_assist.extraction import _parse, extract_campaign_fields
 
@@ -66,6 +67,20 @@ class TestExtractCampaignFieldsHappyPath:
 
 
 @pytest.mark.unit
+class TestPromptContract:
+    def test_system_prompt_demands_a_complete_form_draft(self):
+        """The model must draft name/description/keywords/message_template
+        even when the description doesn't state them (the form has no useful
+        defaults for those), and the template must carry the literal {name}
+        placeholder read_form validates."""
+        system = prompts.extraction_messages("desc")[0]["content"]
+        assert "ALWAYS fill" in system
+        for field in ("name:", "description:", "keywords:", "message_template:"):
+            assert field in system
+        assert "{name}" in system
+
+
+@pytest.mark.unit
 class TestExtractCampaignFieldsFlagging:
     def test_unmatched_location_is_flagged(self):
         client = _FakeClient([_payload(location_text="Nowhereland")])
@@ -79,6 +94,16 @@ class TestExtractCampaignFieldsFlagging:
         result = extract_campaign_fields("desc", client)
         assert result.data.message_template == "Hi {name}, connect?"
         assert "message_template" in result.flagged_fields
+
+    def test_foreign_placeholder_in_template_is_flagged(self):
+        client = _FakeClient(
+            [_payload(message_template="Hi {name}, saw your work at {company}!")]
+        )
+        result = extract_campaign_fields("desc", client)
+        # {company} is never substituted at send time — flag for review, but
+        # don't rewrite: only the user knows what they meant.
+        assert "message_template" in result.flagged_fields
+        assert result.data.message_template == "Hi {name}, saw your work at {company}!"
 
     def test_out_of_range_daily_limit_is_clamped_and_flagged(self):
         client = _FakeClient([_payload(daily_limit=500)])

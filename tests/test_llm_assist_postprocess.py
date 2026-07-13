@@ -2,7 +2,11 @@
 
 import pytest
 
-from llm_assist.postprocess import clamp_daily_limit, repair_name_placeholder
+from llm_assist.postprocess import (
+    clamp_daily_limit,
+    has_foreign_placeholder,
+    repair_name_placeholder,
+)
 
 
 @pytest.mark.unit
@@ -42,6 +46,24 @@ class TestRepairNamePlaceholder:
         repaired, flagged = repair_name_placeholder("[name] met [name] again")
         assert repaired == "{name} met [name] again"
         assert flagged is True
+
+
+@pytest.mark.unit
+class TestHasForeignPlaceholder:
+    def test_none_is_clean(self):
+        assert has_foreign_placeholder(None) is False
+
+    def test_name_only_is_clean(self):
+        assert has_foreign_placeholder("Hi {name}, let's connect!") is False
+
+    def test_plain_text_is_clean(self):
+        assert has_foreign_placeholder("Hi there, let's connect!") is False
+
+    def test_invented_brace_placeholder_is_flagged(self):
+        assert has_foreign_placeholder("Hi {name}, saw your work at {company}!") is True
+
+    def test_invented_bracket_placeholder_is_flagged(self):
+        assert has_foreign_placeholder("Hi {name}, love [startup name]!") is True
 
 
 @pytest.mark.unit

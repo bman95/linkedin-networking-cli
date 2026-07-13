@@ -443,6 +443,18 @@ class TestEdgeCases:
         ids = [id for _, id in INDUSTRY_CHOICES if id]  # Exclude "Any"
         assert len(ids) == len(set(ids)), "Duplicate IDs found in INDUSTRY_CHOICES"
 
+    @pytest.mark.parametrize("mapping_name,mapping", [
+        ("LOCATION_MAPPING", LOCATION_MAPPING),
+        ("INDUSTRY_MAPPING", INDUSTRY_MAPPING),
+        ("COMMON_COMPANIES", COMMON_COMPANIES),
+    ])
+    def test_mapping_codes_are_unique(self, mapping_name, mapping):
+        """Two names sharing one code means at least one of them is wrong."""
+        codes = list(mapping.values())
+        dupes = {c: [n for n, v in mapping.items() if v == c]
+                 for c in codes if codes.count(c) > 1}
+        assert not dupes, f"Duplicate codes in {mapping_name}: {dupes}"
+
     def test_location_mapping_consistency_with_choices(self):
         """Test that LOCATION_MAPPING is consistent with LOCATION_CHOICES."""
         for name, urn in LOCATION_CHOICES:

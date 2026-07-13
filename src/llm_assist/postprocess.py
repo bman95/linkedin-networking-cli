@@ -33,6 +33,24 @@ def repair_name_placeholder(template: str | None) -> tuple[str | None, bool]:
     return repaired, True
 
 
+# Any brace/bracket placeholder that is not exactly "{name}" — e.g. an
+# invented {company} or {startup_name}. Checked after repair_name_placeholder,
+# so recognizable {name} variants have already been normalized away.
+_FOREIGN_PLACEHOLDER_RE = re.compile(r"[{\[](?!name[}\]])[^{}\[\]]+[}\]]")
+
+
+def has_foreign_placeholder(template: str | None) -> bool:
+    """True when the template carries a placeholder other than ``{name}``.
+
+    Only ``{name}`` is ever substituted at send time; anything else a model
+    invents would go out literally in a real connection request, so the
+    caller flags the field for the user's review.
+    """
+    if template is None:
+        return False
+    return _FOREIGN_PLACEHOLDER_RE.search(template) is not None
+
+
 def clamp_daily_limit(value: int | None) -> tuple[int | None, bool]:
     """Clamp to the form's [1, 100] bound; flag if clamping changed it."""
     if value is None:

@@ -261,6 +261,16 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             event.stop()
             self._show_manual_command()
 
+    def collapse(self) -> None:
+        """Fold the panel back to its toggle button (the description is kept).
+
+        Called by the host screen once an extraction has been applied, so the
+        freshly filled form — not the panel — is what the user is looking at;
+        re-expanding via the toggle (description intact) allows a re-run.
+        """
+        self._expanded = False
+        self.query_one("#ai-assist-body").display = False
+
     def _toggle(self) -> None:
         self._expanded = not self._expanded
         self.query_one("#ai-assist-body").display = self._expanded

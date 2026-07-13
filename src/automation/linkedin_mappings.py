@@ -4,7 +4,7 @@ LinkedIn Mappings - Constants for LinkedIn search parameters
 This module contains mappings between human-readable values and LinkedIn's
 internal IDs/URNs for various search parameters.
 
-Last updated: 2025-11-12
+Last updated: 2026-07-11
 """
 
 
@@ -17,6 +17,10 @@ Last updated: 2025-11-12
 # built-in online lookup (Settings -> "Look up location code (online)", backed
 # by LinkedInAutomation.search_location) or paste a custom geoUrn via the
 # "Other (enter custom geoUrn)" option when creating/editing a campaign.
+# Entries whose codes collided with another city's (proof that at least one
+# of the pair was wrong) were removed 2026-07-11: Vienna, Lisbon, Copenhagen,
+# Nairobi, Beijing, Shanghai, Johannesburg, Cape Town. Re-add them via the
+# online lookup.
 
 LOCATION_MAPPING: dict[str, str] = {
     # === VERIFIED LOCATIONS ===
@@ -83,24 +87,19 @@ LOCATION_MAPPING: dict[str, str] = {
     "Brussels, Belgium": "100472588",  # ❓
     "Madrid, Spain": "104506182",  # ❓
     "Barcelona, Spain": "100565514",  # ❓
-    "Zürich, Switzerland": "106693272",  # ❓
+    "Zürich, Switzerland": "106693272",  # ❓ code also claimed by removed Vienna entry — verify before trusting
     "Milan, Italy": "103350119",  # ❓
     "Rome, Italy": "103350364",  # ❓
-    "Stockholm, Sweden": "105117694",  # ❓
-    "Copenhagen, Denmark": "106808692",  # ❓
+    "Stockholm, Sweden": "105117694",  # ❓ code also claimed by removed Lisbon entry — verify before trusting
     "Dublin, Ireland": "104738515",  # ❓
-    "Vienna, Austria": "106693272",  # ❓
     "Warsaw, Poland": "105072130",  # ❓
     "Prague, Czech Republic": "104508036",  # ❓
-    "Lisbon, Portugal": "105117694",  # ❓
 
     # === ASIA-PACIFIC ===
     "Singapore": "102454443",  # ❓
     "Hong Kong": "102095887",  # ❓
     "Tokyo, Japan": "101490751",  # ❓
     "Seoul, South Korea": "106251556",  # ❓
-    "Beijing, China": "102890883",  # ❓
-    "Shanghai, China": "102890883",  # ❓
     "Bangalore, India": "105214831",  # ❓
     "Mumbai, India": "102713980",  # ❓
     "New Delhi, India": "106057199",  # ❓
@@ -116,9 +115,6 @@ LOCATION_MAPPING: dict[str, str] = {
     "Dubai, United Arab Emirates": "104305776",  # ❓
     "Tel Aviv, Israel": "101620260",  # ❓
     "Cairo, Egypt": "106155005",  # ❓
-    "Johannesburg, South Africa": "102590854",  # ❓
-    "Cape Town, South Africa": "102590854",  # ❓
-    "Nairobi, Kenya": "106808692",  # ❓
 }
 
 # Display names for UI (ordered by region and popularity)
@@ -221,6 +217,10 @@ def get_network_value(display_name: str) -> str:
 # ============================================================================
 # INDUSTRY MAPPINGS
 # ============================================================================
+# Codes verified 2026-07-11 against LinkedIn's official legacy industry-code
+# table (https://learn.microsoft.com/en-us/linkedin/shared/references/
+# reference-tables/industry-codes). The bogus "E-commerce" entry (no legacy
+# code exists; it duplicated Internet's 6) was removed then.
 
 INDUSTRY_MAPPING: dict[str, str] = {
     "Computer Software": "4",
@@ -232,16 +232,16 @@ INDUSTRY_MAPPING: dict[str, str] = {
     "Venture Capital & Private Equity": "106",
     "Management Consulting": "11",
     "Marketing & Advertising": "80",
-    "Public Relations & Communications": "18",
-    "E-Learning": "100",
-    "Higher Education": "69",
+    "Public Relations & Communications": "98",
+    "E-Learning": "132",
+    "Higher Education": "68",
     "Hospital & Health Care": "14",
     "Biotechnology": "12",
     "Pharmaceuticals": "15",
-    "Medical Devices": "54",
+    "Medical Devices": "17",
     "Real Estate": "44",
-    "Construction": "51",
-    "Architecture & Planning": "22",
+    "Construction": "48",
+    "Architecture & Planning": "50",
     "Legal Services": "10",
     "Accounting": "47",
     "Human Resources": "137",
@@ -251,10 +251,9 @@ INDUSTRY_MAPPING: dict[str, str] = {
     "Media Production": "126",
     "Telecommunications": "8",
     "Automotive": "53",
-    "Aviation & Aerospace": "94",
+    "Aviation & Aerospace": "52",
     "Consumer Goods": "25",
     "Retail": "27",
-    "E-commerce": "6",
 }
 
 # Display names for UI (ordered by popularity/relevance)
@@ -269,12 +268,12 @@ INDUSTRY_CHOICES: list[tuple[str, str]] = [
     ("Banking", "41"),
     ("Investment Banking", "45"),
     ("Venture Capital & Private Equity", "106"),
-    ("E-Learning", "100"),
-    ("Higher Education", "69"),
+    ("E-Learning", "132"),
+    ("Higher Education", "68"),
     ("Hospital & Health Care", "14"),
     ("Biotechnology", "12"),
     ("Pharmaceuticals", "15"),
-    ("Medical Devices", "54"),
+    ("Medical Devices", "17"),
     ("Real Estate", "44"),
     ("Legal Services", "10"),
     ("Accounting", "47"),
@@ -284,7 +283,7 @@ INDUSTRY_CHOICES: list[tuple[str, str]] = [
     ("Entertainment", "28"),
     ("Telecommunications", "8"),
     ("Automotive", "53"),
-    ("Aviation & Aerospace", "94"),
+    ("Aviation & Aerospace", "52"),
     ("Consumer Goods", "25"),
     ("Retail", "27"),
 ]
@@ -344,7 +343,7 @@ LANGUAGE_MAPPING: dict[str, str] = {
 
 COMMON_COMPANIES: dict[str, str] = {
     "Google": "1441",
-    "Meta": "1586",
+    "Meta": "10667",
     "Apple": "162479",
     "Microsoft": "1035",
     "Amazon": "1586",

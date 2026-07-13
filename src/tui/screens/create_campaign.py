@@ -95,6 +95,10 @@ class CreateCampaignScreen(CampaignFormScreen):
             )
         else:
             self._set_status(f"Filled {applied} of 8 fields from your description.", "good")
+        # Hand the user straight back to the form: fold the panel away so the
+        # filled fields are what's on screen, and land on the first field
+        # that needs their eyes (or the top of the form) for review/editing.
+        event.panel.collapse()
         self.query_one(flagged[0] if flagged else "#field-name").focus()
         # Deliberately no mark_clean(): an AI prefill is unsaved work, so esc
         # still warns before discarding it.
