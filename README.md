@@ -49,8 +49,13 @@ Automating interactions with LinkedIn may violate [LinkedIn's User Agreement and
    persistent browser profile under `~/.linkedin-networking-cli/browser_data/`;
    on the transient (non-persistent) fallback it is loaded from Playwright
    `storage_state` in `~/.linkedin-networking-cli/session.json`. Only one is
-   *read* per run, but `session.json` is always refreshed on exit (persistent
-   runs included) so either path can resume the other's session.
+   *read* per run (the persistent profile when present, otherwise
+   `session.json`), and `session.json` is refreshed on exit when the session is
+   still believed healthy (persistent runs included), so a later transient run
+   can resume a session a persistent run established — but a run that never
+   confirmed login, or whose session was compromised mid-run
+   (CAPTCHA/checkpoint/logout), skips the write instead of clobbering a
+   still-good session file.
 
 ## Usage
 
@@ -62,7 +67,7 @@ uv run linkedin_tui.py
 linkedin-tui
 ```
 
-Navigate with the **arrow keys**, press **Enter** to select, and **Esc** to go back (**q** to quit). The number keys **1**–**4** jump straight to a destination from the home screen, and `Ctrl+P` opens the command palette.
+Navigate with the **arrow keys**, press **Enter** to select, and **Esc** to go back. On the home screen, pressing **Esc** twice quits. `Ctrl+P` opens the command palette.
 
 From the home screen you can:
 
