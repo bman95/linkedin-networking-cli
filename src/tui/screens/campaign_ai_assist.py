@@ -323,7 +323,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             if not self._llm_settings.get("model"):
                 self._set_status("Hosted mode needs LLM_MODEL set.", "error")
                 return
-            if self._db_manager is not None and not self._db_manager.get_setting(
+            if self._db_manager is None or not self._db_manager.get_setting(
                 "llm_hosted_consent_ack", False
             ):
                 self._pending_description = text
