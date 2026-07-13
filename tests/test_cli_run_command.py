@@ -147,6 +147,25 @@ class TestMainDispatch:
         assert rc == 130
         assert "Interrupted" in capsys.readouterr().err
 
+    def test_exception_with_broken_str_still_exits_cleanly(self, capsys):
+        """The guard must survive hostile exceptions too: one whose __str__
+        raises must still yield a one-line ``Error: ...`` (falling back to the
+        class name) and exit 1 — never a raw traceback from the guard itself."""
+
+        class BrokenStrError(Exception):
+            def __str__(self):
+                raise RuntimeError("str is broken")
+
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = BrokenStrError()
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "Error: BrokenStrError" in captured.err
+        assert "Traceback" not in captured.err
+        assert "Logging error" not in captured.err
+
     def test_keyboard_interrupt_during_construction_exits_130(self, capsys):
         """The guard wraps CampaignRunner() construction too — __init__ only
         catches Exception, so a Ctrl-C during it must reach main()'s guard."""

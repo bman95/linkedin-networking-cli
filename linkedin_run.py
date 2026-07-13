@@ -87,11 +87,19 @@ def main(argv=None):
         # with exc_info would dump the very traceback this guard exists to
         # suppress. Keep the traceback in the file logs; the console stays
         # clean (same convention as cli.runner's automation-phase guard).
-        logger.info("Unhandled error in linkedin-run: %s", exc, exc_info=True)
+        # A last-line-of-defense guard must survive hostile exceptions too: a
+        # third-party exception whose __str__ raises would crash the guard
+        # itself, so compute a safe detail string once and hand only that to
+        # the logger's %s slot (exc_info formatting is already safe — the
+        # traceback module guards str() failures internally).
+        try:
+            detail = str(exc).strip() or exc.__class__.__name__
+        except Exception:
+            detail = exc.__class__.__name__
+        logger.info("Unhandled error in linkedin-run: %s", detail, exc_info=True)
         # Some exception texts span several lines (SQLAlchemy appends the
         # statement and a docs link) — keep the stderr contract to one line;
         # the full detail is already in the file logs.
-        detail = str(exc).strip() or exc.__class__.__name__
         print(f"Error: {detail.splitlines()[0]}", file=sys.stderr)
         return 1
 
