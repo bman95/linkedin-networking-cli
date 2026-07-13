@@ -229,11 +229,14 @@ class TestIsModelAvailable:
         with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
             assert client.is_model_available("gemma3") is True
 
-    def test_untagged_config_matches_any_installed_tag(self):
+    def test_untagged_config_does_not_match_sibling_tag(self):
+        # Ollama resolves an untagged name strictly to ":latest" — an
+        # installed sibling tag (gemma3:4b) does not make untagged "gemma3"
+        # servable, so it must read as missing and arm the pull flow.
         client = LLMClient(_config())
         body = {"models": [{"name": "gemma3:4b"}]}
         with patch("urllib.request.urlopen", return_value=_FakeResponse(body)):
-            assert client.is_model_available("gemma3") is True
+            assert client.is_model_available("gemma3") is False
 
     def test_tagged_config_does_not_match_a_different_tag(self):
         client = LLMClient(_config())

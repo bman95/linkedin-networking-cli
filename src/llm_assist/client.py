@@ -131,15 +131,19 @@ class LLMClient:
         name (``LLM_MODEL=gemma3``, or the *Custom…* input). Without this,
         an untagged config reads as "not installed" and arms a multi-gigabyte
         re-pull of a model Ollama would already resolve and serve.
+
+        Mirrors Ollama's own resolution rule exactly: an untagged name
+        resolves strictly to ``:latest`` — an installed sibling tag (e.g.
+        ``gemma3:4b``) does *not* make untagged ``gemma3`` servable, so it
+        must not count as available here (it would skip the pull flow and
+        dead-end in a 404 at chat time).
         """
         available = self.list_models()
         if model in available:
             return True
         if ":" in model:
             return False
-        return f"{model}:latest" in available or any(
-            name.partition(":")[0] == model for name in available
-        )
+        return f"{model}:latest" in available
 
     # ── model pull (local/Ollama only) ──────────────────────────────────
 
