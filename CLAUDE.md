@@ -127,13 +127,22 @@ the page is sitting on a login/challenge URL at close — so a degraded context
 never clobbers a still-good `session.json`.
 
 **Cross-process profile lock.** The persistent profile is guarded by
-`<app_dir>/browser_profile.lock` (PID inside): `start_browser` acquires it
+`<app_dir>/browser_profile.lock` (`pid:token` inside, `token` a random hex id
+generated per `LinkedInAutomation` instance): `start_browser` acquires it
 before `force_close_chrome`, so cleanup only ever kills *orphaned* Chrome from
-a crashed run. A lock naming a live PID raises `BrowserProfileBusyError`
-(surfaced as a clean "profile in use" message) instead of killing a concurrent
-TUI/`linkedin-run` session; a dead-PID lock is stale and reclaimed. The lock
-is released in `close_browser`'s teardown (and on a failed `start_browser`),
-and held across `_refresh_context`'s crash-recovery relaunch.
+a crashed run. Acquisition is atomic (payload written to a temp file, claimed
+via `os.link`, retried on loss of a race — never a read-check-write), so two
+near-simultaneous starters can never both believe they hold it. A lock naming a live PID raises
+`BrowserProfileBusyError` (surfaced as a clean "profile in use" message)
+instead of killing a concurrent TUI/`linkedin-run` session; a dead-PID lock is
+stale and reclaimed. Reclaiming a *live* lock as "our own" additionally
+requires the token to match, not just the PID — so a second
+`LinkedInAutomation` instance in the same process (e.g. a concurrent TUI flow)
+is correctly treated as a foreign, live holder rather than silently killing a
+sibling run's Chrome. The lock is released in `close_browser`'s teardown, on a
+failed `start_browser`, and — if `_refresh_context`'s crash-recovery relaunch
+fails before it can reacquire — by a dedicated release in `_refresh_context`
+itself; otherwise it is held (never released mid-gap) across that relaunch.
 
 ### File Structure Context
 

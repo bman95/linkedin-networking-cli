@@ -232,64 +232,123 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _read_lock_pid(lock_path: Path) -> int | None:
-    """Best-effort read of the PID stored in the lockfile; None on any problem."""
+def _read_lock(lock_path: Path) -> tuple[int, str] | None:
+    """Best-effort read of the ``pid:token`` stored in the lockfile.
+
+    Returns ``None`` on any problem — missing file, unreadable, or malformed
+    content — which the caller treats the same as a stale/absent lock. A
+    lockfile with no ``:`` (the pre-token on-disk format, or a manually
+    written test fixture) parses as an empty token, which simply never
+    matches a real instance token.
+    """
     try:
         content = lock_path.read_text(encoding="utf-8").strip()
-        return int(content)
+        pid_str, _, token = content.partition(":")
+        return int(pid_str), token
     except (OSError, ValueError):
         return None
 
 
-def acquire_profile_lock(user_data_dir: str) -> Path:
+# Bounded retries for the O_EXCL acquire loop below: each iteration only
+# spins again on a lock we just proved is stale/foreign-dead/our-own (all
+# cleared before the retry), so a genuine live foreign holder always exits
+# after exactly one iteration (see acquire_profile_lock). The bound exists
+# purely as a safety net against a pathological repeated race with another
+# claimant, so it never hangs.
+_LOCK_ACQUIRE_RETRIES = 5
+
+
+def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
     """Claim the cross-process lock on ``user_data_dir``'s persistent profile.
 
-    A missing or stale lock (its PID no longer alive) is cleaned up and
-    claimed for our own PID, written atomically (write-temp then
-    ``os.replace``, so a concurrent reader never observes a partial write). A
-    lock whose PID IS alive raises :class:`BrowserProfileBusyError` instead of
-    being silently cleared — that PID owns a legitimate, possibly concurrent
-    run, and clearing its lock would let ``force_close_chrome`` kill its
+    Acquisition is atomic: the full ``pid:token`` payload is written to a
+    unique temp file first, then claimed via ``os.link`` — which fails with
+    ``FileExistsError`` if the lock name already exists — so the lock name
+    never exists without complete content, and two near-simultaneous callers
+    can never both believe they hold it. (Plain ``O_CREAT|O_EXCL`` + write
+    would leave a window where a concurrent reader sees an empty lockfile,
+    judges it malformed/stale, and unlinks a live claim; a read-check-write
+    ``os.replace`` — the previous implementation — was outright racy.)
+
+    ``token`` identifies the calling ``LinkedInAutomation`` *instance*, not
+    just its OS process. A lock is only ever reclaimed when it names BOTH our
+    own PID and our own token — true only for the process/instance that wrote
+    it in the first place (``_refresh_context`` holding the lock across its
+    own close+relaunch gap). A second ``LinkedInAutomation`` instance in the
+    SAME process (e.g. a concurrent TUI flow starting its own automation
+    engine) has a different token, so a live lock naming our PID but a
+    foreign token is correctly treated as a foreign, live holder and raises
+    :class:`BrowserProfileBusyError` instead of being silently reclaimed —
+    reclaiming it would let ``force_close_chrome`` kill that sibling run's
     Chrome out from under it.
+
+    A lock naming a dead PID (or with unreadable/malformed content) is stale:
+    it is unlinked and the atomic claim retried — losers of that re-claim
+    race simply observe the new winner's lock on the next iteration.
 
     Returns the lock path (for :func:`release_profile_lock`).
     """
     lock_path = _profile_lock_path(user_data_dir)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_pid = _read_lock_pid(lock_path)
-    if (
-        existing_pid is not None
-        and existing_pid != os.getpid()
-        and _pid_is_alive(existing_pid)
-    ):
+    tmp_path = lock_path.with_name(f"{lock_path.name}.{os.getpid()}.{token}.tmp")
+    tmp_path.write_text(f"{os.getpid()}:{token}", encoding="utf-8")
+    try:
+        for _ in range(_LOCK_ACQUIRE_RETRIES):
+            try:
+                os.link(tmp_path, lock_path)
+            except FileExistsError:
+                existing = _read_lock(lock_path)
+                if existing is not None:
+                    existing_pid, existing_token = existing
+                    is_own = existing_pid == os.getpid() and existing_token == token
+                    if not is_own and _pid_is_alive(existing_pid):
+                        raise BrowserProfileBusyError(
+                            f"The browser profile at {user_data_dir!r} is "
+                            f"already in use by process {existing_pid} (e.g. "
+                            "another linkedin-tui/linkedin-run run). Wait for "
+                            "it to finish, or stop it, before starting a new "
+                            "one."
+                        ) from None
+                # Stale (dead-PID), malformed, or our own leftover — safe to
+                # clear. Retry the atomic claim rather than assuming we can
+                # just overwrite it: another caller may win the race in
+                # between.
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug(
+                        "Could not remove stale profile lock %s: %s", lock_path, exc
+                    )
+                continue
+            else:
+                return lock_path
+
         raise BrowserProfileBusyError(
-            f"The browser profile at {user_data_dir!r} is already in use by "
-            f"process {existing_pid} (e.g. another linkedin-tui/linkedin-run "
-            "run). Wait for it to finish, or stop it, before starting a new one."
+            f"Could not acquire the browser profile lock at {lock_path} after "
+            f"{_LOCK_ACQUIRE_RETRIES} attempts; another process may be racing "
+            "for it."
         )
-    if existing_pid is not None:
-        # Stale (dead-PID) lock or our own leftover — safe to clear.
+    finally:
         try:
-            lock_path.unlink(missing_ok=True)
+            tmp_path.unlink(missing_ok=True)
         except OSError as exc:
-            logger.debug("Could not remove stale profile lock %s: %s", lock_path, exc)
-
-    tmp_path = lock_path.with_name(f"{lock_path.name}.{os.getpid()}.tmp")
-    tmp_path.write_text(str(os.getpid()), encoding="utf-8")
-    os.replace(tmp_path, lock_path)
-    return lock_path
+            logger.debug("Could not remove lock temp file %s: %s", tmp_path, exc)
 
 
-def release_profile_lock(user_data_dir: str) -> None:
-    """Release our profile lock, only if it still names our own PID.
+def release_profile_lock(user_data_dir: str, token: str) -> None:
+    """Release our profile lock, only if it still names our own PID AND token.
 
     Best-effort and never raises: called from ``close_browser``'s teardown,
-    which must complete regardless. Never unlinks a lock some other (live)
-    process has since claimed.
+    ``start_browser``'s failure path, and ``_refresh_context``'s
+    crash-recovery safety net, all of which must complete/propagate
+    regardless. The token check (not just the PID) matters because two
+    ``LinkedInAutomation`` instances in the SAME process share a PID but
+    never a token: without it, one instance's release could unlink a lock a
+    sibling instance has since legitimately (re)acquired.
     """
     lock_path = _profile_lock_path(user_data_dir)
-    if _read_lock_pid(lock_path) != os.getpid():
+    if _read_lock(lock_path) != (os.getpid(), token):
         return
     try:
         lock_path.unlink(missing_ok=True)
@@ -337,6 +396,12 @@ class LinkedInAutomation:
         # cross-process lock (see acquire_profile_lock); None when no lock is
         # held (transient launch path, or before start_browser runs).
         self._locked_user_data_dir: str | None = None
+        # Per-instance identity for the profile lock (see acquire_profile_lock):
+        # distinguishes this LinkedInAutomation instance from any OTHER
+        # instance that happens to share our PID, so a lock is only ever
+        # reclaimed as "our own" when it is truly this instance's, not just
+        # this process's.
+        self._lock_token: str = uuid.uuid4().hex
 
     def _get_rate_limiter(self) -> RateLimiter:
         """Return the action rate limiter, building it from settings once."""
@@ -423,10 +488,17 @@ class LinkedInAutomation:
         # the now-free profile and force_close_chrome our own relaunch out
         # from under it. Stash the lock dir and clear the attribute so
         # close_browser's own release (in its finally) is skipped; the lock
-        # file stays on disk naming our PID for the whole gap.
-        # start_browser's acquire_profile_lock treats an existing same-PID
-        # lock as our own leftover and reclaims it. If start_browser itself
-        # then fails, its own failure-path release cleans the lock up.
+        # file stays on disk naming our PID and OUR token for the whole gap.
+        # start_browser's acquire_profile_lock reclaims a lock naming both our
+        # own PID and our own token as "our own leftover" — true here because
+        # it is the SAME LinkedInAutomation instance re-acquiring, never a
+        # sibling instance sharing only our PID. If start_browser itself then
+        # fails AFTER reacquiring, its own failure-path release cleans the
+        # lock up; if it fails BEFORE reacquiring (e.g. async_playwright().
+        # start() raises), the except below releases the lock we stashed —
+        # otherwise it would stay on disk naming our still-alive PID with no
+        # remaining release path, blocking every other run until this process
+        # exits.
         locked_user_data_dir = self._locked_user_data_dir
         self._locked_user_data_dir = None
         if locked_user_data_dir is not None:
@@ -441,7 +513,20 @@ class LinkedInAutomation:
         self.page = None
         self.playwright = None
 
-        await self.start_browser()
+        try:
+            await self.start_browser()
+        except Exception:
+            # self._locked_user_data_dir is None here in both cases we need to
+            # tell apart: (a) start_browser reacquired then failed later and
+            # already released it via its own failure path, or (b) it failed
+            # before ever reacquiring, so nobody has released our stashed
+            # lock. release_profile_lock is safe to call in either case: it
+            # only unlinks a lock that STILL names our exact (pid, token), so
+            # in case (a) — where the file is already gone or names a
+            # different claimant by now — this is a no-op.
+            if locked_user_data_dir is not None:
+                release_profile_lock(locked_user_data_dir, self._lock_token)
+            raise
         return self.page
 
     async def _recover(self) -> Page:
@@ -499,7 +584,7 @@ class LinkedInAutomation:
             # then a no-op and the exception propagates untouched, exactly as
             # before.
             if self._locked_user_data_dir is not None:
-                release_profile_lock(self._locked_user_data_dir)
+                release_profile_lock(self._locked_user_data_dir, self._lock_token)
                 self._locked_user_data_dir = None
             raise
 
@@ -600,7 +685,7 @@ class LinkedInAutomation:
             # must abort start_browser, not silently fall back to a
             # transient (session.json) launch that would let a second run
             # proceed against the same account concurrently.
-            acquire_profile_lock(user_data_dir)
+            acquire_profile_lock(user_data_dir, self._lock_token)
             self._locked_user_data_dir = user_data_dir
             # Free the profile before launching: kill any Chrome still holding it
             # (now known to be an orphan, not a locked-in live owner) and (on
@@ -774,7 +859,7 @@ class LinkedInAutomation:
             await self._close_browser_steps()
         finally:
             if self._locked_user_data_dir is not None:
-                release_profile_lock(self._locked_user_data_dir)
+                release_profile_lock(self._locked_user_data_dir, self._lock_token)
                 self._locked_user_data_dir = None
 
     async def _close_browser_steps(self):

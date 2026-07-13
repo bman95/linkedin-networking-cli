@@ -1130,11 +1130,11 @@ class TestBrowserProfileLock:
         user_data_dir = tmp_path / "browser_data"
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
-        lock_path.write_text(str(self._dead_pid()), encoding="utf-8")
+        lock_path.write_text(f"{self._dead_pid()}:someone-elses-token", encoding="utf-8")
 
-        acquire_profile_lock(str(user_data_dir))
+        acquire_profile_lock(str(user_data_dir), "my-token")
 
-        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
 
     def test_no_existing_lock_is_acquired(self, tmp_path):
         from automation.linkedin import _profile_lock_path, acquire_profile_lock
@@ -1144,9 +1144,9 @@ class TestBrowserProfileLock:
         lock_path = _profile_lock_path(str(user_data_dir))
         assert not lock_path.exists()
 
-        acquire_profile_lock(str(user_data_dir))
+        acquire_profile_lock(str(user_data_dir), "my-token")
 
-        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
 
     def test_live_pid_lock_raises_busy_error(self, tmp_path):
         import subprocess
@@ -1159,30 +1159,107 @@ class TestBrowserProfileLock:
         lock_path = _profile_lock_path(str(user_data_dir))
         proc = subprocess.Popen(["sleep", "5"])
         try:
-            lock_path.write_text(str(proc.pid), encoding="utf-8")
+            lock_path.write_text(f"{proc.pid}:someone-elses-token", encoding="utf-8")
 
             with pytest.raises(BrowserProfileBusyError, match=str(proc.pid)):
-                acquire_profile_lock(str(user_data_dir))
+                acquire_profile_lock(str(user_data_dir), "my-token")
 
             # Untouched: a live owner's lock must not be cleared.
-            assert lock_path.read_text(encoding="utf-8").strip() == str(proc.pid)
+            assert lock_path.read_text(encoding="utf-8").strip() == (
+                f"{proc.pid}:someone-elses-token"
+            )
         finally:
             proc.kill()
             proc.wait()
 
-    def test_own_pid_lock_is_treated_as_reacquirable(self, tmp_path):
-        """A lock already naming our own PID (e.g. a retried start_browser)
-        is not treated as busy."""
+    def test_own_pid_and_token_lock_is_reclaimed(self, tmp_path):
+        """A lock already naming our own PID *and* our own token (e.g. a
+        retried start_browser, or _refresh_context's hold-across-relaunch) is
+        not treated as busy."""
         from automation.linkedin import _profile_lock_path, acquire_profile_lock
 
         user_data_dir = tmp_path / "browser_data"
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        lock_path.write_text(f"{os.getpid()}:my-token", encoding="utf-8")
 
-        acquire_profile_lock(str(user_data_dir))
+        acquire_profile_lock(str(user_data_dir), "my-token")
 
-        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
+
+    def test_same_pid_foreign_token_is_treated_as_busy(self, tmp_path):
+        """Regression (issue #57, defect #1): a lock naming OUR OWN PID but a
+        DIFFERENT token belongs to a sibling ``LinkedInAutomation`` instance
+        in the same process (e.g. a concurrent TUI flow), not to us — it must
+        raise busy rather than being silently reclaimed, which would let
+        ``force_close_chrome`` kill that sibling's Chrome out from under it."""
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+        from exceptions import BrowserProfileBusyError
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(f"{os.getpid()}:sibling-token", encoding="utf-8")
+
+        with pytest.raises(BrowserProfileBusyError, match=str(os.getpid())):
+            acquire_profile_lock(str(user_data_dir), "my-token")
+
+        # Untouched: a live sibling's lock must not be cleared.
+        assert lock_path.read_text(encoding="utf-8").strip() == (
+            f"{os.getpid()}:sibling-token"
+        )
+
+    def test_acquire_retries_after_losing_a_creation_race(self, tmp_path, monkeypatch):
+        """The atomic ``os.link`` claim can lose a race to a lockfile that
+        already exists; if that lock turns out stale it is cleared and the
+        claim is retried rather than trusting a single read (the old
+        read-check-write TOCTOU this replaces)."""
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(f"{self._dead_pid()}:someone-elses-token", encoding="utf-8")
+
+        real_link = os.link
+        calls = []
+
+        def _counting_link(src, dst, *a, **kw):
+            calls.append(dst)
+            return real_link(src, dst, *a, **kw)
+
+        monkeypatch.setattr(os, "link", _counting_link)
+
+        acquire_profile_lock(str(user_data_dir), "my-token")
+
+        assert len(calls) == 2  # first claim lost to the stale entry, second won
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
+        # The claim temp file is cleaned up win or lose.
+        assert list(lock_path.parent.glob("*.tmp")) == []
+
+    def test_acquire_gives_up_after_bounded_retries(self, tmp_path, monkeypatch):
+        """A pathological, unending creation race (every claim attempt loses)
+        must not hang forever — it gives up after a bounded number of
+        attempts instead of retrying indefinitely."""
+        from automation.linkedin import (
+            _LOCK_ACQUIRE_RETRIES,
+            _profile_lock_path,
+            acquire_profile_lock,
+        )
+        from exceptions import BrowserProfileBusyError
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(f"{self._dead_pid()}:someone-elses-token", encoding="utf-8")
+
+        always_exists = Mock(side_effect=FileExistsError())
+        monkeypatch.setattr(os, "link", always_exists)
+
+        with pytest.raises(BrowserProfileBusyError, match="attempts"):
+            acquire_profile_lock(str(user_data_dir), "my-token")
+
+        assert always_exists.call_count == _LOCK_ACQUIRE_RETRIES
 
     def test_release_only_removes_our_own_lock(self, tmp_path):
         from automation.linkedin import _profile_lock_path, release_profile_lock
@@ -1190,11 +1267,27 @@ class TestBrowserProfileLock:
         user_data_dir = tmp_path / "browser_data"
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
-        lock_path.write_text("999999999", encoding="utf-8")  # not our PID
+        lock_path.write_text("999999999:my-token", encoding="utf-8")  # not our PID
 
-        release_profile_lock(str(user_data_dir))
+        release_profile_lock(str(user_data_dir), "my-token")
 
         assert lock_path.exists()  # left alone — not ours to remove
+
+    def test_release_leaves_same_pid_foreign_token_lock_alone(self, tmp_path):
+        """Regression (issue #57, defect #1): releasing must check the token,
+        not just the PID — otherwise our release could unlink a lock a
+        sibling ``LinkedInAutomation`` instance in the same process has since
+        legitimately (re)acquired."""
+        from automation.linkedin import _profile_lock_path, release_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(f"{os.getpid()}:sibling-token", encoding="utf-8")
+
+        release_profile_lock(str(user_data_dir), "my-token")
+
+        assert lock_path.exists()  # left alone — a sibling instance's lock
 
     @pytest.mark.asyncio
     async def test_close_browser_releases_the_lock(
@@ -1205,7 +1298,9 @@ class TestBrowserProfileLock:
         user_data_dir = tmp_path / "browser_data"
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        lock_path.write_text(
+            f"{os.getpid()}:{mock_linkedin_automation._lock_token}", encoding="utf-8"
+        )
 
         mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
         mock_linkedin_automation.context = None
@@ -1297,8 +1392,10 @@ class TestBrowserProfileLock:
 
         # A subsequent acquire from the same process must succeed — the
         # earlier failure did not leave a self-blocking lock behind.
-        acquire_profile_lock(user_data_dir)
-        assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+        acquire_profile_lock(user_data_dir, "verify-token")
+        assert lock_path.read_text(encoding="utf-8").strip() == (
+            f"{os.getpid()}:verify-token"
+        )
 
     @pytest.mark.asyncio
     async def test_refresh_context_holds_profile_lock_across_close_and_relaunch(
@@ -1316,7 +1413,9 @@ class TestBrowserProfileLock:
         user_data_dir = tmp_path / "browser_data"
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        lock_path.write_text(
+            f"{os.getpid()}:{mock_linkedin_automation._lock_token}", encoding="utf-8"
+        )
 
         mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
         mock_linkedin_automation.context = None
@@ -1326,8 +1425,9 @@ class TestBrowserProfileLock:
         observed = {}
 
         async def _fake_start():
-            # The lock file must still be here, naming our own PID, when
-            # start_browser runs — close_browser must not have released it.
+            # The lock file must still be here, naming our own PID and token,
+            # when start_browser runs — close_browser must not have released
+            # it.
             observed["lock_exists"] = lock_path.exists()
             observed["locked_dir_during_start"] = mock_linkedin_automation._locked_user_data_dir
             mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
@@ -1345,6 +1445,48 @@ class TestBrowserProfileLock:
         assert observed["locked_dir_during_start"] is None
         assert lock_path.exists()
         assert mock_linkedin_automation._locked_user_data_dir == str(user_data_dir)
+
+    @pytest.mark.asyncio
+    async def test_refresh_context_releases_lock_if_relaunch_fails_before_reacquire(
+        self, mock_linkedin_automation, tmp_path
+    ):
+        """Regression (issue #57, defect #3): if the crash-recovery relaunch's
+        ``start_browser`` raises BEFORE it can reacquire the lock (e.g.
+        ``async_playwright().start()`` itself fails), the lock stashed across
+        the close+relaunch gap must still be released — otherwise it stays on
+        disk naming our still-alive PID/token with no remaining release path,
+        falsely blocking every other run (including a scheduled
+        ``linkedin-run``) until this process exits."""
+        from automation.linkedin import _profile_lock_path
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text(
+            f"{os.getpid()}:{mock_linkedin_automation._lock_token}", encoding="utf-8"
+        )
+
+        mock_linkedin_automation._locked_user_data_dir = str(user_data_dir)
+        mock_linkedin_automation.context = None
+        mock_linkedin_automation.browser = None
+        mock_linkedin_automation.playwright = None
+
+        async def _fake_start_fails_before_reacquire():
+            # Simulates a failure inside _start_browser_unlocked BEFORE it
+            # reaches acquire_profile_lock: _locked_user_data_dir is never
+            # set, exactly like the real failure path.
+            raise RuntimeError("async_playwright().start() failed")
+
+        with patch.object(
+            mock_linkedin_automation,
+            "start_browser",
+            new=AsyncMock(side_effect=_fake_start_fails_before_reacquire),
+        ):
+            with pytest.raises(RuntimeError, match="async_playwright"):
+                await mock_linkedin_automation._refresh_context()
+
+        assert not lock_path.exists()
+        assert mock_linkedin_automation._locked_user_data_dir is None
 
 
 # ============================================================================
