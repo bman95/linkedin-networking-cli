@@ -6,6 +6,7 @@ right campaign + cap. The automation boundary is mocked, so no browser or
 network is exercised (the live send is validated manually by the owner).
 """
 
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -156,19 +157,27 @@ class TestMainDispatch:
         assert rc == 130
         assert "Interrupted" in capsys.readouterr().err
 
-    def test_db_error_through_real_runner_hits_the_guard(self, capsys):
+    def test_db_error_through_real_runner_hits_the_guard(self, capsys, caplog):
         """End-to-end through the real CampaignRunner: a non-ValueError from
         the db layer during campaign resolution (issue #60's scenario — e.g. a
-        locked SQLite file, which DatabaseManager logs and re-raises) must
-        surface as the one-line ``Error: ...`` contract with exit 1, and no
-        traceback on either stream."""
+        locked SQLite file, which DatabaseManager re-raises) must surface as
+        the one-line ``Error: ...`` contract with exit 1, no traceback on
+        either stream, and the full traceback captured by the logger. The
+        exception text is multi-line on purpose — SQLAlchemy's
+        OperationalError str() spans several lines (statement + docs link) and
+        the stderr contract must stay one line regardless."""
+        multiline = (
+            "(sqlite3.OperationalError) database is locked\n"
+            "[SQL: SELECT campaign.id FROM campaign]\n"
+            "(Background on this error at: https://sqlalche.me/e/20/e3q8)"
+        )
 
         class _LockedDB:
             def get_campaign(self, campaign_id):
-                raise RuntimeError("database is locked")
+                raise RuntimeError(multiline)
 
             def get_campaigns(self, active_only=True):
-                raise RuntimeError("database is locked")
+                raise RuntimeError(multiline)
 
         def _real_runner():
             runner = object.__new__(CampaignRunner)
@@ -176,16 +185,25 @@ class TestMainDispatch:
             runner.settings = _settings(valid=True)
             return runner
 
-        with patch.object(
-            linkedin_run, "CampaignRunner", side_effect=_real_runner
-        ):
-            rc = linkedin_run.main(["--campaign", "1"])
+        with caplog.at_level(logging.INFO, logger="linkedin_run"):
+            with patch.object(
+                linkedin_run, "CampaignRunner", side_effect=_real_runner
+            ):
+                rc = linkedin_run.main(["--campaign", "1"])
 
         assert rc == 1
         captured = capsys.readouterr()
-        assert "Error: database is locked" in captured.err
+        error_lines = [
+            line for line in captured.err.splitlines() if line.startswith("Error:")
+        ]
+        assert error_lines == [
+            "Error: (sqlite3.OperationalError) database is locked"
+        ]
+        assert "[SQL:" not in captured.err
         assert "Traceback" not in captured.err
         assert "Traceback" not in captured.out
+        # The "log" half of the contract: the traceback lands in the logger.
+        assert any(r.exc_info for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

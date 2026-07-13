@@ -70,11 +70,11 @@ def main(argv=None):
     Argument parsing (``--help``, missing/invalid args) is left to raise its
     own ``SystemExit`` uncaught — that is argparse's normal, intentional exit
     path. Everything after parsing is guarded: an unexpected exception (e.g. a
-    locked/corrupt SQLite database, which ``DatabaseManager`` logs and
-    re-raises rather than swallows) would otherwise print a raw Python
-    traceback instead of the one-line ``Error: ...`` contract the rest of the
-    runner uses, and a Ctrl-C during a scheduled run would otherwise exit with
-    an interpreter-default code instead of the conventional 130.
+    locked/corrupt SQLite database, which ``DatabaseManager`` re-raises rather
+    than swallows) would otherwise print a raw Python traceback instead of the
+    one-line ``Error: ...`` contract the rest of the runner uses, and a Ctrl-C
+    during a scheduled run would otherwise exit with an interpreter-default
+    code instead of the conventional 130.
     """
     args = _build_parser().parse_args(argv)
     try:
@@ -88,7 +88,11 @@ def main(argv=None):
         # suppress. Keep the traceback in the file logs; the console stays
         # clean (same convention as cli.runner's automation-phase guard).
         logger.info("Unhandled error in linkedin-run: %s", exc, exc_info=True)
-        print(f"Error: {exc}", file=sys.stderr)
+        # Some exception texts span several lines (SQLAlchemy appends the
+        # statement and a docs link) — keep the stderr contract to one line;
+        # the full detail is already in the file logs.
+        detail = str(exc).strip() or exc.__class__.__name__
+        print(f"Error: {detail.splitlines()[0]}", file=sys.stderr)
         return 1
 
 
