@@ -276,8 +276,8 @@ toward a calm, modern terminal surface.
   shared chrome (masthead via `masthead_markup`, hint bar via `hint_markup`) and
   the shared `Back` / `Quit` bindings, so navigation is identical everywhere. The
   **home launcher** (`HomeScreen`, the entry screen)
-  is the one screen without a `Back` binding (it has nowhere to pop to); `q`
-  quits.
+  is the one screen without a `Back` binding (it has nowhere to pop to); a
+  double-`esc` press quits.
 - **No scroll-behind.** Screens are full opaque `Screen` overlays pushed with
   `push_screen`, so switching is in-place with nothing showing through. Each
   screen fills the viewport; only the inner content region scrolls
@@ -286,11 +286,10 @@ toward a calm, modern terminal surface.
   mascot** beside the wordmark + tagline, a **live one-line workspace summary** (worker-loaded — credential status for onboarding, else campaign
   count / today's activity / readiness), and a focused nav list of rich rows
   (title + description) whose selection is a `❯` pointer and an accent-recoloured
-  title — not a loud full-width bar. Navigation is fast: `↑`/`↓` + `enter`, and
-  the number keys **`1`–`4` jump** straight to a destination. Textual's command
-  palette (`ctrl+p`), extended with a `NavCommands` provider, offers the same
-  destinations from anywhere; `COMMANDS` *extends* the built-in providers, so the
-  default system commands (theme switch, quit, …) remain.
+  title — not a loud full-width bar. Navigation is fast: `↑`/`↓` + `enter`.
+  Textual's command palette (`ctrl+p`), extended with a `NavCommands` provider,
+  offers the same destinations from anywhere; `COMMANDS` *extends* the built-in
+  providers, so the default system commands (theme switch, quit, …) remain.
 
 ### State design
 

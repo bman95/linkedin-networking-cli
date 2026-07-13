@@ -62,7 +62,7 @@ uv run linkedin_tui.py
 linkedin-tui
 ```
 
-Navigate with the **arrow keys**, press **Enter** to select, and **Esc** to go back (**q** to quit). The number keys **1**–**4** jump straight to a destination from the home screen, and `Ctrl+P` opens the command palette.
+Navigate with the **arrow keys**, press **Enter** to select, and **Esc** to go back. On the home screen, pressing **Esc** twice quits. `Ctrl+P` opens the command palette.
 
 From the home screen you can:
 
