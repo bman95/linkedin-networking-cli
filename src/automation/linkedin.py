@@ -249,13 +249,68 @@ def _read_lock(lock_path: Path) -> tuple[int, str] | None:
         return None
 
 
-# Bounded retries for the O_EXCL acquire loop below: each iteration only
+# Bounded retries for the os.link acquire loop below: each iteration only
 # spins again on a lock we just proved is stale/foreign-dead/our-own (all
 # cleared before the retry), so a genuine live foreign holder always exits
 # after exactly one iteration (see acquire_profile_lock). The bound exists
 # purely as a safety net against a pathological repeated race with another
 # claimant, so it never hangs.
 _LOCK_ACQUIRE_RETRIES = 5
+
+# Tokens of profile locks currently held by LinkedInAutomation instances in
+# THIS process. Needed to tell two on-disk states apart that look identical
+# (`our_pid:foreign_token`): a live sibling instance sharing our PID (busy —
+# reclaiming would let force_close_chrome kill its Chrome), versus a stale
+# leftover from a DEAD process whose PID number the OS has since recycled to
+# us (stale — `_pid_is_alive(our own pid)` is trivially true, so without this
+# registry that leftover would read as "busy" forever and permanently
+# self-deadlock the profile until a human deletes the lockfile). A live
+# sibling's token, by construction, exists in this set; a dead predecessor's
+# token cannot.
+_PROCESS_LOCK_TOKENS: set[str] = set()
+
+
+def _classify_existing_lock(
+    lock_path: Path, user_data_dir: str, token: str
+) -> tuple[str, tuple[int, str] | None]:
+    """Judge an existing lockfile: ``("own" | "stale", parsed_content)``.
+
+    Raises :class:`BrowserProfileBusyError` for a live foreign holder —
+    either another live process, or a live sibling ``LinkedInAutomation``
+    instance in this process (same PID, token present in
+    ``_PROCESS_LOCK_TOKENS``). ``"own"`` means the lock already names exactly
+    ``(our pid, our token)``; ``"stale"`` covers everything safely
+    reclaimable: dead-PID locks, malformed/unreadable content, a vanished
+    file, and same-PID locks whose token no live instance in this process
+    holds (a dead predecessor under our recycled PID number).
+    """
+    existing = _read_lock(lock_path)
+    if existing is None:
+        return "stale", existing
+    existing_pid, existing_token = existing
+    if existing_pid == os.getpid():
+        if existing_token == token:
+            return "own", existing
+        if existing_token in _PROCESS_LOCK_TOKENS:
+            raise BrowserProfileBusyError(
+                f"The browser profile at {user_data_dir!r} is already in use "
+                "by another automation flow in this same process (e.g. a "
+                "campaign run still driving the browser). Wait for it to "
+                "finish, or stop it, before starting a new one."
+            )
+        # Our PID, a token no live instance here holds: a leftover from a
+        # dead process whose PID number was recycled to us. _pid_is_alive
+        # would be trivially (and misleadingly) true for our own PID, so it
+        # must not be consulted for this case.
+        return "stale", existing
+    if _pid_is_alive(existing_pid):
+        raise BrowserProfileBusyError(
+            f"The browser profile at {user_data_dir!r} is already in use by "
+            f"process {existing_pid} (e.g. another linkedin-tui/linkedin-run "
+            "run). Wait for it to finish, or stop it, before starting a new "
+            "one."
+        )
+    return "stale", existing
 
 
 def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
@@ -268,23 +323,24 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
     can never both believe they hold it. (Plain ``O_CREAT|O_EXCL`` + write
     would leave a window where a concurrent reader sees an empty lockfile,
     judges it malformed/stale, and unlinks a live claim; a read-check-write
-    ``os.replace`` — the previous implementation — was outright racy.)
+    ``os.replace`` — the previous implementation — was outright racy.) On a
+    filesystem without hard-link support (``os.link`` raising a non-EEXIST
+    ``OSError``) the claim degrades, with a warning, to the best that
+    filesystem offers: the same holder checks followed by a non-atomic
+    ``os.replace`` — the pre-atomic behavior, rather than an opaque crash.
 
     ``token`` identifies the calling ``LinkedInAutomation`` *instance*, not
-    just its OS process. A lock is only ever reclaimed when it names BOTH our
-    own PID and our own token — true only for the process/instance that wrote
-    it in the first place (``_refresh_context`` holding the lock across its
-    own close+relaunch gap). A second ``LinkedInAutomation`` instance in the
-    SAME process (e.g. a concurrent TUI flow starting its own automation
-    engine) has a different token, so a live lock naming our PID but a
-    foreign token is correctly treated as a foreign, live holder and raises
-    :class:`BrowserProfileBusyError` instead of being silently reclaimed —
-    reclaiming it would let ``force_close_chrome`` kill that sibling run's
-    Chrome out from under it.
+    just its OS process. A lock is only ever treated as "already ours" when
+    it names BOTH our own PID and our own token — true only for the instance
+    that wrote it (``_refresh_context`` holding the lock across its own
+    close+relaunch gap); that case returns immediately WITHOUT touching the
+    file, so the lock is never absent from disk, even transiently, while our
+    Chrome lives. See :func:`_classify_existing_lock` for how live siblings
+    in this process are distinguished from a dead predecessor under our own
+    recycled PID number.
 
-    A lock naming a dead PID (or with unreadable/malformed content) is stale:
-    it is unlinked and the atomic claim retried — losers of that re-claim
-    race simply observe the new winner's lock on the next iteration.
+    A stale lock is unlinked and the atomic claim retried — losers of that
+    re-claim race simply observe the new winner's lock on the next iteration.
 
     Returns the lock path (for :func:`release_profile_lock`).
     """
@@ -298,29 +354,26 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
             try:
                 os.link(tmp_path, lock_path)
             except FileExistsError:
-                existing = _read_lock(lock_path)
-                if existing is not None:
-                    existing_pid, existing_token = existing
-                    if existing_pid == os.getpid() and existing_token == token:
-                        # Already ours (e.g. _refresh_context reacquiring the
-                        # lock it held across its close+relaunch gap). Return
-                        # WITHOUT unlink+relink: the on-disk content is
-                        # already exactly what we would write, and dropping
-                        # the file even briefly would reopen the mid-gap
-                        # window where a concurrent run could claim the
-                        # profile out from under our still-live Chrome.
-                        return lock_path
-                    if _pid_is_alive(existing_pid):
-                        raise BrowserProfileBusyError(
-                            f"The browser profile at {user_data_dir!r} is "
-                            f"already in use by process {existing_pid} (e.g. "
-                            "another linkedin-tui/linkedin-run run). Wait for "
-                            "it to finish, or stop it, before starting a new "
-                            "one."
-                        ) from None
-                # Stale (dead-PID) or malformed — safe to clear. Retry the
-                # atomic claim rather than assuming we can just overwrite it:
-                # another caller may win the race in between.
+                verdict, existing = _classify_existing_lock(
+                    lock_path, user_data_dir, token
+                )
+                if verdict == "own":
+                    _PROCESS_LOCK_TOKENS.add(token)
+                    return lock_path
+                # Stale — safe to clear. Retry the atomic claim rather than
+                # assuming we can just overwrite it: another caller may win
+                # the race in between. Re-verify the content right before the
+                # unlink so a fresh claim written since the read above is not
+                # deleted. Known residual: the filesystem offers no
+                # compare-and-unlink, so a window of a few instructions
+                # remains between this re-read and the unlink in which a
+                # concurrent claimant's brand-new lock could still be swept
+                # away. Accepted risk: it requires two processes to
+                # independently judge the SAME stale lock within microseconds
+                # of each other; the alternative (flock-serializing cleanup)
+                # is POSIX-only machinery this narrow case does not justify.
+                if _read_lock(lock_path) != existing:
+                    continue  # content changed under us — re-evaluate afresh
                 try:
                     lock_path.unlink(missing_ok=True)
                 except OSError as exc:
@@ -328,7 +381,26 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
                         "Could not remove stale profile lock %s: %s", lock_path, exc
                     )
                 continue
+            except OSError as exc:
+                # Hard links unsupported here (exFAT/FAT, some network/9p
+                # mounts). Degrade to the strongest claim this filesystem
+                # offers — holder checks then a non-atomic os.replace (the
+                # pre-atomic behavior) — instead of crashing opaquely.
+                logger.warning(
+                    "Atomic hard-link lock claim failed on %s (%s); falling "
+                    "back to a non-atomic claim for this filesystem",
+                    lock_path,
+                    exc,
+                )
+                verdict, _ = _classify_existing_lock(lock_path, user_data_dir, token)
+                if verdict == "own":
+                    _PROCESS_LOCK_TOKENS.add(token)
+                    return lock_path
+                os.replace(tmp_path, lock_path)
+                _PROCESS_LOCK_TOKENS.add(token)
+                return lock_path
             else:
+                _PROCESS_LOCK_TOKENS.add(token)
                 return lock_path
 
         raise BrowserProfileBusyError(
@@ -353,7 +425,12 @@ def release_profile_lock(user_data_dir: str, token: str) -> None:
     ``LinkedInAutomation`` instances in the SAME process share a PID but
     never a token: without it, one instance's release could unlink a lock a
     sibling instance has since legitimately (re)acquired.
+
+    The token is always dropped from ``_PROCESS_LOCK_TOKENS`` — the caller is
+    done with the lock either way — so a later same-process acquire never
+    mistakes this finished instance for a live sibling.
     """
+    _PROCESS_LOCK_TOKENS.discard(token)
     lock_path = _profile_lock_path(user_data_dir)
     if _read_lock(lock_path) != (os.getpid(), token):
         return

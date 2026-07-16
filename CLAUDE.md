@@ -132,17 +132,23 @@ generated per `LinkedInAutomation` instance): `start_browser` acquires it
 before `force_close_chrome`, so cleanup only ever kills *orphaned* Chrome from
 a crashed run. Acquisition is atomic (payload written to a temp file, claimed
 via `os.link`, retried on loss of a race — never a read-check-write), so two
-near-simultaneous starters can never both believe they hold it. A lock naming
-a live PID raises `BrowserProfileBusyError` (surfaced as a clean "profile in
-use" message) instead of killing a concurrent TUI/`linkedin-run` session; a
-dead-PID lock is stale and reclaimed. Reclaiming a *live* lock as "our own"
-additionally requires the token to match, not just the PID — so a second
-`LinkedInAutomation` instance in the same process (e.g. a concurrent TUI flow)
-is correctly treated as a foreign, live holder rather than silently killing a
-sibling run's Chrome. The lock is released in `close_browser`'s teardown, on a
-failed `start_browser`, and — if `_refresh_context`'s crash-recovery relaunch
-fails before it can reacquire — by a dedicated release in `_refresh_context`
-itself; otherwise it is held (never released mid-gap) across that relaunch.
+near-simultaneous starters can never both believe they hold it; on a
+filesystem without hard links it degrades, with a warning, to the pre-atomic
+non-atomic claim rather than crashing. A lock naming a live foreign PID
+raises `BrowserProfileBusyError` (surfaced as a clean "profile in use"
+message) instead of killing a concurrent TUI/`linkedin-run` session; a
+dead-PID lock is stale and reclaimed. A lock naming *our own* PID is judged
+by its token against the in-process registry of live holders
+(`_PROCESS_LOCK_TOKENS`): our own token → already ours (reclaimed without
+touching the file); a token some live sibling `LinkedInAutomation` instance
+in this process holds → busy (never silently kill a sibling run's Chrome);
+any other token → a dead predecessor under our recycled PID number → stale
+(`_pid_is_alive` on one's own PID is trivially true, so PID liveness alone
+would self-deadlock the profile forever). The lock is released in
+`close_browser`'s teardown, on a failed `start_browser`, and — if
+`_refresh_context`'s crash-recovery relaunch fails before it can reacquire —
+by a dedicated release in `_refresh_context` itself; otherwise it is held
+(never released mid-gap) across that relaunch.
 
 ### File Structure Context
 

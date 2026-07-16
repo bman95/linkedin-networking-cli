@@ -1124,6 +1124,15 @@ class TestBrowserProfileLock:
         proc.wait()
         return pid
 
+    @pytest.fixture(autouse=True)
+    def _isolated_token_registry(self, monkeypatch):
+        """Give every test a fresh in-process lock-token registry, so tokens
+        registered by one test's acquire never leak into another's
+        live-sibling judgment."""
+        from automation import linkedin as linkedin_module
+
+        monkeypatch.setattr(linkedin_module, "_PROCESS_LOCK_TOKENS", set())
+
     def test_stale_lock_is_cleaned_and_acquired(self, tmp_path):
         from automation.linkedin import _profile_lock_path, acquire_profile_lock
 
@@ -1219,12 +1228,14 @@ class TestBrowserProfileLock:
         assert str(lock_path) not in unlinked
         assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
 
-    def test_same_pid_foreign_token_is_treated_as_busy(self, tmp_path):
-        """Regression (issue #57, defect #1): a lock naming OUR OWN PID but a
-        DIFFERENT token belongs to a sibling ``LinkedInAutomation`` instance
-        in the same process (e.g. a concurrent TUI flow), not to us — it must
-        raise busy rather than being silently reclaimed, which would let
-        ``force_close_chrome`` kill that sibling's Chrome out from under it."""
+    def test_same_pid_live_sibling_token_is_treated_as_busy(self, tmp_path):
+        """Regression (issue #57, defect #1): a lock naming OUR OWN PID and a
+        token held by a LIVE sibling ``LinkedInAutomation`` instance in this
+        process (registered in ``_PROCESS_LOCK_TOKENS``, e.g. a concurrent
+        TUI flow) must raise busy rather than being silently reclaimed, which
+        would let ``force_close_chrome`` kill that sibling's Chrome out from
+        under it."""
+        from automation import linkedin as linkedin_module
         from automation.linkedin import _profile_lock_path, acquire_profile_lock
         from exceptions import BrowserProfileBusyError
 
@@ -1232,14 +1243,94 @@ class TestBrowserProfileLock:
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
         lock_path.write_text(f"{os.getpid()}:sibling-token", encoding="utf-8")
+        linkedin_module._PROCESS_LOCK_TOKENS.add("sibling-token")
 
-        with pytest.raises(BrowserProfileBusyError, match=str(os.getpid())):
+        with pytest.raises(
+            BrowserProfileBusyError, match="another automation flow in this same"
+        ):
             acquire_profile_lock(str(user_data_dir), "my-token")
 
         # Untouched: a live sibling's lock must not be cleared.
         assert lock_path.read_text(encoding="utf-8").strip() == (
             f"{os.getpid()}:sibling-token"
         )
+
+    def test_same_pid_dead_predecessor_token_is_reclaimed(self, tmp_path):
+        """A lock naming our own PID but a token NO live instance in this
+        process holds is a leftover from a dead process whose PID number the
+        OS recycled to us. ``_pid_is_alive(our own pid)`` is trivially true,
+        so without the in-process token registry this would read as busy
+        forever — a permanent self-deadlock only a human could clear."""
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        # Same PID as us, but the token is registered nowhere in this
+        # process: only a dead predecessor could have written it.
+        lock_path.write_text(f"{os.getpid()}:dead-predecessor-token", encoding="utf-8")
+
+        acquire_profile_lock(str(user_data_dir), "my-token")
+
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
+
+    def test_acquire_degrades_when_hard_links_are_unsupported(
+        self, tmp_path, monkeypatch
+    ):
+        """On a filesystem without hard-link support (os.link raising a
+        non-EEXIST OSError, e.g. exFAT or some network mounts) the claim must
+        degrade to the non-atomic pre-atomic behavior — holder checks then
+        os.replace — not crash with a raw OSError."""
+        import errno
+
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+
+        def _no_hard_links(src, dst, *a, **kw):
+            raise OSError(errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(os, "link", _no_hard_links)
+
+        acquire_profile_lock(str(user_data_dir), "my-token")
+
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
+
+    def test_degraded_acquire_still_respects_a_live_foreign_holder(
+        self, tmp_path, monkeypatch
+    ):
+        """The hard-link-less degraded path must still raise busy for a live
+        foreign holder instead of os.replace-ing its lock away."""
+        import errno
+        import subprocess
+
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+        from exceptions import BrowserProfileBusyError
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+
+        def _no_hard_links(src, dst, *a, **kw):
+            raise OSError(errno.EPERM, "Operation not permitted")
+
+        monkeypatch.setattr(os, "link", _no_hard_links)
+
+        proc = subprocess.Popen(["sleep", "5"])
+        try:
+            lock_path.write_text(f"{proc.pid}:their-token", encoding="utf-8")
+
+            with pytest.raises(BrowserProfileBusyError, match=str(proc.pid)):
+                acquire_profile_lock(str(user_data_dir), "my-token")
+
+            assert lock_path.read_text(encoding="utf-8").strip() == (
+                f"{proc.pid}:their-token"
+            )
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_acquire_retries_after_losing_a_creation_race(self, tmp_path, monkeypatch):
         """The atomic ``os.link`` claim can lose a race to a lockfile that
@@ -1322,6 +1413,21 @@ class TestBrowserProfileLock:
         user_data_dir.mkdir()
         lock_path = _profile_lock_path(str(user_data_dir))
         lock_path.write_text(str(self._dead_pid()), encoding="utf-8")
+
+        acquire_profile_lock(str(user_data_dir), "my-token")
+
+        assert lock_path.read_text(encoding="utf-8").strip() == f"{os.getpid()}:my-token"
+
+    def test_malformed_lock_is_treated_as_stale_and_reclaimed(self, tmp_path):
+        """A lockfile whose content is garbage (neither ``pid:token`` nor a
+        legacy plain PID) must be treated as stale and reclaimed, not crash
+        the acquire or block forever."""
+        from automation.linkedin import _profile_lock_path, acquire_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        lock_path.write_text("not-a-pid:whatever", encoding="utf-8")
 
         acquire_profile_lock(str(user_data_dir), "my-token")
 
