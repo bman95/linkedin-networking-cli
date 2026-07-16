@@ -122,7 +122,10 @@ async def smart_connection_checker(
             # DB-stored URLs (from search-time extraction) carry no guaranteed
             # trailing slash, while the walk's URLs always get one — an
             # unnormalized marker could silently never match (issue #59).
-            limit_url = _clean_profile_url(limit_contact.profile_url)
+            # ``or None``: an empty stored URL is "no marker", not a marker
+            # that can never be reached (which would flag every inconclusive
+            # exit as truncated).
+            limit_url = _clean_profile_url(limit_contact.profile_url) or None
             if progress_callback:
                 progress_callback(f"Checking connections until: {limit_name}")
         else:
@@ -214,8 +217,14 @@ async def _check_connections_page(
             return True
         return False
 
-    # Create a lookup dict for faster searching
-    pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
+    # Create a lookup dict for faster searching. Keys normalized like the
+    # page-side URLs (trailing slash, no query): DB-stored URLs carry no
+    # guaranteed trailing slash, and an unnormalized key would silently never
+    # match — missing the acceptance sweep's entire payload (issue #59).
+    pending_lookup = {
+        _clean_profile_url(contact.profile_url): contact
+        for contact in pending_contacts
+    }
 
     # Every profile URL processed so far. A scroll round that surfaces no NEW
     # profile for several consecutive rounds is the true end of the list
@@ -389,8 +398,16 @@ async def _check_connections_page(
         else:
             consecutive_empty_rounds = 0
 
-        if not finish_process and len(connections) < 10:
-            # If we got fewer than 10 connections, we might be at the end
+        if not finish_process and len(connections) < 10 and limit_url is None:
+            # If we got fewer than 10 connections, we might be at the end.
+            # Only taken when no stop marker is expected: a single short
+            # observation can't distinguish a genuinely short list from a
+            # stalled render, so with a marker pending the walk keeps going
+            # until a conclusive exit (the marker itself, a confirmed end of
+            # list, or the backstop) instead of guessing — a short list is
+            # exhausted within a few empty rounds anyway, and a healthy small
+            # account must never be flagged "incomplete" forever just because
+            # its marker legitimately vanished (issue #59 review).
             if progress_callback:
                 progress_callback("Reached end of connections list")
             break
@@ -403,14 +420,14 @@ async def _check_connections_page(
     ):
         # There was a specific stop marker to reconcile against (the
         # campaign's most-recently-accepted connection) and the walk ended on
-        # an INCONCLUSIVE exit — the short-page/empty-page heuristics or the
-        # scroll-rounds backstop — without ever confirming the marker. Flag
-        # the result so callers don't present a silently over-confident
-        # "success" (issue #59). A walk that confirmed the true end of the
-        # list is NOT flagged even when the marker was missing: the marker
-        # can legitimately vanish (the connection was removed, the list
-        # reordered), and flagging it would make "incomplete" the permanent
-        # steady state for a perfectly healthy campaign.
+        # an INCONCLUSIVE exit — the empty-page break or the scroll-rounds
+        # backstop — without ever confirming the marker. Flag the result so
+        # callers don't present a silently over-confident "success" (issue
+        # #59). A walk that confirmed the true end of the list is NOT flagged
+        # even when the marker was missing: the marker can legitimately
+        # vanish (the connection was removed, the list reordered), and
+        # flagging it would make "incomplete" the permanent steady state for
+        # a perfectly healthy campaign.
         stats["truncated"] = True
 
     return stats, updated_campaign_ids
