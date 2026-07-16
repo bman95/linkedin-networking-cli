@@ -39,14 +39,17 @@ async def open_menu_item(pilot, item_id: str) -> None:
 
 @pytest.fixture
 def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
-    """A DatabaseManager with two campaigns, one active and one inactive."""
-    db_manager.create_campaign(
+    """A DatabaseManager with two campaigns, one active and one inactive.
+
+    Sent/Accepted/Rate are derived live from ``contacts`` (issue #66), not the
+    denormalized ``Campaign.total_*`` columns, so contacts are seeded here
+    rather than passing ``total_sent``/``total_accepted`` at creation time.
+    """
+    tech = db_manager.create_campaign(
         {
             "name": "Tech Professionals",
             "daily_limit": 20,
             "active": True,
-            "total_sent": 10,
-            "total_accepted": 4,
         }
     )
     db_manager.create_campaign(
@@ -54,10 +57,27 @@ def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
             "name": "Marketing Leads",
             "daily_limit": 15,
             "active": False,
-            "total_sent": 0,
-            "total_accepted": 0,
         }
     )
+    # 10 sent-group contacts, 4 accepted -> 40.0% acceptance rate.
+    for i in range(4):
+        db_manager.create_contact(
+            {
+                "campaign_id": tech.id,
+                "name": f"Accepted {i}",
+                "profile_url": f"https://example.com/tech-accepted-{i}",
+                "status": "accepted",
+            }
+        )
+    for i in range(6):
+        db_manager.create_contact(
+            {
+                "campaign_id": tech.id,
+                "name": f"Sent {i}",
+                "profile_url": f"https://example.com/tech-sent-{i}",
+                "status": "sent",
+            }
+        )
     return db_manager
 
 
@@ -114,6 +134,64 @@ async def test_navigate_to_campaigns_screen_renders_db_data(
         assert "Inactive" in rendered
         # Acceptance rate for the active campaign: 4/10 -> 40.0%.
         assert "40.0%" in rendered
+
+
+@pytest.mark.unit
+async def test_campaigns_list_derives_stats_from_contacts_not_stale_counters(
+    db_manager: DatabaseManager,
+):
+    """Sent/Accepted/Rate come live from ``contacts``, not ``Campaign.total_*``.
+
+    The stored counters are only synced by ``update_campaign_stats``; anything
+    that bypasses it (crash mid-run, manual edit, seed script) leaves them
+    stale. Before issue #66 this list rendered the stale stored numbers,
+    contradicting the Dashboard, which already derived live from contacts.
+    """
+    db_manager.create_campaign(
+        {
+            "name": "Stale Counters",
+            "daily_limit": 20,
+            "active": True,
+            # Stale, never-synced counters — must NOT be what renders.
+            "total_sent": 99,
+            "total_accepted": 98,
+        }
+    )
+    campaign = db_manager.get_campaigns(active_only=False)[0]
+    db_manager.create_contact(
+        {
+            "campaign_id": campaign.id,
+            "name": "Accepted 0",
+            "profile_url": "https://example.com/stale-accepted-0",
+            "status": "accepted",
+        }
+    )
+    for i in range(2):
+        db_manager.create_contact(
+            {
+                "campaign_id": campaign.id,
+                "name": f"Sent {i}",
+                "profile_url": f"https://example.com/stale-sent-{i}",
+                "status": "sent",
+            }
+        )
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
+        table = app.screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if table.row_count == 1:
+                break
+            await pilot.pause()
+        assert table.row_count == 1
+        cells = [str(cell) for cell in table.get_row_at(0)]
+        # Name, Status, Sent, Accepted, Rate, Daily Limit
+        assert cells[2] == "3"  # live: 2 sent + 1 accepted, not the stale 99
+        assert cells[3] == "1"  # live accepted, not the stale 98
+        assert cells[4] == "33.3%"
+        assert "99" not in cells
+        assert "98" not in cells
 
 
 @pytest.mark.unit
@@ -278,10 +356,10 @@ async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
         current = screen._load_generation
         # A late result from a superseded load (older token) is dropped by the
         # mixin's generation gate before _populate runs.
-        screen._apply_if_current(current - 1, screen._populate, [], None)
+        screen._apply_if_current(current - 1, screen._populate, [], {}, None)
         assert table.row_count == 2
         # The current generation applies normally.
-        screen._apply_if_current(current, screen._populate, [], "Database unavailable.")
+        screen._apply_if_current(current, screen._populate, [], {}, "Database unavailable.")
         assert table.row_count == 0
         assert "Database unavailable" in str(
             screen.query_one("#campaigns-status", Static).render()

@@ -1,5 +1,4 @@
 import json
-from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,21 @@ from .models import (
 )
 
 logger = get_logger(__name__)
+
+
+def _stats_from_status_counts(status_counts: dict[str, int]) -> dict[str, int]:
+    """Fold per-status contact counts into the sent/accepted/pending totals.
+
+    The single place the status-group math lives for the read paths
+    (``get_campaign_contact_stats`` and its batch variant), using the same
+    ``SENT_STATUSES``/``PENDING_STATUSES`` groups as ``update_campaign_stats``
+    so derived and stored totals can never disagree in definition (issue #66).
+    """
+    return {
+        "total_sent": sum(status_counts.get(s, 0) for s in SENT_STATUSES),
+        "total_accepted": status_counts.get(ContactStatus.ACCEPTED, 0),
+        "total_pending": sum(status_counts.get(s, 0) for s in PENDING_STATUSES),
+    }
 
 
 class DatabaseManager:
@@ -666,24 +680,6 @@ class DatabaseManager:
             ).all()
             return list(contacts)
 
-    def count_contacts_by_statuses(self, campaign_id: int, statuses: Iterable[str]) -> int:
-        """Count contacts in any of ``statuses`` for a campaign, via SQL COUNT.
-
-        Callers that only need a size (e.g. the detail screen's checkable-
-        count gate) should use this instead of
-        ``len(get_contacts_by_status(...))``, which materializes every column
-        of every matching row just to discard it (issue #65).
-        """
-        with self.get_session() as session:
-            return session.exec(
-                select(func.count())
-                .select_from(Contact)
-                .where(
-                    Contact.campaign_id == campaign_id,
-                    Contact.status.in_(list(statuses)),
-                )
-            ).one()
-
     # Analytics operations
     def record_daily_analytics(self, campaign_id: int, date_str: str, metrics: dict[str, Any]):
         """Record or update daily analytics"""
@@ -1049,6 +1045,47 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Failed to update campaign stats for {campaign_id}: {e}")
             raise
+
+    def get_campaign_contact_stats(self, campaign_id: int) -> dict[str, int]:
+        """Live sent/accepted/pending counts for one campaign, derived directly
+        from ``contacts`` via SQL COUNT/GROUP BY.
+
+        This is the read-only counterpart of ``update_campaign_stats``: same
+        status-group definitions, same query shape, no write. Screens that show
+        campaign numbers read this (or the batch variant below) instead of the
+        denormalized ``Campaign.total_*`` columns, so they can never contradict
+        each other when those columns have drifted stale (issue #66).
+        """
+        with self.get_session() as session:
+            status_counts = dict(
+                session.exec(
+                    select(Contact.status, func.count())
+                    .where(Contact.campaign_id == campaign_id)
+                    .group_by(Contact.status)
+                ).all()
+            )
+        return _stats_from_status_counts(status_counts)
+
+    def get_all_campaign_contact_stats(self) -> dict[int, dict[str, int]]:
+        """Live per-campaign sent/accepted/pending counts for every campaign.
+
+        Batch variant of ``get_campaign_contact_stats`` for list views: one
+        GROUP BY over ``contacts`` regardless of campaign count, instead of a
+        query per campaign. Campaigns with no contact rows are absent from the
+        result — callers default their counts to zero.
+        """
+        with self.get_session() as session:
+            rows = session.exec(
+                select(Contact.campaign_id, Contact.status, func.count())
+                .group_by(Contact.campaign_id, Contact.status)
+            ).all()
+        per_campaign: dict[int, dict[str, int]] = {}
+        for campaign_id, status, count in rows:
+            per_campaign.setdefault(campaign_id, {})[status] = count
+        return {
+            campaign_id: _stats_from_status_counts(status_counts)
+            for campaign_id, status_counts in per_campaign.items()
+        }
 
     def get_dashboard_stats(self) -> dict[str, Any]:
         """Get overall dashboard statistics"""

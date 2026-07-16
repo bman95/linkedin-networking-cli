@@ -24,6 +24,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Container, Grid
 from textual.widgets import Button, DataTable, Static
 
+from cli.helpers import acceptance_rate
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
@@ -33,12 +34,6 @@ logger = get_logger(__name__)
 
 # How many campaigns the recent-campaigns mini-table shows.
 RECENT_LIMIT = 5
-
-# Contact statuses that count as "sent" / "accepted", mirroring
-# DatabaseManager.update_campaign_stats and get_dashboard_stats so the recent
-# table is computed from the same live source as the stat cards (a denormalized
-# Campaign.total_sent can lag behind the actual contacts).
-_SENT_STATUSES = ("sent", "possibly_sent", "accepted", "declined")
 
 
 @dataclass(frozen=True)
@@ -134,7 +129,9 @@ class DashboardScreen(BaseScreen):
         try:
             stats = self._db_manager.get_dashboard_stats()
             campaigns = self._db_manager.get_campaigns(active_only=False)
-            contacts = self._db_manager.get_contacts()
+            # Inside the guard: _recent_rows queries the DB too, and an
+            # uncaught worker exception would crash the app, not degrade.
+            recent = self._recent_rows(campaigns)
             used_week = self._load_week_usage()
         except Exception as exc:  # surface in-place, never crash the UI
             self.marshal_load(
@@ -142,7 +139,6 @@ class DashboardScreen(BaseScreen):
             )
             return
 
-        recent = self._recent_rows(campaigns, contacts)
         data = DashboardData(stats=stats, recent=recent, used_week=used_week)
         self.marshal_load(app, generation, self._populate, data, None)
 
@@ -158,13 +154,13 @@ class DashboardScreen(BaseScreen):
             logger.debug("Could not resolve weekly usage; omitting", exc_info=True)
             return None
 
-    @staticmethod
-    def _recent_rows(campaigns, contacts) -> list[tuple]:
+    def _recent_rows(self, campaigns) -> list[tuple]:
         """Top-N campaigns, most recently active first, as table-ready rows.
 
-        Sent/accepted/rate are computed from live ``contacts`` — the same source
-        the stat cards use — so the table can't contradict the cards when the
-        denormalized ``Campaign`` aggregates are stale.
+        Sent/accepted/rate come from ``get_all_campaign_contact_stats`` — the
+        same live-from-``contacts`` source the Campaigns list and Campaign
+        detail use — so this table can't contradict them when the denormalized
+        ``Campaign`` aggregates are stale (issue #66).
         """
 
         def _key(c):
@@ -174,21 +170,14 @@ class DashboardScreen(BaseScreen):
             # date would raise).
             return (c.last_run or c.created_at) or datetime.min
 
-        # Per-campaign live tallies from the contacts table.
-        sent: dict = {}
-        accepted: dict = {}
-        for contact in contacts:
-            if contact.status in _SENT_STATUSES:
-                sent[contact.campaign_id] = sent.get(contact.campaign_id, 0) + 1
-            if contact.status == "accepted":
-                accepted[contact.campaign_id] = accepted.get(contact.campaign_id, 0) + 1
-
+        all_stats = self._db_manager.get_all_campaign_contact_stats()
         ordered = sorted(campaigns, key=_key, reverse=True)[:RECENT_LIMIT]
         rows = []
         for c in ordered:
-            c_sent = sent.get(c.id, 0)
-            c_accepted = accepted.get(c.id, 0)
-            rate = (c_accepted / c_sent * 100) if c_sent > 0 else 0.0
+            stats = all_stats.get(c.id, {})
+            c_sent = stats.get("total_sent", 0)
+            c_accepted = stats.get("total_accepted", 0)
+            rate = acceptance_rate(c_sent, c_accepted)
             rows.append(
                 (
                     # Row key first: it carries the campaign id so activating a

@@ -102,6 +102,63 @@ async def test_detail_renders_fields(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_detail_performance_derives_from_contacts_not_stale_counters(
+    db_manager: DatabaseManager,
+):
+    """Performance shows live counts from ``contacts``, not the denormalized
+    ``Campaign.total_*`` columns.
+
+    Those columns are only kept in sync by ``update_campaign_stats`` (called
+    after a real automation run); anything that bypasses it (a crash mid-run,
+    a manual edit, a seed script) leaves them stale. Before issue #66 this
+    screen rendered the stale stored numbers, contradicting the Campaigns list
+    and Dashboard, which already derived live from ``contacts``.
+    """
+    c = make_campaign(
+        db_manager, name="Stale Counters", total_sent=12, total_accepted=5
+    )
+    db_manager.create_contact(
+        {
+            "campaign_id": c.id,
+            "name": "Accepted 0",
+            "profile_url": "https://example.com/detail-accepted-0",
+            "status": "accepted",
+        }
+    )
+    db_manager.create_contact(
+        {
+            "campaign_id": c.id,
+            "name": "Sent 0",
+            "profile_url": "https://example.com/detail-sent-0",
+            "status": "sent",
+        }
+    )
+    db_manager.create_contact(
+        {
+            "campaign_id": c.id,
+            "name": "Sent 1",
+            "profile_url": "https://example.com/detail-sent-1",
+            "status": "sent",
+        }
+    )
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.push_screen(CampaignDetailScreen(db_manager, c.id))
+        await wait_text(pilot, "#detail-status", "select an action")
+        performance = str(
+            app.screen.query_one("#detail-body-performance", Static).render()
+        )
+        assert "Sent: 3" in performance
+        assert "Accepted: 1" in performance
+        assert "Pending: 2" in performance
+        assert "Acceptance Rate: 33.3%" in performance
+        # Not the stale stored counters.
+        assert "Sent: 12" not in performance
+        assert "Accepted: 5" not in performance
+
+
+@pytest.mark.unit
 async def test_detail_toggle_active(db_manager: DatabaseManager):
     c = make_campaign(db_manager)
     assert c.active is True
