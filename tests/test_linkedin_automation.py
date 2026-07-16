@@ -685,6 +685,36 @@ class TestContextManager:
                     pass
                 mock_close.assert_called_once()
 
+    def test_compromises_session_flag_set_only_on_challenge_exceptions(self):
+        """Pin the compromises_session invariant at its source: only the two
+        exceptions every existing catch site marks compromised for
+        (CaptchaDetectedException, NotAuthenticatedException) carry the flag;
+        everything else defaults to False, including the sibling
+        UnexpectedLandingException (a wrong landing, not a challenge)."""
+        from exceptions import (
+            BrowserProfileBusyError,
+            CaptchaDetectedException,
+            LinkedInAutomationError,
+            LoginFailedException,
+            NotAuthenticatedException,
+            RateLimitExceededException,
+            SelectorNotFoundException,
+            UnexpectedLandingException,
+        )
+
+        assert CaptchaDetectedException("x").compromises_session is True
+        assert NotAuthenticatedException("x").compromises_session is True
+
+        for exc in (
+            LinkedInAutomationError("x"),
+            LoginFailedException("x"),
+            SelectorNotFoundException("x"),
+            RateLimitExceededException("x"),
+            UnexpectedLandingException("x"),
+            BrowserProfileBusyError("x"),
+        ):
+            assert exc.compromises_session is False
+
     @pytest.mark.asyncio
     async def test_context_manager_exit_marks_compromised_on_flagged_exception(
         self, db_manager, app_settings

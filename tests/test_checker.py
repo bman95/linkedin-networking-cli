@@ -76,6 +76,22 @@ def _connection_el(href):
     return conn
 
 
+def _new_tab():
+    """A stubbed enrichment tab (``automation.context.new_page()``'s return).
+
+    ``query_selector``/``content`` are wired clean (no match / empty page) so
+    ``detect_captcha`` — now called on this tab too, see
+    ``_update_accepted_connection`` — reads it as challenge-free by default.
+    A bare ``AsyncMock()`` would fail that check: its unstubbed
+    ``query_selector(...)`` and the result's ``is_visible()`` both resolve to
+    a truthy ``MagicMock``, which ``detect_captcha`` reads as a CAPTCHA match.
+    """
+    page = AsyncMock()
+    page.query_selector = AsyncMock(return_value=None)
+    page.content = AsyncMock(return_value="")
+    return page
+
+
 def _set_limit(automation, limit):
     """Wire `_get_connection_limit`'s session query to return `limit`."""
     session = automation.db_manager.get_session.return_value.__enter__.return_value
@@ -272,6 +288,45 @@ class TestChallengeSafety:
         automation.db_manager.update_contact.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_enrichment_tab_in_page_captcha_raises_and_marks_compromised(
+        self, monkeypatch
+    ):
+        """A CAPTCHA can render on the enrichment tab without a URL bounce
+        (navigate_guarded's landing check only catches URL-level challenges)
+        — detect_captcha must be checked on the tab itself too, or a
+        checkpoint widget would leave get_contact_info to silently return an
+        empty dict with no exception at all, and the session would stay
+        marked authenticated (issue #58)."""
+        from exceptions import CaptchaDetectedException
+
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent", profile_url=url,
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url)]
+        )
+        new_page = _new_tab()
+        automation.context.new_page = AsyncMock(return_value=new_page)
+
+        async def _detect_captcha(page):
+            # Only the enrichment tab shows the in-page widget; the main
+            # connections page (automation.page) stays clean throughout.
+            return page is new_page
+
+        monkeypatch.setattr("automation.checker.detect_captcha", _detect_captcha)
+
+        with pytest.raises(CaptchaDetectedException):
+            await smart_connection_checker(automation, 1)
+
+        automation._mark_session_compromised.assert_called_once()
+        new_page.close.assert_awaited_once()
+        automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_enrichment_tab_navigates_guarded_without_recover(self):
         """The enrichment visit drives the NEW tab itself through
         navigate_guarded (not automation.page — it never left the connections
@@ -289,7 +344,7 @@ class TestChallengeSafety:
         automation.page.query_selector_all = AsyncMock(
             return_value=[_connection_el(url)]
         )
-        new_page = AsyncMock()
+        new_page = _new_tab()
         automation.context.new_page = AsyncMock(return_value=new_page)
 
         await smart_connection_checker(automation, 1)
@@ -448,7 +503,7 @@ class TestSmartCheckerWalk:
         automation.page.query_selector_all = AsyncMock(
             return_value=[_connection_el(url + "?trk=foo")]
         )
-        automation.context.new_page = AsyncMock(return_value=AsyncMock())
+        automation.context.new_page = AsyncMock(return_value=_new_tab())
         monkeypatch.setattr(
             "automation.checker.get_contact_info",
             AsyncMock(return_value={

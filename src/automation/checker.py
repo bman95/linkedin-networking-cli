@@ -387,6 +387,18 @@ async def _update_accepted_connection(
             )
             await new_page.wait_for_timeout(random.randint(5000, 8000))
 
+            # An in-page CAPTCHA can render without a URL bounce (the guard
+            # above only catches URL-level challenges) — mirrors the same
+            # check the connections-page walk does for exactly this reason.
+            # Without it, a checkpoint widget on this tab would leave
+            # get_contact_info to just return an empty dict, no exception at
+            # all, and the session would stay marked authenticated (issue #58).
+            if await detect_captcha(new_page):
+                raise CaptchaDetectedException(
+                    f"CAPTCHA detected while enriching accepted connection "
+                    f"{contact.name!r}"
+                )
+
             # Get updated contact info
             contact_info = await get_contact_info(new_page)
 
