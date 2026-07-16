@@ -10,10 +10,10 @@ presentation on top (the TUI writes them into a ``markup=False`` log as-is;
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 
+from automation.diagnostics import resolve_artifacts_dir
 from exceptions import (
     BrowserProfileBusyError,
     CaptchaDetectedException,
@@ -23,16 +23,6 @@ from exceptions import (
     SelectorNotFoundException,
     UnexpectedLandingException,
 )
-
-
-def _default_artifacts_dir() -> Path:
-    """Deterministic artifacts location: env override first, then home default."""
-    override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
-    return (
-        Path(override)
-        if override
-        else Path.home() / ".linkedin-networking-cli" / "artifacts"
-    )
 
 
 def evidence_reference(
@@ -65,9 +55,9 @@ def evidence_reference(
         try:
             resolved = artifacts_dir()
         except Exception:
-            resolved = _default_artifacts_dir()
+            resolved = resolve_artifacts_dir()
     else:
-        resolved = _default_artifacts_dir()
+        resolved = resolve_artifacts_dir()
     return f"Evidence (screenshot/DOM) saved under {resolved}"
 
 

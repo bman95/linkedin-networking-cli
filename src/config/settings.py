@@ -8,6 +8,21 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# The single source of truth for AI-assist (LLM) defaults. Both
+# ``get_llm_settings`` below (env-driven) and the AI-assist panel's in-memory
+# fallback (no ``AppSettings`` available, e.g. in tests) draw from this dict
+# so the two can't silently drift apart (issue #65).
+DEFAULT_LLM_SETTINGS: dict[str, Any] = {
+    "mode": "local",
+    "base_url": "http://localhost:11434",
+    "api_key": None,
+    "model": None,
+    "timeout_s": 60,
+    "pull_timeout_s": 1800,
+    "max_tokens": 1024,
+    "max_input_chars": 4000,
+}
+
 # The automation tunables the Settings screen can edit and persist. Maps the
 # ``get_automation_settings`` key to its env variable, so a persisted override
 # and its env fallback always describe the same knob. Credentials and browser
@@ -19,6 +34,27 @@ EDITABLE_SETTINGS = {
     "connection_cooldown": "CONNECTION_COOLDOWN",
     "search_limit": "SEARCH_LIMIT",
 }
+
+
+def effective_daily_limit(campaign_limit: Any, fallback: int) -> int:
+    """The daily invitation cap actually enforced for a campaign run.
+
+    The per-campaign ``daily_limit`` — the value shown and edited in the CLI —
+    is authoritative. It falls back to the ``DAILY_CONNECTION_LIMIT``
+    setting/env default only when the campaign carries no valid positive value
+    (so an unset/zeroed campaign still gets a sane cap). Lives here (rather
+    than in ``cli.helpers``) so the automation layer can depend on it without
+    reaching upward into the ``cli`` package; shared by the automation
+    enforcement and every display surface so copy can never drift from what a
+    run actually enforces (issue #46).
+    """
+    if (
+        isinstance(campaign_limit, int)
+        and not isinstance(campaign_limit, bool)
+        and campaign_limit > 0
+    ):
+        return campaign_limit
+    return fallback
 
 
 def _env_int(name: str, default: int) -> int:
@@ -371,7 +407,11 @@ class AppSettings:
         ``LLM_MODE`` explicitly overrides it (an invalid override falls back
         to the derived value, with a warning, rather than crashing).
         """
-        base_url = (os.getenv("LLM_BASE_URL") or "http://localhost:11434").strip().rstrip("/")
+        base_url = (
+            (os.getenv("LLM_BASE_URL") or DEFAULT_LLM_SETTINGS["base_url"])
+            .strip()
+            .rstrip("/")
+        )
         api_key = os.getenv("LLM_API_KEY") or None
         model = os.getenv("LLM_MODEL") or None
 
@@ -385,17 +425,21 @@ class AppSettings:
                     "deriving from LLM_API_KEY instead",
                     mode_env,
                 )
-            mode = "hosted" if api_key else "local"
+            mode = "hosted" if api_key else DEFAULT_LLM_SETTINGS["mode"]
 
         settings = {
             "mode": mode,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
-            "timeout_s": _env_int("LLM_TIMEOUT_S", 60),
-            "pull_timeout_s": _env_int("LLM_PULL_TIMEOUT_S", 1800),
-            "max_tokens": _env_int("LLM_MAX_TOKENS", 1024),
-            "max_input_chars": _env_int("LLM_MAX_INPUT_CHARS", 4000),
+            "timeout_s": _env_int("LLM_TIMEOUT_S", DEFAULT_LLM_SETTINGS["timeout_s"]),
+            "pull_timeout_s": _env_int(
+                "LLM_PULL_TIMEOUT_S", DEFAULT_LLM_SETTINGS["pull_timeout_s"]
+            ),
+            "max_tokens": _env_int("LLM_MAX_TOKENS", DEFAULT_LLM_SETTINGS["max_tokens"]),
+            "max_input_chars": _env_int(
+                "LLM_MAX_INPUT_CHARS", DEFAULT_LLM_SETTINGS["max_input_chars"]
+            ),
         }
 
         logger.debug(

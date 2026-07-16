@@ -38,7 +38,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -48,6 +47,7 @@ from textual.widgets import Button, RichLog, Static
 from utils.logging import get_logger
 
 from .automation_errors import describe_automation_error
+from .base import render_status_line
 from .workers import WorkerGuardMixin
 
 logger = get_logger(__name__)
@@ -472,9 +472,4 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
     # ── helpers ───────────────────────────────────────────────────────────
 
     def set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#run-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        # Text() renders literally: messages carry raw exception text and user
-        # data (campaign names), whose square brackets must not be parsed as
-        # markup — see automation_errors' plain-text contract.
-        status.update(Text(message))
+        render_status_line(self.query_one("#run-status", Static), message, kind)

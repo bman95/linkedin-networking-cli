@@ -4951,6 +4951,37 @@ class TestModalNotFoundCircuitBreaker:
 
         assert auto._attempt_connect.await_count == 5
 
+    @pytest.mark.asyncio
+    async def test_card_pass_streak_carries_into_profile_fallback(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """The card pass's modal_not_found streak is handed to the
+        profile-page fallback instead of resetting, so a run split across
+        both passes still aborts after the combined threshold is hit — a
+        wedge that only shows up as "some cards had no button" must not
+        defeat the circuit breaker by resetting the count at the fallback."""
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        monkeypatch.setenv("CONNECTION_DELAY_MIN", "0")
+        monkeypatch.setenv("CONNECTION_DELAY_MAX", "0")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Modal"})
+        # 4 cards with a Connect control (all modal_not_found) + 1 with no
+        # control at all (deferred straight to the profile-page fallback).
+        cards = [(self._profile(i), "connect") for i in range(4)] + [
+            (self._profile(4), "none")
+        ]
+        self._wire(auto, cards, monkeypatch)
+        auto._attempt_connect = AsyncMock(return_value=ConnectResult("modal_not_found"))
+        fallback = AsyncMock(
+            return_value={"sent": 0, "failed": 0, "existing": 0, "total_processed": 0}
+        )
+        auto.send_connection_requests = fallback
+
+        await auto.search_and_connect(campaign, limit=10)
+
+        fallback.assert_awaited_once()
+        assert fallback.await_args.kwargs["initial_modal_not_found_streak"] == 4
+
 
 @pytest.mark.unit
 class TestCooperativeCancellation:

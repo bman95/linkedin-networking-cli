@@ -14,6 +14,7 @@ every screen shares the same threaded-worker race discipline.
 
 from __future__ import annotations
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.screen import Screen
 from textual.widgets import Static
@@ -49,6 +50,24 @@ def hint_markup(hints: tuple[tuple[str, str], ...]) -> str:
     """
     parts = [f"[b]{key}[/b] {action}" for key, action in hints]
     return "[$text-muted]" + "  ·  ".join(parts) + "[/]"
+
+
+def render_status_line(status: Static, message: str, kind: str = "") -> None:
+    """Set a status-line ``Static``'s style class and text.
+
+    The shared body of every screen/panel's own status setter
+    (``campaign_form.py``'s and ``campaign_detail.py``'s ``_set_status``,
+    ``campaign_ai_assist.py``'s ``_set_status``, ``run_panel.py``'s
+    ``set_status``) — same status-line convention, one place (issue #65).
+    ``kind`` is ``""``, ``"error"``, ``"warn"``, or ``"good"``, mapping to the
+    ``status-line`` CSS class's modifier.
+
+    ``Text()`` renders literally: messages carry raw exception text and user
+    input (e.g. campaign names), whose square brackets must not be parsed as
+    markup.
+    """
+    status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
+    status.update(Text(message))
 
 
 class BaseScreen(ArrowFocusMixin, WorkerGuardMixin, Screen):

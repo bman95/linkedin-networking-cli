@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -664,6 +665,24 @@ class DatabaseManager:
                 )
             ).all()
             return list(contacts)
+
+    def count_contacts_by_statuses(self, campaign_id: int, statuses: Iterable[str]) -> int:
+        """Count contacts in any of ``statuses`` for a campaign, via SQL COUNT.
+
+        Callers that only need a size (e.g. the detail screen's checkable-
+        count gate) should use this instead of
+        ``len(get_contacts_by_status(...))``, which materializes every column
+        of every matching row just to discard it (issue #65).
+        """
+        with self.get_session() as session:
+            return session.exec(
+                select(func.count())
+                .select_from(Contact)
+                .where(
+                    Contact.campaign_id == campaign_id,
+                    Contact.status.in_(list(statuses)),
+                )
+            ).one()
 
     # Analytics operations
     def record_daily_analytics(self, campaign_id: int, date_str: str, metrics: dict[str, Any]):

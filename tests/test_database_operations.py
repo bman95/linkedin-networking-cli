@@ -358,6 +358,32 @@ class TestContactOperations:
         assert len(accepted_contacts) == 1
         assert accepted_contacts[0].status == "accepted"
 
+    def test_count_contacts_by_statuses(self, db_manager):
+        """A SQL-COUNT sibling of get_contacts_by_status, for callers that
+        only need a size (issue #65) — one campaign's contacts across
+        multiple statuses; another campaign's contacts are excluded."""
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        other_campaign = db_manager.create_campaign({"name": "Other Campaign"})
+        for i, status in enumerate(("sent", "sent", "possibly_sent", "accepted")):
+            db_manager.create_contact({
+                "campaign_id": campaign.id,
+                "name": f"Contact {status}",
+                "profile_url": f"https://linkedin.com/in/{status}-{i}",
+                "status": status,
+            })
+        db_manager.create_contact({
+            "campaign_id": other_campaign.id,
+            "name": "Other Campaign Contact",
+            "profile_url": "https://linkedin.com/in/other",
+            "status": "sent",
+        })
+
+        assert db_manager.count_contacts_by_statuses(
+            campaign.id, ["sent", "possibly_sent"]
+        ) == 3
+        assert db_manager.count_contacts_by_statuses(campaign.id, ["accepted"]) == 1
+        assert db_manager.count_contacts_by_statuses(campaign.id, ["declined"]) == 0
+
     def test_upsert_contact_creates_when_absent(self, db_manager):
         """upsert_contact creates a fresh row, like create_contact."""
         campaign = db_manager.create_campaign({"name": "Test Campaign"})

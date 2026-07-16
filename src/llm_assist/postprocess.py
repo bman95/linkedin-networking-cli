@@ -51,11 +51,19 @@ def has_foreign_placeholder(template: str | None) -> bool:
     return _FOREIGN_PLACEHOLDER_RE.search(template) is not None
 
 
+# The form's daily-limit bound — also enforced by campaign_form.py's own
+# read_form validator, which imports these rather than restating the numbers,
+# so the AI-assist clamp and the form's own validation can't drift apart.
+DAILY_LIMIT_MIN = 1
+DAILY_LIMIT_MAX = 100
+
+
 def clamp_daily_limit(value: int | None) -> tuple[int | None, bool]:
-    """Clamp to the form's [1, 100] bound; flag if clamping changed it."""
+    """Clamp to the form's [DAILY_LIMIT_MIN, DAILY_LIMIT_MAX] bound; flag if
+    clamping changed it."""
     if value is None:
         return None, False
-    clamped = max(1, min(100, value))
+    clamped = max(DAILY_LIMIT_MIN, min(DAILY_LIMIT_MAX, value))
     return clamped, clamped != value
 
 
