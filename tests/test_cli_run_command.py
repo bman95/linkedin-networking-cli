@@ -6,6 +6,7 @@ right campaign + cap. The automation boundary is mocked, so no browser or
 network is exercised (the live send is validated manually by the owner).
 """
 
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,6 +122,118 @@ class TestMainDispatch:
         with pytest.raises(SystemExit) as excinfo:
             linkedin_run.main(["--help"])
         assert excinfo.value.code == 0
+
+    def test_unexpected_exception_prints_one_liner_and_exits_nonzero(self, capsys):
+        """A non-ValueError raised anywhere in run_noninteractive (e.g. a
+        locked/corrupt SQLite database, which DatabaseManager logs and
+        re-raises rather than swallows) must not leak a raw traceback — it
+        should hit the same one-line ``Error: ...`` contract as every other
+        failure path."""
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = RuntimeError("database is locked")
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc != 0
+        assert rc != 130
+        assert "Error: database is locked" in capsys.readouterr().err
+
+    def test_keyboard_interrupt_exits_130(self, capsys):
+        """Ctrl-C during a scheduled run should exit with the conventional
+        130, not an interpreter-default traceback."""
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = KeyboardInterrupt()
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 130
+        assert "Interrupted" in capsys.readouterr().err
+
+    def test_exception_with_broken_str_still_exits_cleanly(self, capsys):
+        """The guard must survive hostile exceptions too: one whose __str__
+        raises must still yield a one-line ``Error: ...`` (falling back to the
+        class name) and exit 1 — never a raw traceback from the guard itself."""
+
+        class BrokenStrError(Exception):
+            def __str__(self):
+                raise RuntimeError("str is broken")
+
+        instance = MagicMock()
+        instance.run_noninteractive.side_effect = BrokenStrError()
+        with patch.object(linkedin_run, "CampaignRunner", return_value=instance):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "Error: BrokenStrError" in captured.err
+        assert "Traceback" not in captured.err
+        assert "Logging error" not in captured.err
+
+    def test_keyboard_interrupt_during_construction_exits_130(self, capsys):
+        """The guard wraps CampaignRunner() construction too — __init__ only
+        catches Exception, so a Ctrl-C during it must reach main()'s guard."""
+        with patch.object(
+            linkedin_run, "CampaignRunner", side_effect=KeyboardInterrupt()
+        ):
+            rc = linkedin_run.main(["--campaign", "Tech Leads"])
+        assert rc == 130
+        assert "Interrupted" in capsys.readouterr().err
+
+    def test_db_error_through_real_runner_hits_the_guard(self, capsys, caplog):
+        """End-to-end through the real CampaignRunner: a non-ValueError from
+        the db layer during campaign resolution (issue #60's scenario — e.g. a
+        locked SQLite file, which DatabaseManager re-raises) must surface as
+        the one-line ``Error: ...`` contract with exit 1, no traceback on
+        either stream, and the full traceback captured by the logger. The
+        exception text is multi-line on purpose — SQLAlchemy's
+        OperationalError str() spans several lines (statement + docs link) and
+        the stderr contract must stay one line regardless."""
+        multiline = (
+            "(sqlite3.OperationalError) database is locked\n"
+            "[SQL: SELECT campaign.id FROM campaign]\n"
+            "(Background on this error at: https://sqlalche.me/e/20/e3q8)"
+        )
+
+        class _LockedDB:
+            def get_campaign(self, campaign_id):
+                raise RuntimeError(multiline)
+
+            def get_campaigns(self, active_only=True):
+                raise RuntimeError(multiline)
+
+        def _real_runner():
+            runner = object.__new__(CampaignRunner)
+            runner.db_manager = _LockedDB()
+            runner.settings = _settings(valid=True)
+            return runner
+
+        with caplog.at_level(logging.INFO, logger="linkedin_run"):
+            with patch.object(
+                linkedin_run, "CampaignRunner", side_effect=_real_runner
+            ):
+                rc = linkedin_run.main(["--campaign", "1"])
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        error_lines = [
+            line for line in captured.err.splitlines() if line.startswith("Error:")
+        ]
+        assert error_lines == [
+            "Error: (sqlite3.OperationalError) database is locked"
+        ]
+        assert "[SQL:" not in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+        # The "log" half of the contract: the traceback lands in the logger,
+        # and a one-line ERROR record (no exc_info, so no console traceback)
+        # carries the failure signal into the dedicated errors.log while
+        # opting out of the console handler (stdout carries progress only).
+        assert any(r.exc_info for r in caplog.records)
+        error_records = [
+            r for r in caplog.records if r.levelno >= logging.ERROR
+        ]
+        assert error_records
+        assert all(not r.exc_info for r in error_records)
+        assert all(
+            getattr(r, "console", True) is False for r in error_records
+        )
 
 
 # ---------------------------------------------------------------------------
