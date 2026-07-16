@@ -80,7 +80,7 @@ class SettingsScreen(BaseScreen):
     SCREEN_TITLE = "Settings"
 
     HINTS = (
-        ("tab", "fields"),
+        ("↑↓", "fields"),
         ("enter", "activate"),
         ("esc", "back"),
     )

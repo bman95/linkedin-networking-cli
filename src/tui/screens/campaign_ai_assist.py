@@ -219,7 +219,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         if llm_settings.get("mode") != "local":
             return True
         client = self._build_client(llm_settings, model)
-        return model in client.list_models()
+        return client.is_model_available(model)
 
     def perform_pull(
         self, llm_settings: dict[str, Any], model: str, on_progress, should_stop
@@ -323,7 +323,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             if not self._llm_settings.get("model"):
                 self._set_status("Hosted mode needs LLM_MODEL set.", "error")
                 return
-            if self._db_manager is not None and not self._db_manager.get_setting(
+            if self._db_manager is None or not self._db_manager.get_setting(
                 "llm_hosted_consent_ack", False
             ):
                 self._pending_description = text
