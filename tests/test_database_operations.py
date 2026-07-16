@@ -358,32 +358,6 @@ class TestContactOperations:
         assert len(accepted_contacts) == 1
         assert accepted_contacts[0].status == "accepted"
 
-    def test_count_contacts_by_statuses(self, db_manager):
-        """A SQL-COUNT sibling of get_contacts_by_status, for callers that
-        only need a size (issue #65) — one campaign's contacts across
-        multiple statuses; another campaign's contacts are excluded."""
-        campaign = db_manager.create_campaign({"name": "Test Campaign"})
-        other_campaign = db_manager.create_campaign({"name": "Other Campaign"})
-        for i, status in enumerate(("sent", "sent", "possibly_sent", "accepted")):
-            db_manager.create_contact({
-                "campaign_id": campaign.id,
-                "name": f"Contact {status}",
-                "profile_url": f"https://linkedin.com/in/{status}-{i}",
-                "status": status,
-            })
-        db_manager.create_contact({
-            "campaign_id": other_campaign.id,
-            "name": "Other Campaign Contact",
-            "profile_url": "https://linkedin.com/in/other",
-            "status": "sent",
-        })
-
-        assert db_manager.count_contacts_by_statuses(
-            campaign.id, ["sent", "possibly_sent"]
-        ) == 3
-        assert db_manager.count_contacts_by_statuses(campaign.id, ["accepted"]) == 1
-        assert db_manager.count_contacts_by_statuses(campaign.id, ["declined"]) == 0
-
     def test_upsert_contact_creates_when_absent(self, db_manager):
         """upsert_contact creates a fresh row, like create_contact."""
         campaign = db_manager.create_campaign({"name": "Test Campaign"})
@@ -1531,6 +1505,46 @@ class TestCampaignContactStats:
         assert live["total_sent"] == 3
         assert live["total_accepted"] == 1
         assert live["total_pending"] == 2
+
+    def test_get_all_campaign_contact_stats(self, db_manager):
+        """The batch variant tallies every campaign in one grouped query and
+        matches the single-campaign method per campaign; campaigns with no
+        contacts are absent (callers default to zero)."""
+        first = db_manager.create_campaign({"name": "First"})
+        second = db_manager.create_campaign({"name": "Second"})
+        empty = db_manager.create_campaign({"name": "Empty"})
+        for i, status in enumerate(("sent", "possibly_sent", "accepted")):
+            db_manager.create_contact({
+                "campaign_id": first.id,
+                "name": f"First {status}",
+                "profile_url": f"https://linkedin.com/in/first-{i}",
+                "status": status,
+            })
+        db_manager.create_contact({
+            "campaign_id": second.id,
+            "name": "Second declined",
+            "profile_url": "https://linkedin.com/in/second-0",
+            "status": "declined",
+        })
+
+        all_stats = db_manager.get_all_campaign_contact_stats()
+
+        assert all_stats[first.id] == {
+            "total_sent": 3,
+            "total_accepted": 1,
+            "total_pending": 2,
+        }
+        assert all_stats[second.id] == {
+            "total_sent": 1,
+            "total_accepted": 0,
+            "total_pending": 0,
+        }
+        assert empty.id not in all_stats
+        # Parity with the single-campaign read path.
+        for campaign_id in (first.id, second.id):
+            assert all_stats[campaign_id] == db_manager.get_campaign_contact_stats(
+                campaign_id
+            )
 
 
 # ============================================================================

@@ -137,6 +137,64 @@ async def test_navigate_to_campaigns_screen_renders_db_data(
 
 
 @pytest.mark.unit
+async def test_campaigns_list_derives_stats_from_contacts_not_stale_counters(
+    db_manager: DatabaseManager,
+):
+    """Sent/Accepted/Rate come live from ``contacts``, not ``Campaign.total_*``.
+
+    The stored counters are only synced by ``update_campaign_stats``; anything
+    that bypasses it (crash mid-run, manual edit, seed script) leaves them
+    stale. Before issue #66 this list rendered the stale stored numbers,
+    contradicting the Dashboard, which already derived live from contacts.
+    """
+    db_manager.create_campaign(
+        {
+            "name": "Stale Counters",
+            "daily_limit": 20,
+            "active": True,
+            # Stale, never-synced counters — must NOT be what renders.
+            "total_sent": 99,
+            "total_accepted": 98,
+        }
+    )
+    campaign = db_manager.get_campaigns(active_only=False)[0]
+    db_manager.create_contact(
+        {
+            "campaign_id": campaign.id,
+            "name": "Accepted 0",
+            "profile_url": "https://example.com/stale-accepted-0",
+            "status": "accepted",
+        }
+    )
+    for i in range(2):
+        db_manager.create_contact(
+            {
+                "campaign_id": campaign.id,
+                "name": f"Sent {i}",
+                "profile_url": f"https://example.com/stale-sent-{i}",
+                "status": "sent",
+            }
+        )
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "campaigns")
+        table = app.screen.query_one("#campaigns-table", DataTable)
+        for _ in range(50):
+            if table.row_count == 1:
+                break
+            await pilot.pause()
+        assert table.row_count == 1
+        cells = [str(cell) for cell in table.get_row_at(0)]
+        # Name, Status, Sent, Accepted, Rate, Daily Limit
+        assert cells[2] == "3"  # live: 2 sent + 1 accepted, not the stale 99
+        assert cells[3] == "1"  # live accepted, not the stale 98
+        assert cells[4] == "33.3%"
+        assert "99" not in cells
+        assert "98" not in cells
+
+
+@pytest.mark.unit
 async def test_campaigns_screen_handles_empty_db(db_manager: DatabaseManager):
     """An empty DB renders the screen with zero rows and a friendly message.
 

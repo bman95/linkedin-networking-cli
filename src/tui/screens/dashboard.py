@@ -155,10 +155,10 @@ class DashboardScreen(BaseScreen):
     def _recent_rows(self, campaigns) -> list[tuple]:
         """Top-N campaigns, most recently active first, as table-ready rows.
 
-        Sent/accepted/rate come from ``get_campaign_contact_stats`` — the same
-        live-from-``contacts`` source the Campaigns list and Campaign detail use
-        — so this table can't contradict them when the denormalized ``Campaign``
-        aggregates are stale (issue #66).
+        Sent/accepted/rate come from ``get_all_campaign_contact_stats`` — the
+        same live-from-``contacts`` source the Campaigns list and Campaign
+        detail use — so this table can't contradict them when the denormalized
+        ``Campaign`` aggregates are stale (issue #66).
         """
 
         def _key(c):
@@ -168,12 +168,13 @@ class DashboardScreen(BaseScreen):
             # date would raise).
             return (c.last_run or c.created_at) or datetime.min
 
+        all_stats = self._db_manager.get_all_campaign_contact_stats()
         ordered = sorted(campaigns, key=_key, reverse=True)[:RECENT_LIMIT]
         rows = []
         for c in ordered:
-            stats = self._db_manager.get_campaign_contact_stats(c.id)
-            c_sent = stats["total_sent"]
-            c_accepted = stats["total_accepted"]
+            stats = all_stats.get(c.id, {})
+            c_sent = stats.get("total_sent", 0)
+            c_accepted = stats.get("total_accepted", 0)
             rate = acceptance_rate(c_sent, c_accepted)
             rows.append(
                 (

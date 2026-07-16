@@ -5,8 +5,8 @@ blocking (each opens its own short-lived SQLite session), so they run in a
 threaded worker to keep the Textual event loop responsive. A threaded worker
 body cannot be interrupted mid-call, so a read contended by another writer on
 the same SQLite file (e.g. the classic CLI mid-campaign) holds the worker until
-the read returns; the read here is a single small query, so that window stays
-short.
+the read returns; the read here is two small queries (the campaign rows plus
+one grouped count over contacts), so that window stays short.
 """
 
 from __future__ import annotations
@@ -129,12 +129,9 @@ class CampaignsScreen(BaseScreen):
             # Live sent/accepted per campaign, from `contacts` — not the
             # denormalized Campaign.total_* columns, which can drift stale.
             # Same source Campaign detail and the Dashboard use, so this list
-            # can never disagree with them (issue #66). Cheap at this scale;
-            # this read already runs in a worker off the UI thread.
-            stats = {
-                c.id: self._db_manager.get_campaign_contact_stats(c.id)
-                for c in campaigns
-            }
+            # can never disagree with them (issue #66). One grouped query for
+            # the whole list, not a query per campaign.
+            stats = self._db_manager.get_all_campaign_contact_stats()
         except Exception as exc:  # surface the failure in-place, don't crash the UI
             self.marshal_load(
                 app, generation, self._populate, [], {}, f"Error loading campaigns: {exc}"
