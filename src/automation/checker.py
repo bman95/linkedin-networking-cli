@@ -43,10 +43,18 @@ async def smart_connection_checker(
     result: a walled page read as "no connections found" would both misreport
     to the user and let the scroll loop hammer keypresses against a checkpoint.
 
+    An unexpected (non-challenge) failure — e.g. a Playwright error mid-scroll
+    or a database error — is *not* swallowed into a clean-looking zero-stat
+    result either: it propagates to the caller, mirroring
+    ``search_and_connect`` in ``linkedin.py`` (issue #59).
+
     Returns:
         Dict with counts: {"checked": int, "newly_accepted": int, "updated": int},
         plus ``stopped: True`` after a stop request and ``truncated: True`` when
-        the scroll-rounds backstop cut the walk short.
+        the walk gave up inconclusively — the scroll-rounds backstop tripped,
+        or (with a stop marker expected from a prior check) the walk ended on
+        a single-observation heuristic without reaching the marker or
+        confirming the true end of the list.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -110,7 +118,14 @@ async def smart_connection_checker(
 
         if limit_contact:
             limit_name = limit_contact.name
-            limit_url = limit_contact.profile_url
+            # Normalize through the same cleaner applied to page-side hrefs:
+            # DB-stored URLs (from search-time extraction) carry no guaranteed
+            # trailing slash, while the walk's URLs always get one — an
+            # unnormalized marker could silently never match (issue #59).
+            # ``or None``: an empty stored URL is "no marker", not a marker
+            # that can never be reached (which would flag every inconclusive
+            # exit as truncated).
+            limit_url = _clean_profile_url(limit_contact.profile_url) or None
             if progress_callback:
                 progress_callback(f"Checking connections until: {limit_name}")
         else:
@@ -161,11 +176,12 @@ async def smart_connection_checker(
         if isinstance(challenge, (CaptchaDetectedException, NotAuthenticatedException)):
             automation._mark_session_compromised()
         raise
-    except Exception as e:
-        logger.error(f"Error in smart connection checker: {e}")
-        if progress_callback:
-            progress_callback(f"Checker failed: {str(e)}")
-        return {"checked": 0, "newly_accepted": 0, "updated": 0}
+    # No catch-all here: an unexpected error must propagate to the caller's
+    # failure handler, mirroring search_and_connect in linkedin.py. Swallowing
+    # it into a zero-stat return would let the TUI's run panel stamp a
+    # crashed check as a clean "success" (issue #59) — any acceptances the
+    # walk had already reconciled before the failure still stand in the DB;
+    # only the misleading "all zero, all fine" summary is the problem.
 
 
 async def _check_connections_page(
@@ -201,14 +217,32 @@ async def _check_connections_page(
             return True
         return False
 
-    # Create a lookup dict for faster searching
-    pending_lookup = {contact.profile_url: contact for contact in pending_contacts}
+    # Create a lookup dict for faster searching. Keys normalized like the
+    # page-side URLs (trailing slash, no query): DB-stored URLs carry no
+    # guaranteed trailing slash, and an unnormalized key would silently never
+    # match — missing the acceptance sweep's entire payload (issue #59).
+    pending_lookup = {
+        _clean_profile_url(contact.profile_url): contact
+        for contact in pending_contacts
+    }
 
     # Every profile URL processed so far. A scroll round that surfaces no NEW
-    # profile is the true end of the list (whether the DOM accumulates cards
-    # or recycles them), giving the walk a natural terminator alongside the
-    # limit_url marker — and sparing already-updated contacts a duplicate pass.
+    # profile for several consecutive rounds is the true end of the list
+    # (whether the DOM accumulates cards or recycles them), giving the walk a
+    # natural terminator alongside the limit_url marker — and sparing
+    # already-updated contacts a duplicate pass.
     seen_urls: set[str] = set()
+
+    # Whether the walk actually confirmed reaching the limit_url marker (as
+    # opposed to concluding "end of list" via a heuristic below, or hitting
+    # the scroll-rounds backstop). Only meaningful when limit_url is set.
+    reached_limit_marker = False
+
+    # Whether the walk confirmed the true end of the list (several consecutive
+    # empty rounds — a deliberate, repeated observation). The single-round
+    # heuristics (short page, empty page) and the scroll backstop do NOT set
+    # this: they are inconclusive exits.
+    confirmed_end_of_list = False
 
     # Backstop only: the natural terminators are the limit_url marker, the
     # no-new-profiles detection above, and the short-page heuristic below. The
@@ -219,6 +253,16 @@ async def _check_connections_page(
     # apart from a complete check.
     scroll_rounds = 0
     max_scroll_rounds = 40
+
+    # A single scroll round surfacing zero new profiles is not reliable proof
+    # of "end of list": the wait strategy here is fixed timeouts (ArrowDown
+    # presses + flat pauses — no network-idle or wait-for-new-card
+    # condition), so on a slow connection one round's query can run before
+    # LinkedIn paints the next batch. Require several consecutive empty
+    # rounds — each its own multi-second scroll phase — before concluding the
+    # list is actually exhausted (issue #59).
+    empty_rounds_end_threshold = 3
+    consecutive_empty_rounds = 0
 
     while not finish_process:
         if _stop_requested():
@@ -322,6 +366,7 @@ async def _check_connections_page(
                     if progress_callback:
                         progress_callback("Reached connection limit, stopping checker")
                     finish_process = True
+                    reached_limit_marker = True
                     break
 
             except (CaptchaDetectedException, NotAuthenticatedException):
@@ -336,16 +381,54 @@ async def _check_connections_page(
                 continue
 
         if not finish_process and new_this_round == 0:
-            # A whole scroll round surfaced nothing new: the end of the list.
+            consecutive_empty_rounds += 1
+            if consecutive_empty_rounds >= empty_rounds_end_threshold:
+                # Several consecutive rounds surfaced nothing new: treat this
+                # as the true end of the list rather than one stalled
+                # lazy-load.
+                confirmed_end_of_list = True
+                if progress_callback:
+                    progress_callback("Reached end of connections list")
+                break
+            if progress_callback:
+                progress_callback(
+                    "No new connections this round — giving the page a "
+                    "moment to catch up..."
+                )
+        else:
+            consecutive_empty_rounds = 0
+
+        if not finish_process and len(connections) < 10 and limit_url is None:
+            # If we got fewer than 10 connections, we might be at the end.
+            # Only taken when no stop marker is expected: a single short
+            # observation can't distinguish a genuinely short list from a
+            # stalled render, so with a marker pending the walk keeps going
+            # until a conclusive exit (the marker itself, a confirmed end of
+            # list, or the backstop) instead of guessing — a short list is
+            # exhausted within a few empty rounds anyway, and a healthy small
+            # account must never be flagged "incomplete" forever just because
+            # its marker legitimately vanished (issue #59 review).
             if progress_callback:
                 progress_callback("Reached end of connections list")
             break
 
-        if not finish_process and len(connections) < 10:
-            # If we got fewer than 10 connections, we might be at the end
-            if progress_callback:
-                progress_callback("Reached end of connections list")
-            break
+    if (
+        limit_url is not None
+        and not reached_limit_marker
+        and not confirmed_end_of_list
+        and not stats.get("stopped")
+    ):
+        # There was a specific stop marker to reconcile against (the
+        # campaign's most-recently-accepted connection) and the walk ended on
+        # an INCONCLUSIVE exit — the empty-page break or the scroll-rounds
+        # backstop — without ever confirming the marker. Flag the result so
+        # callers don't present a silently over-confident "success" (issue
+        # #59). A walk that confirmed the true end of the list is NOT flagged
+        # even when the marker was missing: the marker can legitimately
+        # vanish (the connection was removed, the list reordered), and
+        # flagging it would make "incomplete" the permanent steady state for
+        # a perfectly healthy campaign.
+        stats["truncated"] = True
 
     return stats, updated_campaign_ids
 

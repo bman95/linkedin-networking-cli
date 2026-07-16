@@ -454,6 +454,16 @@ class AutomationRunPanel(WorkerGuardMixin, Vertical):
                 log.write(spec.render(result or {}))
                 self.set_status("Stopped at your request. Press esc to return.")
                 return
+            if status == "incomplete":
+                # The checker (issue #59) finished without confirming it saw
+                # everything — never a plain green "Done." for a walk that
+                # gave up on a heuristic rather than a confirmed marker.
+                log.write(spec.render(result or {}))
+                self.set_status(
+                    "Finished, but results may be incomplete. Press esc to return.",
+                    "warn",
+                )
+                return
             log.write(spec.render(result or {}))
             self.set_status("Done. Press esc to return.", "good")
         finally:
