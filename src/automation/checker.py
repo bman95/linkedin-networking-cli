@@ -51,10 +51,10 @@ async def smart_connection_checker(
     Returns:
         Dict with counts: {"checked": int, "newly_accepted": int, "updated": int},
         plus ``stopped: True`` after a stop request and ``truncated: True`` when
-        the walk ended without confirming it reached the end of the list or a
-        known stop marker — the scroll-rounds backstop tripped, or (with a
-        stop marker expected from a prior check) it was never reached before
-        the walk gave up.
+        the walk gave up inconclusively — the scroll-rounds backstop tripped,
+        or (with a stop marker expected from a prior check) the walk ended on
+        a single-observation heuristic without reaching the marker or
+        confirming the true end of the list.
     """
     if not automation.is_authenticated:
         raise Exception("Not authenticated. Please login first.")
@@ -118,7 +118,11 @@ async def smart_connection_checker(
 
         if limit_contact:
             limit_name = limit_contact.name
-            limit_url = limit_contact.profile_url
+            # Normalize through the same cleaner applied to page-side hrefs:
+            # DB-stored URLs (from search-time extraction) carry no guaranteed
+            # trailing slash, while the walk's URLs always get one — an
+            # unnormalized marker could silently never match (issue #59).
+            limit_url = _clean_profile_url(limit_contact.profile_url)
             if progress_callback:
                 progress_callback(f"Checking connections until: {limit_name}")
         else:
@@ -224,6 +228,12 @@ async def _check_connections_page(
     # opposed to concluding "end of list" via a heuristic below, or hitting
     # the scroll-rounds backstop). Only meaningful when limit_url is set.
     reached_limit_marker = False
+
+    # Whether the walk confirmed the true end of the list (several consecutive
+    # empty rounds — a deliberate, repeated observation). The single-round
+    # heuristics (short page, empty page) and the scroll backstop do NOT set
+    # this: they are inconclusive exits.
+    confirmed_end_of_list = False
 
     # Backstop only: the natural terminators are the limit_url marker, the
     # no-new-profiles detection above, and the short-page heuristic below. The
@@ -367,6 +377,7 @@ async def _check_connections_page(
                 # Several consecutive rounds surfaced nothing new: treat this
                 # as the true end of the list rather than one stalled
                 # lazy-load.
+                confirmed_end_of_list = True
                 if progress_callback:
                     progress_callback("Reached end of connections list")
                 break
@@ -387,14 +398,19 @@ async def _check_connections_page(
     if (
         limit_url is not None
         and not reached_limit_marker
+        and not confirmed_end_of_list
         and not stats.get("stopped")
     ):
         # There was a specific stop marker to reconcile against (the
-        # campaign's most-recently-accepted connection) but the walk never
-        # confirmed reaching it — it ended via a coarser heuristic (a
-        # repeatedly-stalled end-of-list guess, the short-page heuristic, or
-        # the scroll-rounds backstop). Flag the result so callers don't
-        # present a silently over-confident "success" (issue #59).
+        # campaign's most-recently-accepted connection) and the walk ended on
+        # an INCONCLUSIVE exit — the short-page/empty-page heuristics or the
+        # scroll-rounds backstop — without ever confirming the marker. Flag
+        # the result so callers don't present a silently over-confident
+        # "success" (issue #59). A walk that confirmed the true end of the
+        # list is NOT flagged even when the marker was missing: the marker
+        # can legitimately vanish (the connection was removed, the list
+        # reordered), and flagging it would make "incomplete" the permanent
+        # steady state for a perfectly healthy campaign.
         stats["truncated"] = True
 
     return stats, updated_campaign_ids

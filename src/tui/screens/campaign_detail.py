@@ -121,11 +121,10 @@ def map_check_stats(stats: dict) -> dict:
 
     A user-requested stop is checked first (mirrors ``map_connect_results``):
     it is a normal partial completion, never dressed up as the checker's own
-    "incomplete" signal. ``truncated`` (issue #59) means the walk ended
-    without confirming it reached the end of the list or an expected stop
-    marker — the scroll-rounds backstop tripped, or a known marker from a
-    prior check was never reached — so it must not render as a plain green
-    "success" either.
+    "incomplete" signal. ``truncated`` (issue #59) means the walk gave up
+    inconclusively — the scroll-rounds backstop tripped, or an expected stop
+    marker was never reached before an inconclusive exit — so it must not
+    render as a plain green "success" either.
     """
     if stats.get("stopped"):
         status = "cancelled"

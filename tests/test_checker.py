@@ -548,11 +548,11 @@ class TestSmartCheckerWalk:
         assert "truncated" not in result
 
     @pytest.mark.asyncio
-    async def test_walk_flags_truncated_when_limit_marker_never_reached(self):
+    async def test_walk_flags_truncated_when_marker_missed_on_short_page(self):
         """A limit_url from a previous check means the walk expects a
-        specific stop marker. Concluding "end of list" via a heuristic
-        without ever seeing that marker must not report a fully-confident
-        success (issue #59 #2/#3)."""
+        specific stop marker. Ending on a single-observation heuristic (the
+        short-page exit) without ever seeing that marker must not report a
+        fully-confident success (issue #59 #2/#3)."""
         limit_url = "https://www.linkedin.com/in/bob/"
         limit = SimpleNamespace(name="Bob", profile_url=limit_url)
         contact = SimpleNamespace(
@@ -562,7 +562,38 @@ class TestSmartCheckerWalk:
         automation = _automation(pending=[contact])
         _set_limit(automation, limit)
         automation.page.query_selector = AsyncMock(return_value=None)
-        # Bob (the limit marker) never appears in any round.
+        # Fewer than 10 cards -> the short-page heuristic ends the walk after
+        # a single round; Bob (the limit marker) is not among them.
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[
+                _connection_el(f"https://www.linkedin.com/in/other{i}/")
+                for i in range(5)
+            ]
+        )
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=lambda m: None
+        )
+        assert result.get("truncated") is True
+
+    @pytest.mark.asyncio
+    async def test_confirmed_end_of_list_with_missing_marker_is_not_truncated(self):
+        """A walk that CONFIRMED the true end of the list (several consecutive
+        empty rounds) is complete even when the expected marker was missing —
+        the marker can legitimately vanish (connection removed, list
+        reordered). Flagging it would make "incomplete" the permanent steady
+        state for a healthy campaign (review finding on issue #59)."""
+        limit_url = "https://www.linkedin.com/in/bob/"
+        limit = SimpleNamespace(name="Bob", profile_url=limit_url)
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, limit)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        # A full page (>= 10 cards, so the short-page heuristic stays out of
+        # the way) that never changes: the walk sees the whole list, then
+        # confirms the end via consecutive empty rounds. Bob never appears.
         automation.page.query_selector_all = AsyncMock(
             return_value=[
                 _connection_el(f"https://www.linkedin.com/in/other{i}/")
@@ -572,7 +603,33 @@ class TestSmartCheckerWalk:
         result = await smart_connection_checker(
             automation, 1, progress_callback=lambda m: None
         )
-        assert result.get("truncated") is True
+        assert "truncated" not in result
+
+    @pytest.mark.asyncio
+    async def test_limit_marker_matches_despite_db_url_missing_trailing_slash(self):
+        """The DB-stored marker URL (search-time extraction) carries no
+        guaranteed trailing slash, while page-side URLs are normalized to have
+        one — the marker must be normalized too or it silently never matches
+        (review finding on issue #59)."""
+        limit = SimpleNamespace(
+            name="Bob", profile_url="https://www.linkedin.com/in/bob"
+        )
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, limit)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        messages = []
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el("https://www.linkedin.com/in/bob/")]
+        )
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=messages.append
+        )
+        assert any("Reached connection limit" in m for m in messages)
+        assert "truncated" not in result
 
     @pytest.mark.asyncio
     async def test_walk_survives_one_stalled_round_before_concluding_end_of_list(self):
@@ -695,6 +752,9 @@ class TestSmartCheckerWalk:
         assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
         assert "truncated" not in result
         assert any("end of connections list" in m.lower() for m in messages)
+        # Pins the consecutive-empty-rounds threshold (3): one productive
+        # round, then exactly three confirming empty rounds.
+        assert automation.page.query_selector_all.await_count == 4
 
     @pytest.mark.asyncio
     async def test_walk_pathological_feed_hits_scroll_backstop(self):
