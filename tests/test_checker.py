@@ -544,19 +544,90 @@ class TestSmartCheckerWalk:
         # Bob is the stop marker, not a pending contact -> nothing accepted.
         assert result["checked"] == 0
         assert result["newly_accepted"] == 0
+        # The marker was actually confirmed reached -> not flagged truncated.
+        assert "truncated" not in result
+
+    @pytest.mark.asyncio
+    async def test_walk_flags_truncated_when_limit_marker_never_reached(self):
+        """A limit_url from a previous check means the walk expects a
+        specific stop marker. Concluding "end of list" via a heuristic
+        without ever seeing that marker must not report a fully-confident
+        success (issue #59 #2/#3)."""
+        limit_url = "https://www.linkedin.com/in/bob/"
+        limit = SimpleNamespace(name="Bob", profile_url=limit_url)
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, limit)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        # Bob (the limit marker) never appears in any round.
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[
+                _connection_el(f"https://www.linkedin.com/in/other{i}/")
+                for i in range(10)
+            ]
+        )
+        result = await smart_connection_checker(
+            automation, 1, progress_callback=lambda m: None
+        )
+        assert result.get("truncated") is True
+
+    @pytest.mark.asyncio
+    async def test_walk_survives_one_stalled_round_before_concluding_end_of_list(self):
+        """A single scroll round with zero new cards must not end the walk —
+        only several consecutive empty rounds do. A lazy-load that catches up
+        on a later round still gets its new cards picked up (issue #59 #2)."""
+        contact = SimpleNamespace(
+            id=1, name="Jane", status="sent",
+            profile_url="https://www.linkedin.com/in/jane/",
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+
+        same_10 = [
+            _connection_el(f"https://www.linkedin.com/in/other{i}/")
+            for i in range(10)
+        ]
+        extra_5 = [
+            _connection_el(f"https://www.linkedin.com/in/more{i}/")
+            for i in range(5)
+        ]
+        # Round 1: 10 new cards. Round 2: the same 10 (a stalled lazy-load —
+        # zero new). Round 3: the lazy-load caught up and the same 10 plus 5
+        # more new cards appear. The old single-round terminator would have
+        # ended the walk after round 2 and missed those 5.
+        calls = {"n": 0}
+
+        async def _cards(_selector):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                return same_10 + extra_5
+            return same_10
+
+        automation.page.query_selector_all = AsyncMock(side_effect=_cards)
+        result = await smart_connection_checker(automation, 1)
+        # The walk survived the stalled round 2 and queried again for round 3.
+        assert calls["n"] >= 3
+        assert "truncated" not in result
 
     @pytest.mark.asyncio
     async def test_walk_handles_navigation_error(self):
+        """An unexpected (non-challenge) failure propagates instead of being
+        swallowed into a clean-looking zero-stat result (issue #59 #1): a
+        crashed check must not report as green "success"."""
         contact = SimpleNamespace(
             id=1, name="Jane", status="sent",
             profile_url="https://www.linkedin.com/in/jane/",
         )
         automation = _automation(pending=[contact])
         automation.page.goto = AsyncMock(side_effect=RuntimeError("nav boom"))
-        result = await smart_connection_checker(
-            automation, 1, progress_callback=lambda m: None
-        )
-        assert result == {"checked": 0, "newly_accepted": 0, "updated": 0}
+        with pytest.raises(RuntimeError, match="nav boom"):
+            await smart_connection_checker(
+                automation, 1, progress_callback=lambda m: None
+            )
 
     @pytest.mark.asyncio
     async def test_update_swallows_enrichment_error(self):
@@ -600,8 +671,9 @@ class TestSmartCheckerWalk:
     @pytest.mark.asyncio
     async def test_walk_without_limit_terminates_at_end_of_list(self):
         """With no stop marker and the same full page of cards every round,
-        the no-new-profiles detection ends the walk after one repeat round
-        (it looped forever before the guards existed) — and the result is NOT
+        the no-new-profiles detection ends the walk after several consecutive
+        repeat rounds (issue #59 #2: a single stalled round is not enough —
+        it looped forever before the guards existed) — and the result is NOT
         flagged as truncated: the whole list was seen."""
         contact = SimpleNamespace(
             id=1, name="Jane", status="sent",

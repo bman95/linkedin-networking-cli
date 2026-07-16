@@ -117,9 +117,24 @@ def render_connect_result(result: dict) -> str:
 
 
 def map_check_stats(stats: dict) -> dict:
-    """Map smart-checker stats onto the run panel's status contract."""
+    """Map smart-checker stats onto the run panel's status contract.
+
+    A user-requested stop is checked first (mirrors ``map_connect_results``):
+    it is a normal partial completion, never dressed up as the checker's own
+    "incomplete" signal. ``truncated`` (issue #59) means the walk ended
+    without confirming it reached the end of the list or an expected stop
+    marker — the scroll-rounds backstop tripped, or a known marker from a
+    prior check was never reached — so it must not render as a plain green
+    "success" either.
+    """
+    if stats.get("stopped"):
+        status = "cancelled"
+    elif stats.get("truncated"):
+        status = "incomplete"
+    else:
+        status = "success"
     return {
-        "status": "cancelled" if stats.get("stopped") else "success",
+        "status": status,
         "checked": stats.get("checked", 0),
         "newly_accepted": stats.get("newly_accepted", 0),
     }
@@ -130,11 +145,13 @@ def render_check_result(result: dict) -> str:
     checked = result.get("checked", 0)
     accepted = result.get("newly_accepted", 0)
     rate = (accepted / checked * 100) if checked else 0.0
-    headline = (
-        "Connection check stopped at your request — partial results."
-        if result.get("status") == "cancelled"
-        else "Connection check complete."
-    )
+    status = result.get("status")
+    if status == "cancelled":
+        headline = "Connection check stopped at your request — partial results."
+    elif status == "incomplete":
+        headline = "Connection check ended early — results may be incomplete."
+    else:
+        headline = "Connection check complete."
     return (
         f"{headline}\n"
         f"Contacts checked: {checked}\n"

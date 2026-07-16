@@ -142,6 +142,28 @@ def test_map_check_stats_maps_stopped_to_cancelled():
     assert "Connection check complete." in render_check_result(done)
 
 
+@pytest.mark.unit
+def test_map_check_stats_maps_truncated_to_incomplete():
+    """Issue #59 #3: the checker's ``truncated`` flag (a stalled/backstop
+    walk that never confirmed reaching the list end or a stop marker) must
+    not be dropped into a plain "success" — it renders as a distinct,
+    non-green "incomplete" status."""
+    result = map_check_stats({"checked": 1, "newly_accepted": 0, "truncated": True})
+    assert result["status"] == "incomplete"
+    text = render_check_result(result)
+    assert "may be incomplete" in text
+    assert "Connection check complete." not in text
+
+
+@pytest.mark.unit
+def test_map_check_stats_stopped_takes_priority_over_truncated():
+    """A user-requested stop is reported as 'cancelled' even if the walk also
+    happened to end without confirming the list end — 'cancelled' already
+    conveys 'partial results' and must not be overridden by 'incomplete'."""
+    result = map_check_stats({"stopped": True, "truncated": True})
+    assert result["status"] == "cancelled"
+
+
 # ── run pipeline via a browser-free fake ────────────────────────────────────
 
 
@@ -162,6 +184,8 @@ class _FakeRunScreen(AutomationRunScreen):
             return {"status": "login_failed"}
         if self._outcome == "safety_stop":
             return {"status": "safety_stop", "n": 3}
+        if self._outcome == "incomplete":
+            return {"status": "incomplete", "n": 5}
         return {"status": "success", "n": 7}
 
     def render_result(self, result: dict) -> str:
@@ -331,6 +355,22 @@ async def test_run_pipeline_safety_stop_is_not_a_green_done(
         await _run_fake(pilot, app, "safety_stop")
         status = await wait_text(pilot, "#run-status", "Stopped early")
         assert "Stopped early to protect the account" in status
+
+
+@pytest.mark.unit
+async def test_run_pipeline_incomplete_is_not_a_green_done(
+    db_manager: DatabaseManager,
+):
+    """Issue #59: a result status of 'incomplete' (the checker gave up
+    without confirming it saw everything) renders the summary but never a
+    green 'Done.'."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _run_fake(pilot, app, "incomplete")
+        status = await wait_text(pilot, "#run-status", "may be incomplete")
+        assert "may be incomplete" in status
+        assert "summary: n=5" in log_text(app.screen)
 
 
 # ── cooperative cancellation (issue #43) ────────────────────────────────────
