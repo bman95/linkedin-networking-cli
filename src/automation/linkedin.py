@@ -680,7 +680,19 @@ class LinkedInAutomation:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        """Async context manager exit"""
+        """Async context manager exit.
+
+        Backstop for the ``compromises_session`` flag the typed challenge
+        exceptions carry (see ``exceptions.py``): if a session-compromising
+        exception is propagating out of the ``async with`` block, mark the
+        session compromised here before ``close_browser`` runs, in case the
+        call site that detected it forgot to call
+        ``_mark_session_compromised`` itself (issue #58). A no-op when the
+        session was already marked (the flag only ever clears
+        ``is_authenticated``, never re-sets it).
+        """
+        if exc is not None and getattr(exc, "compromises_session", False):
+            self._mark_session_compromised()
         await self.close_browser()
 
     async def start_browser(self):

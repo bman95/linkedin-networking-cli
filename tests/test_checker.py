@@ -225,6 +225,81 @@ class TestChallengeSafety:
 
         automation._mark_session_compromised.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_enrichment_tab_challenge_raises_and_marks_compromised(
+        self, monkeypatch
+    ):
+        """A checkpoint hit while enriching an accepted contact's info opens a
+        NEW tab (_update_accepted_connection) and previously raised no typed
+        exception at all: the raw goto never checked the landing, and a broad
+        except swallowed anything that did go wrong, so the session stayed
+        marked authenticated and close_browser could persist a compromised
+        session.json (issue #58). It must now raise and mark the session
+        compromised exactly like a challenge on the main connections page."""
+        from exceptions import CaptchaDetectedException
+
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent", profile_url=url,
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url)]
+        )
+        new_page = AsyncMock()
+        automation.context.new_page = AsyncMock(return_value=new_page)
+
+        async def _navigate(page, target_url, **kwargs):
+            # Only the enrichment tab (not the connections-page navigation)
+            # hits the challenge, mirroring the reported scenario where
+            # automation.page never left the connections page.
+            if page is new_page:
+                raise CaptchaDetectedException("checkpoint on enrichment tab")
+            await page.goto(target_url)
+            return page
+
+        monkeypatch.setattr(
+            "automation.checker.navigate_guarded", AsyncMock(side_effect=_navigate)
+        )
+
+        with pytest.raises(CaptchaDetectedException):
+            await smart_connection_checker(automation, 1)
+
+        automation._mark_session_compromised.assert_called_once()
+        new_page.close.assert_awaited_once()
+        automation.db_manager.update_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enrichment_tab_navigates_guarded_without_recover(self):
+        """The enrichment visit drives the NEW tab itself through
+        navigate_guarded (not automation.page — it never left the connections
+        list) and disables crash recovery: a wedge on this side tab must not
+        trigger a refresh of the main connections-page context."""
+        from automation import checker as checker_module
+
+        url = "https://www.linkedin.com/in/jane/"
+        contact = SimpleNamespace(
+            id=1, campaign_id=1, name="Jane", status="sent", profile_url=url,
+        )
+        automation = _automation(pending=[contact])
+        _set_limit(automation, None)
+        automation.page.query_selector = AsyncMock(return_value=None)
+        automation.page.query_selector_all = AsyncMock(
+            return_value=[_connection_el(url)]
+        )
+        new_page = AsyncMock()
+        automation.context.new_page = AsyncMock(return_value=new_page)
+
+        await smart_connection_checker(automation, 1)
+
+        # The enrichment call is the second navigate_guarded call (the first
+        # is the connections-page navigation on automation.page).
+        enrichment_call = checker_module.navigate_guarded.call_args_list[-1]
+        assert enrichment_call.args[0] is new_page
+        assert enrichment_call.kwargs["recover"] is None
+
 
 @pytest.mark.unit
 class TestCooperativeStop:
