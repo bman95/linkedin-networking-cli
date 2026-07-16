@@ -1050,6 +1050,31 @@ class DatabaseManager:
             logger.error(f"Failed to update campaign stats for {campaign_id}: {e}")
             raise
 
+    def get_campaign_contact_stats(self, campaign_id: int) -> dict[str, int]:
+        """Live sent/accepted/pending counts for one campaign, derived directly
+        from ``contacts`` via SQL COUNT/GROUP BY.
+
+        This is the read-only counterpart of ``update_campaign_stats``: same
+        status-group definitions, same query shape, no write. Screens that show
+        a single campaign's numbers (Campaigns list, Campaign detail, the
+        Dashboard's recent-campaigns table) all call this instead of reading
+        the denormalized ``Campaign.total_*`` columns, so they can never
+        contradict each other when those columns have drifted stale (issue #66).
+        """
+        with self.get_session() as session:
+            status_counts = dict(
+                session.exec(
+                    select(Contact.status, func.count())
+                    .where(Contact.campaign_id == campaign_id)
+                    .group_by(Contact.status)
+                ).all()
+            )
+        return {
+            "total_sent": sum(status_counts.get(s, 0) for s in SENT_STATUSES),
+            "total_accepted": status_counts.get(ContactStatus.ACCEPTED, 0),
+            "total_pending": sum(status_counts.get(s, 0) for s in PENDING_STATUSES),
+        }
+
     def get_dashboard_stats(self) -> dict[str, Any]:
         """Get overall dashboard statistics"""
         try:

@@ -1417,6 +1417,122 @@ class TestCampaignStatistics:
         db_manager.update_campaign_stats(99999)
 
 
+@pytest.mark.unit
+class TestCampaignContactStats:
+    """Test the live, read-only per-campaign stats path (issue #66).
+
+    ``get_campaign_contact_stats`` is the read-only counterpart of
+    ``update_campaign_stats``: same status-group definitions, computed
+    straight from ``contacts`` instead of the denormalized ``Campaign.total_*``
+    columns, so screens using it can never show stale numbers.
+    """
+
+    def test_get_campaign_contact_stats(self, db_manager):
+        campaign = db_manager.create_campaign({"name": "Test Campaign"})
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Contact 1",
+            "profile_url": "https://linkedin.com/in/contact1",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Contact 2",
+            "profile_url": "https://linkedin.com/in/contact2",
+            "status": "accepted",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Contact 3",
+            "profile_url": "https://linkedin.com/in/contact3",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Contact 4",
+            "profile_url": "https://linkedin.com/in/contact4",
+            "status": "found",  # Not sent
+        })
+
+        stats = db_manager.get_campaign_contact_stats(campaign.id)
+        assert stats["total_sent"] == 3  # sent + accepted
+        assert stats["total_accepted"] == 1
+        assert stats["total_pending"] == 2  # sent only
+
+    def test_get_campaign_contact_stats_no_contacts(self, db_manager):
+        campaign = db_manager.create_campaign({"name": "Empty"})
+        stats = db_manager.get_campaign_contact_stats(campaign.id)
+        assert stats == {"total_sent": 0, "total_accepted": 0, "total_pending": 0}
+
+    def test_get_campaign_contact_stats_matches_update_campaign_stats(self, db_manager):
+        """Same counting rules as the write path, so the two never disagree."""
+        campaign = db_manager.create_campaign({"name": "Parity"})
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Confirmed",
+            "profile_url": "https://linkedin.com/in/confirmed",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Ambiguous",
+            "profile_url": "https://linkedin.com/in/ambiguous",
+            "status": "possibly_sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Won",
+            "profile_url": "https://linkedin.com/in/won",
+            "status": "accepted",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Reserved",
+            "profile_url": "https://linkedin.com/in/reserved",
+            "status": "reserved",
+        })
+
+        db_manager.update_campaign_stats(campaign.id)
+        stored = db_manager.get_campaign(campaign.id)
+        live = db_manager.get_campaign_contact_stats(campaign.id)
+
+        assert live["total_sent"] == stored.total_sent
+        assert live["total_accepted"] == stored.total_accepted
+        assert live["total_pending"] == stored.total_pending
+
+    def test_get_campaign_contact_stats_ignores_stale_stored_counters(self, db_manager):
+        """The whole point of #66: when the stored counters were never synced
+        (e.g. seeded directly, bypassing ``update_campaign_stats``), the live
+        read reports what ``contacts`` actually holds, not the stale columns.
+        """
+        campaign = db_manager.create_campaign(
+            {"name": "Stale", "total_sent": 12, "total_accepted": 5}
+        )
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Sent 1",
+            "profile_url": "https://linkedin.com/in/stale-sent-1",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Sent 2",
+            "profile_url": "https://linkedin.com/in/stale-sent-2",
+            "status": "sent",
+        })
+        db_manager.create_contact({
+            "campaign_id": campaign.id,
+            "name": "Accepted 1",
+            "profile_url": "https://linkedin.com/in/stale-accepted-1",
+            "status": "accepted",
+        })
+
+        live = db_manager.get_campaign_contact_stats(campaign.id)
+        assert live["total_sent"] == 3
+        assert live["total_accepted"] == 1
+        assert live["total_pending"] == 2
+
+
 # ============================================================================
 # Dashboard Statistics Tests
 # ============================================================================

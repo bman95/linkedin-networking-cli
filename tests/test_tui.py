@@ -39,14 +39,17 @@ async def open_menu_item(pilot, item_id: str) -> None:
 
 @pytest.fixture
 def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
-    """A DatabaseManager with two campaigns, one active and one inactive."""
-    db_manager.create_campaign(
+    """A DatabaseManager with two campaigns, one active and one inactive.
+
+    Sent/Accepted/Rate are derived live from ``contacts`` (issue #66), not the
+    denormalized ``Campaign.total_*`` columns, so contacts are seeded here
+    rather than passing ``total_sent``/``total_accepted`` at creation time.
+    """
+    tech = db_manager.create_campaign(
         {
             "name": "Tech Professionals",
             "daily_limit": 20,
             "active": True,
-            "total_sent": 10,
-            "total_accepted": 4,
         }
     )
     db_manager.create_campaign(
@@ -54,10 +57,27 @@ def seeded_db_manager(db_manager: DatabaseManager) -> DatabaseManager:
             "name": "Marketing Leads",
             "daily_limit": 15,
             "active": False,
-            "total_sent": 0,
-            "total_accepted": 0,
         }
     )
+    # 10 sent-group contacts, 4 accepted -> 40.0% acceptance rate.
+    for i in range(4):
+        db_manager.create_contact(
+            {
+                "campaign_id": tech.id,
+                "name": f"Accepted {i}",
+                "profile_url": f"https://example.com/tech-accepted-{i}",
+                "status": "accepted",
+            }
+        )
+    for i in range(6):
+        db_manager.create_contact(
+            {
+                "campaign_id": tech.id,
+                "name": f"Sent {i}",
+                "profile_url": f"https://example.com/tech-sent-{i}",
+                "status": "sent",
+            }
+        )
     return db_manager
 
 
@@ -278,10 +298,10 @@ async def test_stale_load_result_is_dropped(seeded_db_manager: DatabaseManager):
         current = screen._load_generation
         # A late result from a superseded load (older token) is dropped by the
         # mixin's generation gate before _populate runs.
-        screen._apply_if_current(current - 1, screen._populate, [], None)
+        screen._apply_if_current(current - 1, screen._populate, [], {}, None)
         assert table.row_count == 2
         # The current generation applies normally.
-        screen._apply_if_current(current, screen._populate, [], "Database unavailable.")
+        screen._apply_if_current(current, screen._populate, [], {}, "Database unavailable.")
         assert table.row_count == 0
         assert "Database unavailable" in str(
             screen.query_one("#campaigns-status", Static).render()

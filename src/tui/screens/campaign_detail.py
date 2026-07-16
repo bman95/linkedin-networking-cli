@@ -42,7 +42,6 @@ from cli.helpers import (
     write_contacts_csv,
 )
 from config.settings import AppSettings
-from database.models import PENDING_STATUSES
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
@@ -302,15 +301,21 @@ class CampaignDetailScreen(BaseScreen):
         c = self._db_manager.get_campaign(self._campaign_id)
         if c is None:
             return None
-        sent, accepted, pending = c.total_sent, c.total_accepted, c.total_pending
+        # Live counts from `contacts`, not the denormalized `Campaign.total_*`
+        # columns — those can drift stale (crash mid-run, manual edits,
+        # imports) and this is the same source the Campaigns list and
+        # Dashboard use, so the three screens can never disagree (issue #66).
+        stats = self._db_manager.get_campaign_contact_stats(self._campaign_id)
+        sent, accepted, pending = (
+            stats["total_sent"],
+            stats["total_accepted"],
+            stats["total_pending"],
+        )
         rate = acceptance_rate(sent, accepted)
         # The check gate mirrors the old Check screen's worklist: contacts in
-        # the sent / possibly_sent states (not the campaign's pending counter).
-        # A COUNT query, not len(get_contacts_by_status(...)) — the full rows
-        # were only ever discarded via len() (issue #65).
-        checkable = self._db_manager.count_contacts_by_statuses(
-            self._campaign_id, PENDING_STATUSES
-        )
+        # the sent / possibly_sent states — exactly `pending` above, so no
+        # second query is needed for it.
+        checkable = pending
         overview = (
             f"Name: {c.name}\n"
             f"Status: {'Active' if c.active else 'Inactive'}\n"

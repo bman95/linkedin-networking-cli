@@ -17,8 +17,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Static
 
-from cli.helpers import acceptance_rate as _acceptance_rate
-from cli.helpers import campaign_get_field
+from cli.helpers import acceptance_rate
 from database.models import Campaign
 from database.operations import DatabaseManager
 from utils.logging import get_logger
@@ -27,14 +26,6 @@ from .base import BaseScreen
 from .campaign_detail import CampaignDetailScreen
 
 logger = get_logger(__name__)
-
-
-def acceptance_rate(campaign: Campaign) -> float:
-    """Acceptance rate as a percentage, shared with the classic CLI."""
-    return _acceptance_rate(
-        campaign_get_field(campaign, "total_sent", 0),
-        campaign_get_field(campaign, "total_accepted", 0),
-    )
 
 
 class CampaignsScreen(BaseScreen):
@@ -131,18 +122,32 @@ class CampaignsScreen(BaseScreen):
     def _run_load(self, app: App, generation: int) -> None:
         """Fetch campaigns off the event loop, then populate the table."""
         if self._db_manager is None:
-            self.marshal_load(app, generation, self._populate, [], "Database unavailable.")
+            self.marshal_load(app, generation, self._populate, [], {}, "Database unavailable.")
             return
         try:
             campaigns = self._db_manager.get_campaigns(active_only=False)
+            # Live sent/accepted per campaign, from `contacts` — not the
+            # denormalized Campaign.total_* columns, which can drift stale.
+            # Same source Campaign detail and the Dashboard use, so this list
+            # can never disagree with them (issue #66). Cheap at this scale;
+            # this read already runs in a worker off the UI thread.
+            stats = {
+                c.id: self._db_manager.get_campaign_contact_stats(c.id)
+                for c in campaigns
+            }
         except Exception as exc:  # surface the failure in-place, don't crash the UI
             self.marshal_load(
-                app, generation, self._populate, [], f"Error loading campaigns: {exc}"
+                app, generation, self._populate, [], {}, f"Error loading campaigns: {exc}"
             )
             return
-        self.marshal_load(app, generation, self._populate, campaigns, None)
+        self.marshal_load(app, generation, self._populate, campaigns, stats, None)
 
-    def _populate(self, campaigns: list[Campaign], error: str | None) -> None:
+    def _populate(
+        self,
+        campaigns: list[Campaign],
+        stats: dict[int, dict[str, int]],
+        error: str | None,
+    ) -> None:
         table = self.query_one("#campaigns-table", DataTable)
         table.clear()
         status = self.query_one("#campaigns-status", Static)
@@ -151,15 +156,18 @@ class CampaignsScreen(BaseScreen):
             status.update(Text(error))
             return
         for campaign in campaigns:
+            campaign_stats = stats.get(campaign.id, {})
+            sent = campaign_stats.get("total_sent", 0)
+            accepted = campaign_stats.get("total_accepted", 0)
             table.add_row(
                 # User-controlled — render literally so a name containing Rich
                 # markup (e.g. "Q4 [/] Outreach") can't raise MarkupError and
                 # tear down the UI.
                 Text(campaign.name),
                 "Active" if campaign.active else "Inactive",
-                str(campaign.total_sent),
-                str(campaign.total_accepted),
-                f"{acceptance_rate(campaign):.1f}%",
+                str(sent),
+                str(accepted),
+                f"{acceptance_rate(sent, accepted):.1f}%",
                 str(campaign.daily_limit),
                 # Row key carries the id so activating a row opens its detail.
                 key=str(campaign.id),
