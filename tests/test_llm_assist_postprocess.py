@@ -151,6 +151,25 @@ class TestCleanKeywords:
         assert cleaned == "python"
         assert flagged is True
 
+    def test_partial_multiword_location_substring_is_dropped(self):
+        # Iteration-2 regression: "San Francisco" is neither a single word,
+        # a comma segment, nor the whole phrase of "San Francisco Bay Area",
+        # but it is still a location echo — any contiguous word run matches.
+        cleaned, flagged = clean_keywords(
+            "San Francisco, Python, Software Engineer",
+            location_text="San Francisco Bay Area",
+        )
+        assert cleaned == "Python, Software Engineer"
+        assert flagged is True
+
+    def test_empty_string_input_collapses_to_none_and_flags(self):
+        assert clean_keywords("") == (None, True)
+
+    def test_internal_multi_space_runs_are_collapsed(self):
+        cleaned, flagged = clean_keywords("data   engineers, python")
+        assert cleaned == "data engineers, python"
+        assert flagged is True
+
     def test_no_location_text_leaves_location_like_terms_alone(self):
         text = "data engineers, Berlin"
         assert clean_keywords(text, location_text=None) == (text, False)

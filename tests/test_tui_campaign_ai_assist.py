@@ -417,11 +417,48 @@ async def test_pure_noise_keywords_flag_the_field_without_overwriting_it(
         assert keywords.value == "hand typed keywords"
         assert keywords.has_class("field-flagged")
 
+        # The mentioned-but-unusable field still counts in the summary (same
+        # as _apply_match's mentioned-but-unmatched location handling): name
+        # + keywords = 2 of 8.
+        status = str(screen.query_one("#create-status", Static).render())
+        assert "Filled 2 of 8" in status
+
         # A genuine edit still clears the flag (no snapshot entry exists, so
         # the first Changed event is treated as the user's own).
         keywords.value = "python"
         await pilot.pause()
         assert keywords.has_class("field-flagged") is False
+
+
+@pytest.mark.unit
+async def test_keywords_flag_takes_first_focus_when_multiple_fields_flagged(
+    db_manager: DatabaseManager,
+):
+    """Keywords is the first flaggable field in form order, so when it is
+    flagged alongside another field the review focus starts there."""
+    app = LinkedInTUI(db_manager=db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        screen = await goto_create(pilot)
+        panel = await expand_panel(pilot, screen)
+
+        result = _result(
+            data=_extracted(keywords="data engineers", daily_limit=100),
+            flagged={"keywords", "daily_limit"},
+        )
+        panel.check_model_available = lambda *a, **k: True
+        panel.perform_extraction = lambda *a, **k: result
+
+        panel.query_one("#ai-assist-input", TextArea).text = "data engineers, high volume"
+        await pilot.pause()
+        await press_button(pilot, panel, "#ai-assist-run")
+        await wait_until(pilot, lambda: not panel._busy)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert screen.query_one("#field-keywords", Input).has_class("field-flagged")
+        assert screen.query_one("#field-daily", Input).has_class("field-flagged")
+        assert app.focused is screen.query_one("#field-keywords", Input)
 
 
 @pytest.mark.unit

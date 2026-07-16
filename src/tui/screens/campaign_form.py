@@ -582,6 +582,9 @@ def fill_form_from_extraction(screen: CampaignFormScreen, result) -> tuple[int, 
         # any existing value is left alone, but the field is still flagged so
         # the user knows the AI had nothing usable for it. No snapshot entry:
         # the value never changed, so any Changed event is a genuine edit.
+        # Counts as "mentioned" in the Filled-N-of-8 summary, same as
+        # _apply_match's mentioned-but-unmatched location/industry/network.
+        applied += 1
         flagged.append("#field-keywords")
 
     if data.daily_limit is not None:

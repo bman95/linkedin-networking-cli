@@ -71,29 +71,31 @@ def clean_keywords(
     covers those", but 1-4B models ignore it). None of this needs another
     model call: split on commas, trim, drop empties, case-insensitively
     dedupe keeping the first occurrence, then drop any term that echoes
-    ``location_text`` — a single one of its words ("Berlin"), one of its
-    comma-separated segments ("New York"), or the whole phrase copied
-    verbatim ("San Francisco Bay Area"). The single-word check can
-    false-positive on a legitimate keyword that happens to equal a location
-    word; the mandatory review step (the field is flagged whenever cleanup
-    changed anything) is the backstop for that inherent tradeoff. Returns
-    the rejoined string (``None`` if nothing survives) and whether the
-    input actually changed.
+    ``location_text`` — any contiguous run of its words, so "Berlin",
+    "New York" (from "New York, NY"), "San Francisco" AND the verbatim
+    "San Francisco Bay Area" all match, punctuation-insensitively. The
+    word-level check can false-positive on a legitimate keyword that
+    happens to equal a location word; the mandatory review step (the field
+    is flagged whenever cleanup changed anything) is the backstop for that
+    inherent tradeoff. Returns the rejoined string (``None`` if nothing
+    survives) and whether the input actually changed.
     """
     if keywords is None:
         return None, False
 
-    location = (location_text or "").lower()
-    # Single words ("berlin", "germany") …
-    location_terms = {token for token in re.split(r"\W+", location) if token}
-    # … comma-separated segments ("new york") …
-    location_terms.update(
-        segment for segment in (" ".join(s.split()) for s in location.split(",")) if segment
-    )
-    # … and the whole phrase, punctuation-normalized ("san francisco bay area").
-    whole = " ".join(token for token in re.split(r"\W+", location) if token)
-    if whole:
-        location_terms.add(whole)
+    # Every contiguous word n-gram of the location phrase, lowercased and
+    # punctuation-normalized: "San Francisco Bay Area" yields "san",
+    # "san francisco", …, "san francisco bay area" — so a partial-substring
+    # echo ("San Francisco") is dropped, not just single words, whole
+    # comma-separated segments, or the verbatim phrase.
+    location_words = [
+        token for token in re.split(r"\W+", (location_text or "").lower()) if token
+    ]
+    location_terms = {
+        " ".join(location_words[i:j])
+        for i in range(len(location_words))
+        for j in range(i + 1, len(location_words) + 1)
+    }
 
     seen: set[str] = set()
     cleaned: list[str] = []
@@ -102,11 +104,11 @@ def clean_keywords(
         if not term:
             continue
         key = term.lower()
-        if key in seen or key in location_terms:
+        if key in seen:
             continue
         # Punctuation-normalized only for the location check ("Berlin -
-        # Germany" still matches the whole phrase); the dedupe key above
-        # stays exact so "C++" never collides with "C".
+        # Germany" still matches); the dedupe key above stays exact so
+        # "C++" never collides with "C".
         if " ".join(token for token in re.split(r"\W+", key) if token) in location_terms:
             continue
         seen.add(key)
