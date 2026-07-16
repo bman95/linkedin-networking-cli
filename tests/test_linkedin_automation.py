@@ -4952,6 +4952,34 @@ class TestModalNotFoundCircuitBreaker:
         assert auto._attempt_connect.await_count == 5
 
     @pytest.mark.asyncio
+    async def test_seeded_streak_trips_profile_pass_abort_early(
+        self, mock_linkedin_automation, monkeypatch
+    ):
+        """A streak seeded from the card pass counts toward the profile-page
+        abort: with 4 carried in, ONE more modal_not_found trips the breaker
+        (the combined-streak contract behind the carry-over, end to end)."""
+        from exceptions import LinkedInAutomationError
+
+        monkeypatch.setenv("DAILY_CONNECTION_LIMIT", "20")
+        auto = mock_linkedin_automation
+        campaign = auto.db_manager.create_campaign({"name": "Modal"})
+        button = AsyncMock()
+        auto._find_connect_control = AsyncMock(return_value=(button, "connect"))
+        auto._attempt_connect = AsyncMock(return_value=ConnectResult("modal_not_found"))
+
+        with patch(
+            "automation.interactions.detect_captcha", new=AsyncMock(return_value=False)
+        ):
+            with pytest.raises(LinkedInAutomationError, match="modal not found"):
+                await auto.send_connection_requests(
+                    campaign,
+                    self._profiles(6),
+                    initial_modal_not_found_streak=4,
+                )
+
+        auto._attempt_connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_card_pass_streak_carries_into_profile_fallback(
         self, mock_linkedin_automation, monkeypatch
     ):

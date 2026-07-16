@@ -222,12 +222,17 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             return True
         base_url = llm_settings.get("base_url", DEFAULT_LLM_SETTINGS["base_url"])
         cache_key = (base_url, model)
-        cached = self._model_availability_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        if self._model_availability_cache.get(cache_key):
+            return True
         client = self._build_client(llm_settings, model)
         available = client.is_model_available(model)
-        self._model_availability_cache[cache_key] = available
+        if available:
+            # Positive-only cache: a "not found" is never remembered, so a
+            # model pulled OUTSIDE this panel (the "Show me the command
+            # instead" path, or any external `ollama pull`) is picked up by
+            # the next run's fresh probe instead of dead-ending on a stale
+            # False for the panel's lifetime.
+            self._model_availability_cache[cache_key] = True
         return available
 
     def perform_pull(
@@ -351,7 +356,10 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         No ``db_manager`` or no persisted ack means NOT consented (issue #63).
         A confirmed True is cached on the instance so repeat runs skip the
         synchronous SQLite read (issue #65); False is never cached, so the
-        gate re-reads the DB until consent actually exists.
+        gate re-reads the DB until consent actually exists. Caveat: the True
+        is sticky for this panel's lifetime — if an in-app "revoke consent"
+        path is ever added, it must also clear ``_hosted_consent_ack`` (or
+        this caching must go back to reading the DB every run).
         """
         if self._hosted_consent_ack:
             return True

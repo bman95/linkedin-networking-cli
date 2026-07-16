@@ -951,6 +951,14 @@ def test_check_model_available_caches_per_base_url_and_model():
     assert panel.check_model_available(other_settings, "gemma3:8b") is True
     assert fake_client.is_model_available.call_count == 3
 
+    # Positive-only: a "not found" is never cached, so the next press
+    # re-probes and can succeed (e.g. after an external `ollama pull`).
+    assert panel.check_model_available(settings, "other-model") is True
+    assert fake_client.is_model_available.call_count == 4
+    # ...and that success IS cached from then on.
+    assert panel.check_model_available(settings, "other-model") is True
+    assert fake_client.is_model_available.call_count == 4
+
 
 @pytest.mark.unit
 def test_check_model_available_skips_cache_in_hosted_mode():
