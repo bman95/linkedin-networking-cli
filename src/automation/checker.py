@@ -324,6 +324,13 @@ async def _check_connections_page(
                     finish_process = True
                     break
 
+            except (CaptchaDetectedException, NotAuthenticatedException):
+                # A challenge/login wall hit while enriching an accepted
+                # contact (see _update_accepted_connection) must stop the
+                # walk, not be swallowed like an ordinary per-card parsing
+                # hiccup — propagate to smart_connection_checker's own
+                # challenge handling below (issue #58).
+                raise
             except Exception as e:
                 logger.warning(f"Error processing connection element: {e}")
                 continue
@@ -348,15 +355,49 @@ async def _update_accepted_connection(
     contact,
     progress_callback: Callable | None = None,
 ) -> None:
-    """Update contact in database as accepted and collect additional info."""
+    """Update contact in database as accepted and collect additional info.
 
+    Opens a NEW tab for the contact's profile and drives it through the same
+    guarded navigation the search flows use (``navigate_guarded`` on
+    ``new_page`` — never ``automation.page``, which stays on the connections
+    list throughout), so a challenge/login bounce is detected against the tab
+    actually navigated. Without this, a checkpoint on this tab raised no
+    typed exception and never marked the session compromised, so
+    ``close_browser`` could persist a still-good ``session.json`` overwritten
+    with cookies from a session that had, in fact, just been challenged
+    (issue #58). A detected ``CaptchaDetectedException`` /
+    ``NotAuthenticatedException`` propagates instead of being swallowed; any
+    other failure (a slow/odd profile page, a scrape hiccup) remains a soft
+    failure that is logged, not raised. ``recover`` is deliberately omitted
+    (unlike the main navigation paths): a crash on this side tab must not
+    trigger a full context refresh of the still-in-progress connections walk.
+    """
+
+    # The tab is closed in the finally so a failure in goto/get_contact_info
+    # can't leak it.
+    new_page = await automation.context.new_page()
     try:
-        # Open the contact's profile to get additional info. The tab is closed
-        # in the finally so a failure in goto/get_contact_info can't leak it.
-        new_page = await automation.context.new_page()
         try:
-            await new_page.goto(contact.profile_url, timeout=30000)
+            new_page = await navigate_guarded(
+                new_page,
+                contact.profile_url,
+                check_path=False,
+                context={"profile_url": contact.profile_url},
+                **{**automation._nav_kwargs(), "recover": None},
+            )
             await new_page.wait_for_timeout(random.randint(5000, 8000))
+
+            # An in-page CAPTCHA can render without a URL bounce (the guard
+            # above only catches URL-level challenges) — mirrors the same
+            # check the connections-page walk does for exactly this reason.
+            # Without it, a checkpoint widget on this tab would leave
+            # get_contact_info to just return an empty dict, no exception at
+            # all, and the session would stay marked authenticated (issue #58).
+            if await detect_captcha(new_page):
+                raise CaptchaDetectedException(
+                    f"CAPTCHA detected while enriching accepted connection "
+                    f"{contact.name!r}"
+                )
 
             # Get updated contact info
             contact_info = await get_contact_info(new_page)
@@ -385,6 +426,8 @@ async def _update_accepted_connection(
 
         logger.info(f"Updated contact {contact.name} as accepted connection")
 
+    except (CaptchaDetectedException, NotAuthenticatedException):
+        raise
     except Exception as e:
         logger.error(f"Error updating accepted connection {contact.name}: {e}")
         if progress_callback:

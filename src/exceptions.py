@@ -31,7 +31,21 @@ class LinkedInAutomationError(Exception):
             It carries the on-disk artifact paths (``screenshot``/``dom``) so
             the CLI can point the user at the saved evidence. ``None`` when no
             bundle was captured (the CLI falls back to the artifacts directory).
+        compromises_session: Class-level flag (default ``False``) marking
+            whether this exception type represents a mid-run session
+            compromise (CAPTCHA/checkpoint/login-wall) that should clear
+            ``LinkedInAutomation.is_authenticated`` before ``session.json`` is
+            persisted. Set ``True`` on ``CaptchaDetectedException`` and
+            ``NotAuthenticatedException`` only. Existing catch sites still
+            call ``_mark_session_compromised()`` directly (kept for the
+            call-and-return-a-partial-result flows, which never let the
+            exception propagate); ``LinkedInAutomation.__aexit__`` also
+            honors this flag as a backstop, so an exception that propagates
+            out of the ``async with`` block is marked even if the call site
+            that caught and re-raised it forgot to (issue #58).
     """
+
+    compromises_session: bool = False
 
     def __init__(self, *args, evidence=None):
         """Initialize the error, optionally carrying an evidence bundle.
@@ -65,7 +79,8 @@ class NotAuthenticatedException(LinkedInAuthenticationError):
     Example:
         raise NotAuthenticatedException("Session expired. Please login again.")
     """
-    pass
+
+    compromises_session = True
 
 
 class LoginFailedException(LinkedInAuthenticationError):
@@ -181,7 +196,8 @@ class CaptchaDetectedException(LinkedInAutomationError):
     Example:
         raise CaptchaDetectedException("CAPTCHA detected - manual verification required")
     """
-    pass
+
+    compromises_session = True
 
 
 class UnexpectedLandingException(LinkedInAutomationError):

@@ -685,6 +685,82 @@ class TestContextManager:
                     pass
                 mock_close.assert_called_once()
 
+    def test_compromises_session_flag_set_only_on_challenge_exceptions(self):
+        """Pin the compromises_session invariant at its source: only the two
+        exceptions every existing catch site marks compromised for
+        (CaptchaDetectedException, NotAuthenticatedException) carry the flag;
+        everything else defaults to False, including the sibling
+        UnexpectedLandingException (a wrong landing, not a challenge)."""
+        from exceptions import (
+            BrowserProfileBusyError,
+            CaptchaDetectedException,
+            LinkedInAutomationError,
+            LoginFailedException,
+            NotAuthenticatedException,
+            RateLimitExceededException,
+            SelectorNotFoundException,
+            UnexpectedLandingException,
+        )
+
+        assert CaptchaDetectedException("x").compromises_session is True
+        assert NotAuthenticatedException("x").compromises_session is True
+
+        for exc in (
+            LinkedInAutomationError("x"),
+            LoginFailedException("x"),
+            SelectorNotFoundException("x"),
+            RateLimitExceededException("x"),
+            UnexpectedLandingException("x"),
+            BrowserProfileBusyError("x"),
+        ):
+            assert exc.compromises_session is False
+
+    @pytest.mark.asyncio
+    async def test_context_manager_exit_marks_compromised_on_flagged_exception(
+        self, db_manager, app_settings
+    ):
+        """A session-compromising exception (``compromises_session=True`` —
+        e.g. CaptchaDetectedException) propagating out of the ``async with``
+        block is marked compromised at __aexit__: a backstop for a call site
+        that detects the challenge but forgets to call
+        _mark_session_compromised itself before close_browser runs and could
+        persist a compromised session.json (issue #58)."""
+        from exceptions import CaptchaDetectedException
+
+        automation = LinkedInAutomation(db_manager, app_settings)
+        automation.is_authenticated = True
+
+        with patch.object(automation, 'start_browser', new_callable=AsyncMock):
+            with patch.object(
+                automation, 'close_browser', new_callable=AsyncMock
+            ) as mock_close:
+                with pytest.raises(CaptchaDetectedException):
+                    async with automation:
+                        raise CaptchaDetectedException("checkpoint")
+                mock_close.assert_called_once()
+
+        assert automation.is_authenticated is False
+
+    @pytest.mark.asyncio
+    async def test_context_manager_exit_ignores_non_flagged_exception(
+        self, db_manager, app_settings
+    ):
+        """A plain error carrying no ``compromises_session`` flag must not
+        clear ``is_authenticated`` — only genuine challenge exceptions do."""
+        automation = LinkedInAutomation(db_manager, app_settings)
+        automation.is_authenticated = True
+
+        with patch.object(automation, 'start_browser', new_callable=AsyncMock):
+            with patch.object(
+                automation, 'close_browser', new_callable=AsyncMock
+            ) as mock_close:
+                with pytest.raises(RuntimeError):
+                    async with automation:
+                        raise RuntimeError("unrelated failure")
+                mock_close.assert_called_once()
+
+        assert automation.is_authenticated is True
+
 
 # ============================================================================
 # Browser Hardening Tests (navigator.webdriver / AutomationControlled)

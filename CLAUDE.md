@@ -126,6 +126,23 @@ CAPTCHA/checkpoint/logout calls `_mark_session_compromised()` (clearing
 the page is sitting on a login/challenge URL at close — so a degraded context
 never clobbers a still-good `session.json`.
 
+Marking is not confined to one call site: `CaptchaDetectedException` /
+`NotAuthenticatedException` carry a class-level `compromises_session = True`
+(`exceptions.py`; every other exception defaults to `False`), and
+`LinkedInAutomation.__aexit__` honors it as a backstop — any of these two
+exceptions propagating out of the `async with LinkedInAutomation(...)` block
+marks the session compromised there too, before `close_browser` runs, even if
+the call site that detected the challenge forgot to call
+`_mark_session_compromised()` itself (issue #58). Existing catch sites that
+swallow the exception into a partial result (never letting it propagate) still
+call `_mark_session_compromised()` directly — the backstop only ever helps,
+never replaces, those. The connections-checker's per-contact enrichment visit
+(`checker._update_accepted_connection`) opens a **new tab** and drives it
+through `navigate_guarded` on that tab specifically (not `automation.page`,
+which stays on the connections list throughout) with `recover` disabled, so a
+challenge on that tab is detected against the page actually navigated and
+propagates instead of being silently absorbed.
+
 **Cross-process profile lock.** The persistent profile is guarded by
 `<app_dir>/browser_profile.lock` (`pid:token` inside, `token` a random hex id
 generated per `LinkedInAutomation` instance): `start_browser` acquires it
