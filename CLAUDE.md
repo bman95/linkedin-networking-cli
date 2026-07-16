@@ -144,7 +144,11 @@ touching the file); a token some live sibling `LinkedInAutomation` instance
 in this process holds → busy (never silently kill a sibling run's Chrome);
 any other token → a dead predecessor under our recycled PID number → stale
 (`_pid_is_alive` on one's own PID is trivially true, so PID liveness alone
-would self-deadlock the profile forever). The lock is released in
+would self-deadlock the profile forever). Same-process acquire/release are
+serialized by a `threading.Lock` (`_PROCESS_LOCK_MUTEX`) — the TUI runs
+concurrent flows on separate OS threads — and release unlinks the file
+*before* dropping the token from the registry, so a live mid-release lock is
+never misread as a dead-predecessor leftover. The lock is released in
 `close_browser`'s teardown, on a failed `start_browser`, and — if
 `_refresh_context`'s crash-recovery relaunch fails before it can reacquire —
 by a dedicated release in `_refresh_context` itself; otherwise it is held

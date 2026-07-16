@@ -4,6 +4,7 @@ import os
 import platform
 import random
 import re
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -249,12 +250,12 @@ def _read_lock(lock_path: Path) -> tuple[int, str] | None:
         return None
 
 
-# Bounded retries for the os.link acquire loop below: each iteration only
-# spins again on a lock we just proved is stale/foreign-dead/our-own (all
-# cleared before the retry), so a genuine live foreign holder always exits
-# after exactly one iteration (see acquire_profile_lock). The bound exists
-# purely as a safety net against a pathological repeated race with another
-# claimant, so it never hangs.
+# Bounded retries for the os.link acquire loop below: only the "stale lock
+# cleared, re-claim" case spins again — an already-ours lock short-circuits
+# with a return and a live foreign holder raises, both after exactly one
+# iteration (see acquire_profile_lock). The bound exists purely as a safety
+# net against a pathological repeated race with another claimant, so it
+# never hangs.
 _LOCK_ACQUIRE_RETRIES = 5
 
 # Tokens of profile locks currently held by LinkedInAutomation instances in
@@ -268,6 +269,17 @@ _LOCK_ACQUIRE_RETRIES = 5
 # sibling's token, by construction, exists in this set; a dead predecessor's
 # token cannot.
 _PROCESS_LOCK_TOKENS: set[str] = set()
+
+# Serializes same-process lock operations (acquire/release below). The TUI
+# genuinely runs concurrent automation flows on separate OS threads
+# (@work(thread=True) workers in different groups, each with its own event
+# loop), so without this mutex two windows open: (a) acquire's os.link
+# succeeds a beat before the registry .add(), letting a sibling classify the
+# brand-new live lock as a dead-predecessor leftover and unlink it; (b) a
+# releaser's read-check-unlink can straddle a sibling's stale-clear+re-claim
+# and delete the sibling's fresh lock. Cross-PROCESS exclusivity is the
+# os.link claim's job; this mutex only closes the same-process windows.
+_PROCESS_LOCK_MUTEX = threading.Lock()
 
 
 def _classify_existing_lock(
@@ -351,57 +363,71 @@ def acquire_profile_lock(user_data_dir: str, token: str) -> Path:
     tmp_path.write_text(f"{os.getpid()}:{token}", encoding="utf-8")
     try:
         for _ in range(_LOCK_ACQUIRE_RETRIES):
-            try:
-                os.link(tmp_path, lock_path)
-            except FileExistsError:
-                verdict, existing = _classify_existing_lock(
-                    lock_path, user_data_dir, token
-                )
-                if verdict == "own":
-                    _PROCESS_LOCK_TOKENS.add(token)
-                    return lock_path
-                # Stale — safe to clear. Retry the atomic claim rather than
-                # assuming we can just overwrite it: another caller may win
-                # the race in between. Re-verify the content right before the
-                # unlink so a fresh claim written since the read above is not
-                # deleted. Known residual: the filesystem offers no
-                # compare-and-unlink, so a window of a few instructions
-                # remains between this re-read and the unlink in which a
-                # concurrent claimant's brand-new lock could still be swept
-                # away. Accepted risk: it requires two processes to
-                # independently judge the SAME stale lock within microseconds
-                # of each other; the alternative (flock-serializing cleanup)
-                # is POSIX-only machinery this narrow case does not justify.
-                if _read_lock(lock_path) != existing:
-                    continue  # content changed under us — re-evaluate afresh
+            # The mutex makes each claim attempt atomic against same-process
+            # siblings: without it, the gap between a successful os.link and
+            # the registry .add() below would let a sibling read the fresh
+            # lock, miss its token in the registry, judge it a dead-
+            # predecessor leftover, and unlink a live claim.
+            with _PROCESS_LOCK_MUTEX:
                 try:
-                    lock_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    logger.debug(
-                        "Could not remove stale profile lock %s: %s", lock_path, exc
+                    os.link(tmp_path, lock_path)
+                except FileExistsError:
+                    verdict, existing = _classify_existing_lock(
+                        lock_path, user_data_dir, token
                     )
-                continue
-            except OSError as exc:
-                # Hard links unsupported here (exFAT/FAT, some network/9p
-                # mounts). Degrade to the strongest claim this filesystem
-                # offers — holder checks then a non-atomic os.replace (the
-                # pre-atomic behavior) — instead of crashing opaquely.
-                logger.warning(
-                    "Atomic hard-link lock claim failed on %s (%s); falling "
-                    "back to a non-atomic claim for this filesystem",
-                    lock_path,
-                    exc,
-                )
-                verdict, _ = _classify_existing_lock(lock_path, user_data_dir, token)
-                if verdict == "own":
+                    if verdict == "own":
+                        _PROCESS_LOCK_TOKENS.add(token)
+                        return lock_path
+                    # Stale — safe to clear. Retry the atomic claim rather
+                    # than assuming we can just overwrite it: another caller
+                    # may win the race in between. Re-verify the content
+                    # right before the unlink so a fresh claim written since
+                    # the read above is not deleted. Known residual: the
+                    # filesystem offers no compare-and-unlink, so a window of
+                    # a few instructions remains between this re-read and the
+                    # unlink in which a concurrent PROCESS's brand-new lock
+                    # could still be swept away (same-process claimants are
+                    # excluded by the mutex). Accepted risk: it requires two
+                    # processes to independently judge the SAME stale lock
+                    # within microseconds of each other; the alternative
+                    # (flock-serializing cleanup) is POSIX-only machinery
+                    # this narrow case does not justify.
+                    if _read_lock(lock_path) != existing:
+                        continue  # content changed under us — re-evaluate
+                    try:
+                        lock_path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        logger.debug(
+                            "Could not remove stale profile lock %s: %s",
+                            lock_path,
+                            exc,
+                        )
+                    continue
+                except OSError as exc:
+                    # Hard links unsupported here (exFAT/FAT, some network/9p
+                    # mounts). Degrade to the strongest claim this filesystem
+                    # offers — holder checks then a non-atomic os.replace
+                    # (the pre-atomic behavior) — instead of crashing
+                    # opaquely.
+                    logger.warning(
+                        "Atomic hard-link lock claim failed on %s (%s); "
+                        "falling back to a non-atomic claim for this "
+                        "filesystem",
+                        lock_path,
+                        exc,
+                    )
+                    verdict, _ = _classify_existing_lock(
+                        lock_path, user_data_dir, token
+                    )
+                    if verdict == "own":
+                        _PROCESS_LOCK_TOKENS.add(token)
+                        return lock_path
+                    os.replace(tmp_path, lock_path)
                     _PROCESS_LOCK_TOKENS.add(token)
                     return lock_path
-                os.replace(tmp_path, lock_path)
-                _PROCESS_LOCK_TOKENS.add(token)
-                return lock_path
-            else:
-                _PROCESS_LOCK_TOKENS.add(token)
-                return lock_path
+                else:
+                    _PROCESS_LOCK_TOKENS.add(token)
+                    return lock_path
 
         raise BrowserProfileBusyError(
             f"Could not acquire the browser profile lock at {lock_path} after "
@@ -428,16 +454,26 @@ def release_profile_lock(user_data_dir: str, token: str) -> None:
 
     The token is always dropped from ``_PROCESS_LOCK_TOKENS`` — the caller is
     done with the lock either way — so a later same-process acquire never
-    mistakes this finished instance for a live sibling.
+    mistakes this finished instance for a live sibling. The drop happens LAST
+    (after the unlink) and under the same-process mutex: discarding first
+    would open a window in which the lockfile still names this token but the
+    registry no longer does, letting a concurrent same-process acquirer
+    misjudge the live, mid-release lock as a dead-predecessor leftover —
+    and this function's subsequent unlink could then delete that acquirer's
+    freshly claimed lock, leaving the profile unguarded on disk.
     """
-    _PROCESS_LOCK_TOKENS.discard(token)
     lock_path = _profile_lock_path(user_data_dir)
-    if _read_lock(lock_path) != (os.getpid(), token):
-        return
-    try:
-        lock_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("Could not remove profile lock %s: %s", lock_path, exc)
+    with _PROCESS_LOCK_MUTEX:
+        try:
+            if _read_lock(lock_path) == (os.getpid(), token):
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.debug(
+                        "Could not remove profile lock %s: %s", lock_path, exc
+                    )
+        finally:
+            _PROCESS_LOCK_TOKENS.discard(token)
 
 
 @dataclass

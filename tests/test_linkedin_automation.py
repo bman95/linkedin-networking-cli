@@ -1383,6 +1383,9 @@ class TestBrowserProfileLock:
             acquire_profile_lock(str(user_data_dir), "my-token")
 
         assert always_exists.call_count == _LOCK_ACQUIRE_RETRIES
+        # The give-up path must clean up its temp file too, not just the
+        # successful-retry path.
+        assert list(lock_path.parent.glob("*.tmp")) == []
 
     def test_legacy_plain_pid_lock_live_is_busy(self, tmp_path):
         """A pre-token lockfile (plain PID, no colon — written by a run of the
@@ -1460,6 +1463,65 @@ class TestBrowserProfileLock:
         release_profile_lock(str(user_data_dir), "my-token")
 
         assert lock_path.exists()  # left alone — a sibling instance's lock
+
+    def test_release_with_never_registered_token_is_a_safe_noop(self, tmp_path):
+        """Releasing a token that was never registered (e.g. a busy-abort
+        path where acquire raised before adding it) must not raise and must
+        not disturb the registry — guards against a future ``.remove()``
+        swap for the ``.discard()``."""
+        from automation import linkedin as linkedin_module
+        from automation.linkedin import release_profile_lock
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        linkedin_module._PROCESS_LOCK_TOKENS.add("someone-elses-token")
+
+        release_profile_lock(str(user_data_dir), "never-registered-token")
+
+        assert linkedin_module._PROCESS_LOCK_TOKENS == {"someone-elses-token"}
+
+    def test_release_drops_registry_token_only_after_the_unlink(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression (review of issue #57 fix): the registry discard must
+        happen AFTER the lockfile unlink, not before. Discard-first opens a
+        window where the on-disk lock still names this token but the
+        registry no longer does, so a concurrent same-process acquirer
+        would misjudge the live, mid-release lock as a dead-predecessor
+        leftover and reclaim it — and this release's later unlink could then
+        delete that acquirer's fresh lock."""
+        from pathlib import Path
+
+        from automation import linkedin as linkedin_module
+        from automation.linkedin import (
+            _profile_lock_path,
+            acquire_profile_lock,
+            release_profile_lock,
+        )
+
+        user_data_dir = tmp_path / "browser_data"
+        user_data_dir.mkdir()
+        lock_path = _profile_lock_path(str(user_data_dir))
+        acquire_profile_lock(str(user_data_dir), "my-token")
+        assert "my-token" in linkedin_module._PROCESS_LOCK_TOKENS
+
+        registry_at_unlink: list[bool] = []
+        real_unlink = Path.unlink
+
+        def _recording_unlink(self, *args, **kwargs):
+            if self == lock_path:
+                registry_at_unlink.append(
+                    "my-token" in linkedin_module._PROCESS_LOCK_TOKENS
+                )
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _recording_unlink)
+
+        release_profile_lock(str(user_data_dir), "my-token")
+
+        assert registry_at_unlink == [True]  # still registered at unlink time
+        assert "my-token" not in linkedin_module._PROCESS_LOCK_TOKENS
+        assert not lock_path.exists()
 
     @pytest.mark.asyncio
     async def test_close_browser_releases_the_lock(
