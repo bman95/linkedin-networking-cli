@@ -72,13 +72,20 @@ def extract_campaign_fields(
         parsed.message_template
     )
     daily_limit, daily_limit_flagged = postprocess.clamp_daily_limit(parsed.daily_limit)
+    keywords, keywords_flagged = postprocess.clean_keywords(
+        parsed.keywords, parsed.location_text
+    )
 
     location_match = matching.match_location(parsed.location_text)
     industry_match = matching.match_industry(parsed.industry_text)
     network_match = matching.match_network(parsed.network_text)
 
     data = parsed.model_copy(
-        update={"message_template": message_template, "daily_limit": daily_limit}
+        update={
+            "message_template": message_template,
+            "daily_limit": daily_limit,
+            "keywords": keywords,
+        }
     )
 
     flagged: set[str] = set()
@@ -86,6 +93,8 @@ def extract_campaign_fields(
         flagged.add("message_template")
     if daily_limit_flagged:
         flagged.add("daily_limit")
+    if keywords_flagged:
+        flagged.add("keywords")
     if location_match.needs_review:
         flagged.add("location")
     if industry_match.needs_review:

@@ -1,6 +1,6 @@
 """Deterministic fixups applied to a parsed :class:`ExtractedCampaign`.
 
-Cheap, rule-based corrections for the two failure modes small models hit most
+Cheap, rule-based corrections for the failure modes small models hit most
 often on these specific fields — never round-tripped back through the LLM.
 """
 
@@ -57,3 +57,62 @@ def clamp_daily_limit(value: int | None) -> tuple[int | None, bool]:
         return None, False
     clamped = max(1, min(100, value))
     return clamped, clamped != value
+
+
+def clean_keywords(
+    keywords: str | None, location_text: str | None = None
+) -> tuple[str | None, bool]:
+    """Deterministically clean a comma-separated keywords string.
+
+    Small local models routinely return noisy keyword lists despite the
+    prompt's explicit instructions: exact-or-recased duplicates, stray
+    whitespace/empty entries, and terms that just repeat ``location_text``
+    (the prompt already tells the model "not locations — location_text
+    covers those", but 1-4B models ignore it). None of this needs another
+    model call: split on commas, trim, drop empties, case-insensitively
+    dedupe keeping the first occurrence, then drop any term that echoes
+    ``location_text`` — any contiguous run of its words, so "Berlin",
+    "New York" (from "New York, NY"), "San Francisco" AND the verbatim
+    "San Francisco Bay Area" all match, punctuation-insensitively. The
+    word-level check can false-positive on a legitimate keyword that
+    happens to equal a location word; the mandatory review step (the field
+    is flagged whenever cleanup changed anything) is the backstop for that
+    inherent tradeoff. Returns the rejoined string (``None`` if nothing
+    survives) and whether the input actually changed.
+    """
+    if keywords is None:
+        return None, False
+
+    # Every contiguous word n-gram of the location phrase, lowercased and
+    # punctuation-normalized: "San Francisco Bay Area" yields "san",
+    # "san francisco", …, "san francisco bay area" — so a partial-substring
+    # echo ("San Francisco") is dropped, not just single words, whole
+    # comma-separated segments, or the verbatim phrase.
+    location_words = [
+        token for token in re.split(r"\W+", (location_text or "").lower()) if token
+    ]
+    location_terms = {
+        " ".join(location_words[i:j])
+        for i in range(len(location_words))
+        for j in range(i + 1, len(location_words) + 1)
+    }
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw_term in keywords.split(","):
+        term = " ".join(raw_term.split())
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        # Punctuation-normalized only for the location check ("Berlin -
+        # Germany" still matches); the dedupe key above stays exact so
+        # "C++" never collides with "C".
+        if " ".join(token for token in re.split(r"\W+", key) if token) in location_terms:
+            continue
+        seen.add(key)
+        cleaned.append(term)
+
+    result = ", ".join(cleaned) if cleaned else None
+    return result, result != keywords

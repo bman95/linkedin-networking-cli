@@ -116,6 +116,30 @@ class TestExtractCampaignFieldsFlagging:
         result = extract_campaign_fields("desc", client)
         assert result.flagged_fields == frozenset()
 
+    def test_noisy_keywords_are_cleaned_and_flagged(self):
+        # Regression case from issue #68: a small local model duplicated
+        # terms and leaked the location into keywords.
+        client = _FakeClient(
+            [_payload(keywords="data engineers, Berlin, Berlin", location_text="Berlin")]
+        )
+        result = extract_campaign_fields("desc", client)
+        assert result.data.keywords == "data engineers"
+        assert "keywords" in result.flagged_fields
+
+    def test_clean_keywords_are_not_flagged(self):
+        client = _FakeClient([_payload(keywords="data engineers, python")])
+        result = extract_campaign_fields("desc", client)
+        assert result.data.keywords == "data engineers, python"
+        assert "keywords" not in result.flagged_fields
+
+    def test_keywords_that_are_pure_noise_collapse_to_none_and_stay_flagged(self):
+        client = _FakeClient(
+            [_payload(keywords="Berlin, Germany", location_text="Berlin, Germany")]
+        )
+        result = extract_campaign_fields("desc", client)
+        assert result.data.keywords is None
+        assert "keywords" in result.flagged_fields
+
 
 @pytest.mark.unit
 class TestExtractCampaignFieldsRepair:
