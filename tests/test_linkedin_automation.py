@@ -1464,6 +1464,56 @@ class TestBrowserProfileLock:
 
         assert lock_path.exists()  # left alone — a sibling instance's lock
 
+    def test_concurrent_thread_acquires_yield_exactly_one_winner(self, tmp_path):
+        """Real-thread regression for `_PROCESS_LOCK_MUTEX` (review of issue
+        #57 fix): the TUI runs concurrent automation flows on separate OS
+        threads, and without the mutex the gap between a winner's ``os.link``
+        and its registry ``.add()`` lets a losing thread misjudge the fresh
+        live lock as a dead-predecessor leftover, unlink it, and re-claim —
+        two threads then both believe they own the profile. Hammer the
+        acquire from many threads at once, over several rounds: every round
+        must produce exactly one winner, everyone else
+        ``BrowserProfileBusyError``, and the winner's release must leave the
+        registry clean for the next round. (Probabilistic against the exact
+        interleaving, but any failure is a real bug — there are no false
+        positives.)"""
+        from automation import linkedin as linkedin_module
+        from automation.linkedin import acquire_profile_lock, release_profile_lock
+        from exceptions import BrowserProfileBusyError
+
+        n_threads = 8
+        for round_no in range(10):
+            user_data_dir = tmp_path / f"browser_data_{round_no}"
+            user_data_dir.mkdir()
+            results: list[str] = []
+            results_lock = threading.Lock()
+            start = threading.Barrier(n_threads)
+
+            def attempt(token, udd, barrier=start, sink=results, sink_lock=results_lock):
+                barrier.wait()
+                try:
+                    acquire_profile_lock(str(udd), token)
+                    outcome = f"win:{token}"
+                except BrowserProfileBusyError:
+                    outcome = "busy"
+                with sink_lock:
+                    sink.append(outcome)
+
+            threads = [
+                threading.Thread(target=attempt, args=(f"tok-{i}", user_data_dir))
+                for i in range(n_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            wins = [r for r in results if r.startswith("win:")]
+            assert len(wins) == 1, f"round {round_no}: expected 1 winner, got {results}"
+            assert results.count("busy") == n_threads - 1
+            release_profile_lock(str(user_data_dir), wins[0].removeprefix("win:"))
+            assert linkedin_module._PROCESS_LOCK_TOKENS == set()
+
     def test_release_with_never_registered_token_is_a_safe_noop(self, tmp_path):
         """Releasing a token that was never registered (e.g. a busy-abort
         path where acquire raised before adding it) must not raise and must
