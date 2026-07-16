@@ -63,14 +63,22 @@ class TestDatabaseManagerInit:
         undisposed) would surface only as a GC-time ResourceWarning that a
         plain test run silently swallows (issue #69).
         """
+        import sqlite3
+
         db_manager = DatabaseManager(str(temp_db_path))
-        # __init__'s create_tables/migration already checked a connection out
-        # and back in, so the pool holds at least one live connection.
+        # Hold a reference to a pooled DBAPI connection: dispose() replaces
+        # the pool either way, so only the raw connection's state can prove
+        # the old connections were CLOSED rather than merely dereferenced
+        # (engine.dispose(close=False) would leave them for GC — the exact
+        # leak this issue is about).
+        raw = db_manager.engine.raw_connection()
+        dbapi_conn = raw.dbapi_connection
+        raw.close()  # return it to the pool, still open
         assert db_manager.engine.pool.checkedin() >= 1
         db_manager.close()
-        # dispose() replaces the pool; a fresh, empty pool proves the old
-        # connections were closed rather than left for garbage collection.
         assert db_manager.engine.pool.checkedin() == 0
+        with pytest.raises(sqlite3.ProgrammingError):
+            dbapi_conn.execute("SELECT 1")
 
 
 # ============================================================================

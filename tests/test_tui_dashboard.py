@@ -126,8 +126,11 @@ async def test_navigate_to_dashboard_and_back(db_manager: DatabaseManager):
         # cannot interrupt the OS thread — which could then check a connection
         # out of the engine while (or after) the db_manager fixture disposes
         # it, leaking the very sqlite3.Connection the teardown exists to close
-        # (issue #69). Waiting for "Updated" guarantees the load completed.
-        await wait_for_status(pilot, app.screen, "#dashboard-status", "Updated")
+        # (issue #69). The screen is still mounted here, so its worker is still
+        # tracked and this genuinely joins it (unlike a wait after the pop; and
+        # unlike polling the status text, which reads "No campaigns yet." — not
+        # "Updated." — for this test's unseeded DB).
+        await app.workers.wait_for_complete()
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
