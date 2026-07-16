@@ -124,6 +124,13 @@ async def test_navigate_to_dashboard_and_back(db_manager: DatabaseManager):
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
+        # The dashboard's thread-worker load may still be running (this test
+        # never waits for the "Updated" status like its siblings do). Textual
+        # does not join thread workers on shutdown, so without this wait the
+        # db_manager fixture could dispose the engine while the worker checks
+        # out a fresh connection — leaking the very sqlite3.Connection this
+        # fixture's teardown exists to close (issue #69).
+        await app.workers.wait_for_complete()
 
 
 @pytest.mark.unit
@@ -134,6 +141,10 @@ async def test_navigate_to_settings(db_manager: DatabaseManager):
         await pilot.pause()
         await open_menu_item(pilot, "settings")
         assert isinstance(app.screen, SettingsScreen)
+        # Same rationale as test_navigate_to_dashboard_and_back: let any
+        # in-flight thread-worker DB load finish before the db_manager
+        # fixture disposes the engine.
+        await app.workers.wait_for_complete()
 
 
 @pytest.mark.unit
