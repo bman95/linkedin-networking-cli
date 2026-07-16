@@ -78,6 +78,23 @@ def _restrict_permissions(path: Path, mode: int) -> None:
         logger.debug("Could not chmod %s to %o: %s", path, mode, exc)
 
 
+def resolve_artifacts_dir() -> Path:
+    """The artifacts directory path — env override first, then home default.
+
+    Pure path resolution, no filesystem side effects: shared by
+    :func:`_artifacts_dir` below (which additionally creates and locks down
+    the directory before writing into it) and ``cli.automation_errors``'
+    display-only fallback, so the two can't state the path logic twice
+    (issue #65).
+    """
+    override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
+    return (
+        Path(override)
+        if override
+        else Path.home() / ".linkedin-networking-cli" / "artifacts"
+    )
+
+
 def _artifacts_dir() -> Path:
     """Resolve the artifacts directory, creating it on demand.
 
@@ -86,12 +103,7 @@ def _artifacts_dir() -> Path:
     ``browser_data/`` under the app dir. Kept owner-only: the artifacts hold
     DOM dumps and screenshots of an authenticated session.
     """
-    override = os.getenv("LINKEDIN_CLI_ARTIFACTS_DIR")
-    base = (
-        Path(override)
-        if override
-        else Path.home() / ".linkedin-networking-cli" / "artifacts"
-    )
+    base = resolve_artifacts_dir()
     base.mkdir(parents=True, exist_ok=True)
     _restrict_permissions(base, 0o700)
     return base

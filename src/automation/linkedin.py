@@ -53,8 +53,7 @@ from automation.navigation import (
     run_bounded,
     verify_listing_rendered,
 )
-from cli.helpers import effective_daily_limit
-from config.settings import AppSettings
+from config.settings import AppSettings, effective_daily_limit
 from database.models import Campaign, Contact, ContactStatus
 from database.operations import DatabaseManager
 from exceptions import (
@@ -1598,11 +1597,7 @@ class LinkedInAutomation:
             async for _page in self._walk_search_pages(campaign, progress_callback):
                 # Page boundary is also a safe stop point (issue #43) — without
                 # this, a run of card-less result pages would delay the stop.
-                if stop_event is not None and stop_event.is_set():
-                    if progress_callback:
-                        progress_callback(
-                            "Stop requested — ending the run at a safe point"
-                        )
+                if self._stop_requested(stop_event, progress_callback):
                     stopped_reason = "cancelled"
                     stop_all = True
                     break
@@ -1626,26 +1621,15 @@ class LinkedInAutomation:
                     # Cooperative cancellation (issue #43): checked between
                     # profiles only, so the profile in flight always finishes
                     # its irreversible send tail before the run winds down.
-                    if stop_event is not None and stop_event.is_set():
-                        if progress_callback:
-                            progress_callback(
-                                "Stop requested — ending the run at a safe point"
-                            )
+                    if self._stop_requested(stop_event, progress_callback):
                         stopped_reason = "cancelled"
                         scan_done = stop_all = True
                         break
                     url = profile.profile_url
-                    # Requested per-run send cap (the `run` subcommand's --max):
-                    # counts confirmed + ambiguous sends, NOT cards scanned, so
-                    # already-contacted results never consume the budget.
-                    if (
-                        max_sends is not None
-                        and sent_count + possibly_sent_count >= max_sends
+                    # Requested per-run send cap (the `run` subcommand's --max).
+                    if self._send_cap_reached(
+                        max_sends, sent_count + possibly_sent_count, progress_callback
                     ):
-                        if progress_callback:
-                            progress_callback(
-                                f"Requested send cap reached ({max_sends} this run)"
-                            )
                         scan_done = stop_all = True
                         break
                     if len(seen_urls) >= limit:
@@ -1655,16 +1639,9 @@ class LinkedInAutomation:
                         continue
                     seen_urls.add(url)
 
-                    # Recompute the local-day key each card (midnight rollover).
-                    # Cheap early stop only — the real enforcement is the atomic
-                    # reserve in _attempt_connect.
-                    today = date.today().isoformat()
-                    if self.db_manager.get_daily_connection_count(today) >= daily_limit:
-                        if progress_callback:
-                            progress_callback(
-                                f"Daily connection limit reached "
-                                f"({daily_limit}/{daily_limit} used today)"
-                            )
+                    # Cheap per-card early stop against the persisted daily cap
+                    # (the helper recomputes the day key: midnight rollover).
+                    if self._daily_limit_reached(daily_limit, progress_callback):
                         scan_done = stop_all = True
                         break
 
@@ -1816,15 +1793,9 @@ class LinkedInAutomation:
                             stop_event,
                             page_based=result.outcome == "sent",
                         )
-                        if (
-                            result.total_today is not None
-                            and result.total_today >= daily_limit
+                        if result.total_today is not None and self._daily_limit_reached(
+                            daily_limit, progress_callback, used=result.total_today
                         ):
-                            if progress_callback:
-                                progress_callback(
-                                    f"Daily connection limit reached "
-                                    f"({result.total_today}/{daily_limit} used today)"
-                                )
                             scan_done = stop_all = True
                             break
                         # A possibly_sent refreshed the browser mid-walk, so the
@@ -1882,6 +1853,12 @@ class LinkedInAutomation:
                     progress_callback,
                     max_sends=remaining_sends,
                     stop_event=stop_event,
+                    # Carry the card pass's streak over instead of resetting
+                    # it: a run split across both passes must still abort
+                    # after _MODAL_NOT_FOUND_ABORT_THRESHOLD consecutive
+                    # no-modal outcomes combined (see the parameter's
+                    # docstring on send_connection_requests).
+                    initial_modal_not_found_streak=consecutive_modal_not_found,
                 )
                 sent_count += fb["sent"]
                 possibly_sent_count += fb.get("possibly_sent", 0)
@@ -1891,16 +1868,7 @@ class LinkedInAutomation:
 
             self.db_manager.update_campaign_stats(campaign.id)
             if modal_not_found_exhausted:
-                # The invitation modal never appeared for
-                # _MODAL_NOT_FOUND_ABORT_THRESHOLD profiles in a row — abort
-                # loudly instead of returning a normal-looking summary that
-                # hides a run which sent nothing useful.
-                raise LinkedInAutomationError(
-                    "Invitation modal not found "
-                    f"{self._MODAL_NOT_FOUND_ABORT_THRESHOLD} times in a row — "
-                    "LinkedIn UI language unsupported or markup changed; "
-                    "aborting to avoid a useless run"
-                )
+                raise self._modal_not_found_abort_error()
             return {
                 "sent": sent_count,
                 "possibly_sent": possibly_sent_count,
@@ -1941,13 +1909,86 @@ class LinkedInAutomation:
     def _effective_daily_limit(campaign, automation_settings) -> int:
         """The daily invitation cap actually enforced for this run.
 
-        Delegates to the shared ``cli.helpers.effective_daily_limit`` rule —
+        Delegates to the shared ``config.settings.effective_daily_limit`` rule —
         the same one display surfaces use — so what a run enforces can never
         drift from what the UI shows (issue #46).
         """
         return effective_daily_limit(
             getattr(campaign, "daily_limit", None),
             automation_settings["daily_connection_limit"],
+        )
+
+    # ── per-run policy checks, shared by both send loops (issue #65) ────────
+    # search_and_connect (the card pass) and send_connection_requests (the
+    # profile-page pass) enforce the same run policy; these helpers own the
+    # check + progress copy so the two loops can't drift. Each loop keeps its
+    # own flow control (break vs. scan_done/stop_all flags) around them.
+
+    @staticmethod
+    def _stop_requested(stop_event, progress_callback) -> bool:
+        """True when a cooperative stop was requested (issue #43); emits the notice.
+
+        Polled between profiles/cards only — never inside the irreversible
+        reserve→click→send tail — so the item in flight always completes.
+        """
+        if stop_event is None or not stop_event.is_set():
+            return False
+        if progress_callback:
+            progress_callback("Stop requested — ending the run at a safe point")
+        return True
+
+    @staticmethod
+    def _send_cap_reached(max_sends, sends_so_far, progress_callback) -> bool:
+        """True when the per-run send cap (``--max``) is spent; emits the notice.
+
+        Counts confirmed + ambiguous sends, NOT items scanned, so
+        already-contacted results never consume the budget.
+        """
+        if max_sends is None or sends_so_far < max_sends:
+            return False
+        if progress_callback:
+            progress_callback(f"Requested send cap reached ({max_sends} this run)")
+        return True
+
+    def _daily_limit_reached(self, daily_limit, progress_callback, used=None) -> bool:
+        """Cheap early stop against the persisted daily cap; emits the notice.
+
+        ``used`` is an already-known count (e.g. ``ConnectResult.total_today``
+        after a send); ``None`` reads the persisted count for the current
+        local day (recomputing the day key, so a run crossing midnight starts
+        a fresh bucket). This is only the early stop — the real enforcement is
+        the atomic reserve in :meth:`_attempt_connect`.
+        """
+        if used is None:
+            count = self.db_manager.get_daily_connection_count(
+                date.today().isoformat()
+            )
+            if count < daily_limit:
+                return False
+            shown = daily_limit  # historical pre-check copy: "N/N used today"
+        else:
+            if used < daily_limit:
+                return False
+            shown = used
+        if progress_callback:
+            progress_callback(
+                f"Daily connection limit reached ({shown}/{daily_limit} used today)"
+            )
+        return True
+
+    def _modal_not_found_abort_error(self) -> LinkedInAutomationError:
+        """The loud abort raised after the modal_not_found streak trips.
+
+        Raised (identically) by both send loops once
+        ``_MODAL_NOT_FOUND_ABORT_THRESHOLD`` consecutive profiles never showed
+        the invitation modal — instead of returning a normal-looking summary
+        that hides a run which sent nothing useful.
+        """
+        return LinkedInAutomationError(
+            "Invitation modal not found "
+            f"{self._MODAL_NOT_FOUND_ABORT_THRESHOLD} times in a row — "
+            "LinkedIn UI language unsupported or markup changed; "
+            "aborting to avoid a useless run"
         )
 
     def _emit_cooldown_notice(self, automation_settings, progress_callback) -> None:
@@ -2021,6 +2062,7 @@ class LinkedInAutomation:
         progress_callback: Callable | None = None,
         max_sends: int | None = None,
         stop_event: Any | None = None,
+        initial_modal_not_found_streak: int = 0,
     ) -> dict[str, int]:
         """Send connection requests to profiles.
 
@@ -2034,6 +2076,14 @@ class LinkedInAutomation:
         **between profiles** — never inside :meth:`_attempt_connect` — so a
         stop request lets the in-flight send finish and returns the normal
         partial summary (issue #43).
+
+        ``initial_modal_not_found_streak`` seeds the consecutive
+        "modal_not_found" counter (see ``_MODAL_NOT_FOUND_ABORT_THRESHOLD``).
+        :meth:`search_and_connect` passes its own card-pass streak in here when
+        falling back to this profile-page pass, so a run split across both
+        passes still aborts after ``_MODAL_NOT_FOUND_ABORT_THRESHOLD``
+        consecutive no-modal outcomes *combined*, instead of each pass getting
+        its own fresh budget and never tripping the abort.
         """
 
         if not self.is_authenticated:
@@ -2049,7 +2099,7 @@ class LinkedInAutomation:
         existing_count = 0
         stopped_reason: str | None = None  # set on an account-safety stop
         # Consecutive "modal_not_found" streak (see _MODAL_NOT_FOUND_ABORT_THRESHOLD).
-        consecutive_modal_not_found = 0
+        consecutive_modal_not_found = initial_modal_not_found_streak
         modal_not_found_exhausted = False
 
         # Persisted, restart-safe daily cap. The count is keyed by the local
@@ -2093,37 +2143,22 @@ class LinkedInAutomation:
         for i, profile in enumerate(profiles):
             # Cooperative cancellation (issue #43): between profiles only, so
             # the in-flight reserve→click→send tail is never interrupted.
-            if stop_event is not None and stop_event.is_set():
-                if progress_callback:
-                    progress_callback(
-                        "Stop requested — ending the run at a safe point"
-                    )
+            if self._stop_requested(stop_event, progress_callback):
                 stopped_reason = "cancelled"
                 break
-            today = date.today().isoformat()
             try:
                 # Requested per-run send cap (see search_and_connect): counts
                 # confirmed + ambiguous sends, not profiles processed.
-                if (
-                    max_sends is not None
-                    and sent_count + possibly_sent_count >= max_sends
+                if self._send_cap_reached(
+                    max_sends, sent_count + possibly_sent_count, progress_callback
                 ):
-                    if progress_callback:
-                        progress_callback(
-                            f"Requested send cap reached ({max_sends} this run)"
-                        )
                     break
 
-                # Recompute the local-day key each iteration so a run that
-                # crosses midnight starts a fresh bucket. The actual slot is
-                # claimed atomically just before sending (reserve-before-send),
-                # so this is only a cheap early stop, not the enforcement point.
-                if self.db_manager.get_daily_connection_count(today) >= daily_limit:
-                    if progress_callback:
-                        progress_callback(
-                            f"Daily connection limit reached "
-                            f"({daily_limit}/{daily_limit} used today)"
-                        )
+                # Cheap per-profile early stop against the persisted daily cap
+                # (the helper recomputes the day key, so a run that crosses
+                # midnight starts a fresh bucket). The actual slot is claimed
+                # atomically just before sending (reserve-before-send).
+                if self._daily_limit_reached(daily_limit, progress_callback):
                     break
 
                 if progress_callback:
@@ -2305,15 +2340,9 @@ class LinkedInAutomation:
                         page_based=result.outcome == "sent",
                     )
                     # Check the persisted daily limit (cumulative across restarts).
-                    if (
-                        result.total_today is not None
-                        and result.total_today >= daily_limit
+                    if result.total_today is not None and self._daily_limit_reached(
+                        daily_limit, progress_callback, used=result.total_today
                     ):
-                        if progress_callback:
-                            progress_callback(
-                                f"Daily connection limit reached "
-                                f"({result.total_today}/{daily_limit} used today)"
-                            )
                         break
                     continue
                 # Soft failures (email_required, blocked, modal_not_found,
@@ -2436,16 +2465,7 @@ class LinkedInAutomation:
         self.db_manager.update_campaign_stats(campaign.id)
 
         if modal_not_found_exhausted:
-            # The invitation modal never appeared for
-            # _MODAL_NOT_FOUND_ABORT_THRESHOLD profiles in a row — abort
-            # loudly instead of returning a normal-looking summary that hides
-            # a run which sent nothing useful.
-            raise LinkedInAutomationError(
-                "Invitation modal not found "
-                f"{self._MODAL_NOT_FOUND_ABORT_THRESHOLD} times in a row — "
-                "LinkedIn UI language unsupported or markup changed; "
-                "aborting to avoid a useless run"
-            )
+            raise self._modal_not_found_abort_error()
 
         return {
             "sent": sent_count,
@@ -3739,7 +3759,14 @@ class LinkedInAutomation:
     async def extract_detailed_profile(
         self, profile_url: str, progress_callback: Callable | None = None
     ) -> dict[str, Any]:
-        """Extract comprehensive profile data using enhanced scraping"""
+        """Extract comprehensive profile data using enhanced scraping.
+
+        No product caller today. Deliberately retained pending the decision
+        documented in DESIGN-PROPOSALS.md §6 (rewrite ``scraping.py`` against
+        current LinkedIn markup, fold it into a Voyager path, or delete the
+        module) — its pre-SDUI selectors likely return empty fields silently,
+        so do not wire it into a product flow before that decision lands.
+        """
         from .scraping import collect_public_information, get_contact_info, get_open_to_work_status
 
         if not self.is_authenticated:

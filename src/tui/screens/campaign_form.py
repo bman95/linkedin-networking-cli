@@ -45,10 +45,11 @@ from automation.linkedin_mappings import (
     get_network_display_names,
     get_network_value,
 )
+from llm_assist.postprocess import DAILY_LIMIT_MAX, DAILY_LIMIT_MIN
 from utils.logging import get_logger
 
 from .automation_errors import describe_automation_error
-from .base import BaseScreen
+from .base import BaseScreen, render_status_line
 
 logger = get_logger(__name__)
 
@@ -187,12 +188,7 @@ class CampaignFormScreen(BaseScreen):
         self._ai_filled_snapshot: dict[str, str] = {}
 
     def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one(self.STATUS_ID, Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        # Text() renders literally: messages carry raw exception text and user
-        # input, whose square brackets must not be parsed as markup (a selector
-        # like locator([role='option']) would otherwise be silently swallowed).
-        status.update(Text(message))
+        render_status_line(self.query_one(self.STATUS_ID, Static), message, kind)
 
     # ── dirty-form guard ──────────────────────────────────────────────────
 
@@ -435,8 +431,12 @@ def read_form(screen: CampaignFormScreen) -> tuple[dict | None, tuple[str, str] 
         daily_limit = int(daily_raw)
     except ValueError:
         daily_limit = 0
-    if not 1 <= daily_limit <= 100:
-        return None, ("Daily limit must be a number between 1 and 100.", "#field-daily")
+    if not DAILY_LIMIT_MIN <= daily_limit <= DAILY_LIMIT_MAX:
+        return None, (
+            f"Daily limit must be a number between {DAILY_LIMIT_MIN} and "
+            f"{DAILY_LIMIT_MAX}.",
+            "#field-daily",
+        )
 
     message_template = screen.query_one("#field-message", Input).value
     if "{name}" not in message_template:

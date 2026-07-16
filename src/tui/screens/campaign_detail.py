@@ -30,18 +30,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Label, ListItem, ListView, Static
 
-from cli.helpers import acceptance_rate, contacts_csv_filename, write_contacts_csv
+from cli.helpers import (
+    acceptance_rate,
+    contacts_csv_filename,
+    map_search_and_connect_result,
+    write_contacts_csv,
+)
 from config.settings import AppSettings
+from database.models import PENDING_STATUSES
 from database.operations import DatabaseManager
 from utils.logging import get_logger
 
-from .base import BaseScreen
+from .base import BaseScreen, render_status_line
 from .run_panel import AutomationRunPanel, ConfirmBar, RunSpec, run_with_linkedin
 
 logger = get_logger(__name__)
@@ -67,20 +72,12 @@ def export_contacts_csv(campaign_name: str, contacts) -> Path:
 def map_connect_results(results: dict) -> dict:
     """Map ``search_and_connect`` results onto the run panel's status contract.
 
-    Mirrors the classic CLI's ``_run_campaign_automation``: a user-requested
-    stop (issue #43) is a normal partial completion — checked first so it is
-    never dressed up as a CAPTCHA safety stop; a protective stop (inline
-    CAPTCHA / challenge wall) must never be reported as a clean run — checked
-    before the empty-scan mapping so a first-page CAPTCHA doesn't masquerade as
-    "no profiles".
+    Thin wrapper kept for import compatibility; the actual mapping is the
+    shared ``cli.helpers.map_search_and_connect_result``, also used by the
+    classic ``linkedin-run`` entry point's ``_run_campaign_automation`` so the
+    two presentations of the same automation call can't drift apart.
     """
-    if results.get("stopped_reason") == "cancelled":
-        return {**results, "status": "cancelled"}
-    if results.get("stopped_reason"):
-        return {**results, "status": "safety_stop"}
-    if results.get("scanned", 0) == 0:
-        return {"status": "no_profiles"}
-    return {**results, "status": "success"}
+    return map_search_and_connect_result(results)
 
 
 def render_connect_result(result: dict) -> str:
@@ -143,7 +140,7 @@ def render_check_result(result: dict) -> str:
     """Summary text for a connection check (moved from the old Check screen)."""
     checked = result.get("checked", 0)
     accepted = result.get("newly_accepted", 0)
-    rate = (accepted / checked * 100) if checked else 0.0
+    rate = acceptance_rate(checked, accepted)
     status = result.get("status")
     if status == "cancelled":
         headline = "Connection check stopped at your request — partial results."
@@ -309,10 +306,10 @@ class CampaignDetailScreen(BaseScreen):
         rate = acceptance_rate(sent, accepted)
         # The check gate mirrors the old Check screen's worklist: contacts in
         # the sent / possibly_sent states (not the campaign's pending counter).
-        checkable = len(
-            self._db_manager.get_contacts_by_status(self._campaign_id, "sent")
-        ) + len(
-            self._db_manager.get_contacts_by_status(self._campaign_id, "possibly_sent")
+        # A COUNT query, not len(get_contacts_by_status(...)) — the full rows
+        # were only ever discarded via len() (issue #65).
+        checkable = self._db_manager.count_contacts_by_statuses(
+            self._campaign_id, PENDING_STATUSES
         )
         overview = (
             f"Name: {c.name}\n"
@@ -699,8 +696,4 @@ class CampaignDetailScreen(BaseScreen):
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#detail-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        # Text() renders literally: messages carry campaign names and raw
-        # exception text, whose brackets must not be parsed as markup.
-        status.update(Text(message))
+        render_status_line(self.query_one("#detail-status", Static), message, kind)

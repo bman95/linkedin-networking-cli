@@ -12,6 +12,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Re-exported for callers that historically imported it from here (the classic
+# CLI's original home for this rule); the definition itself lives in
+# ``config.settings`` so the automation layer can depend on it without an
+# inverted import back into ``cli`` (issue #65).
+from config.settings import effective_daily_limit  # noqa: F401
+
 
 def campaign_get_field(campaign: Any, attr: str, default: Any = None) -> Any:
     """Read a campaign attribute regardless of the backing type.
@@ -42,23 +48,26 @@ def acceptance_rate(sent: int, accepted: int) -> float:
     return (accepted / sent * 100) if sent > 0 else 0.0
 
 
-def effective_daily_limit(campaign_limit: Any, fallback: int) -> int:
-    """The daily invitation cap actually enforced for a campaign run.
+def map_search_and_connect_result(results: dict) -> dict:
+    """Map a ``search_and_connect`` result dict onto a UI status contract.
 
-    The per-campaign ``daily_limit`` — the value shown and edited in the CLI —
-    is authoritative. It falls back to the ``DAILY_CONNECTION_LIMIT``
-    setting/env default only when the campaign carries no valid positive value
-    (so an unset/zeroed campaign still gets a sane cap). Shared by the
-    automation enforcement and every display surface so copy can never drift
-    from what a run actually enforces (issue #46).
+    Shared by the TUI (``campaign_detail.map_connect_results``) and the
+    ``linkedin-run`` entry point (``CampaignRunner._run_campaign_automation``)
+    so the two presentations of the same automation call can't drift apart.
+
+    A user-requested stop (``stopped_reason == "cancelled"``) is a normal
+    partial completion — checked first so it is never dressed up as a
+    protective CAPTCHA/challenge stop; a protective stop is checked before the
+    empty-scan mapping so a first-page CAPTCHA doesn't masquerade as
+    "no profiles".
     """
-    if (
-        isinstance(campaign_limit, int)
-        and not isinstance(campaign_limit, bool)
-        and campaign_limit > 0
-    ):
-        return campaign_limit
-    return fallback
+    if results.get("stopped_reason") == "cancelled":
+        return {**results, "status": "cancelled"}
+    if results.get("stopped_reason"):
+        return {**results, "status": "safety_stop"}
+    if results.get("scanned", 0) == 0:
+        return {**results, "status": "no_profiles"}
+    return {**results, "status": "success"}
 
 
 # Contact CSV export columns, shared by the classic CLI and the TUI so both

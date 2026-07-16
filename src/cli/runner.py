@@ -15,7 +15,11 @@ import sys
 from automation.diagnostics import _artifacts_dir
 from automation.linkedin import LinkedInAutomation
 from cli.automation_errors import describe_automation_error
-from cli.helpers import campaign_get_field, effective_daily_limit
+from cli.helpers import (
+    campaign_get_field,
+    effective_daily_limit,
+    map_search_and_connect_result,
+)
 from config.settings import AppSettings
 from database.operations import DatabaseManager
 from utils.logging import get_logger
@@ -51,9 +55,12 @@ class CampaignRunner:
         falling back to the profile-page path for cards with no Connect
         control — issue #25). ``search_limit`` caps the results scanned;
         ``max_sends`` (optional) additionally caps the invitations sent this
-        run. Returns the automation result dict with a ``status`` key
-        (``safety_stop`` when the run was cut short by a CAPTCHA/challenge to
-        protect the account).
+        run. Returns the automation result dict with a ``status`` key,
+        mapped by the shared ``cli.helpers.map_search_and_connect_result``
+        (also used by the TUI's ``campaign_detail.map_connect_results``) so
+        this entry point and the TUI can't disagree on what a given
+        ``stopped_reason`` means — ``"safety_stop"`` for a CAPTCHA/challenge
+        stop, ``"cancelled"`` for a user-requested stop.
         """
         async with LinkedInAutomation(self.db_manager, self.settings) as automation:
             progress_update("Launching browser and attaching to Chrome...")
@@ -70,29 +77,9 @@ class CampaignRunner:
                 progress_callback=progress_update,
                 max_sends=max_sends,
             )
-
-            # A protective stop (inline CAPTCHA / challenge wall) must never be
-            # reported as a clean run — checked before the empty-scan mapping so
-            # a first-page CAPTCHA doesn't masquerade as "no profiles".
-            if results.get("stopped_reason"):
-                results.update(
-                    {
-                        "status": "safety_stop",
-                        "profiles": results.get("scanned", 0),
-                    }
-                )
-                return results
-
-            if results.get("scanned", 0) == 0:
-                return {"status": "no_profiles", "profiles": 0}
-
-            results.update(
-                {
-                    "status": "success",
-                    "profiles": results.get("scanned", 0),
-                }
-            )
-            return results
+            mapped = map_search_and_connect_result(results)
+            mapped["profiles"] = mapped.get("scanned", 0)
+            return mapped
 
     def _resolve_campaign(self, reference):
         """Resolve a campaign by numeric id or by name.
@@ -120,23 +107,17 @@ class CampaignRunner:
                 "use --campaign <id> instead."
             )
 
+        def _match(predicate):
+            matches = [c for c in campaigns if predicate(c)]
+            if len(matches) > 1:
+                raise _ambiguous(matches)
+            return matches[0] if matches else None
+
         campaigns = self.db_manager.get_campaigns(active_only=False)
-        exact = [c for c in campaigns if campaign_get_field(c, "name") == ref]
-        if len(exact) > 1:
-            raise _ambiguous(exact)
-        if exact:
-            return exact[0]
         lowered = ref.lower()
-        loose = [
-            c
-            for c in campaigns
-            if (campaign_get_field(c, "name") or "").lower() == lowered
-        ]
-        if len(loose) > 1:
-            raise _ambiguous(loose)
-        if loose:
-            return loose[0]
-        return None
+        return _match(lambda c: campaign_get_field(c, "name") == ref) or _match(
+            lambda c: (campaign_get_field(c, "name") or "").lower() == lowered
+        )
 
     def run_noninteractive(self, campaign_reference, max_invites=None):
         """Execute a campaign without prompts — the ``linkedin-run`` entry point.
@@ -270,6 +251,14 @@ class CampaignRunner:
         if status == "no_profiles":
             progress_update(
                 "No profiles matched the campaign criteria. Review the filters."
+            )
+            return 0
+        if status == "cancelled":
+            sent = result.get("sent", 0)
+            possibly_sent = result.get("possibly_sent", 0)
+            progress_update(
+                "Run stopped at your request — partial results "
+                f"(sent {sent}, possibly sent {possibly_sent})."
             )
             return 0
         if status == "safety_stop":

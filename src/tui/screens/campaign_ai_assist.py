@@ -28,6 +28,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Button, Input, Label, ProgressBar, RichLog, Select, Static, TextArea
 
+from config.settings import DEFAULT_LLM_SETTINGS
 from llm_assist import (
     RECOMMENDED_MODELS,
     ExtractionResult,
@@ -46,6 +47,7 @@ from llm_assist import (
 )
 from utils.logging import get_logger
 
+from .base import render_status_line
 from .run_panel import ConfirmBar
 from .workers import WorkerGuardMixin
 
@@ -53,17 +55,6 @@ logger = get_logger(__name__)
 
 _MIN_DESCRIPTION_CHARS = 8
 _CUSTOM_MODEL = "Custom…"
-
-_DEFAULT_LLM_SETTINGS: dict[str, Any] = {
-    "mode": "local",
-    "base_url": "http://localhost:11434",
-    "api_key": None,
-    "model": None,
-    "timeout_s": 60,
-    "pull_timeout_s": 1800,
-    "max_tokens": 1024,
-    "max_input_chars": 4000,
-}
 
 
 def describe_llm_error(exc: Exception) -> str:
@@ -95,7 +86,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._db_manager = None
-        self._llm_settings: dict[str, Any] = dict(_DEFAULT_LLM_SETTINGS)
+        self._llm_settings: dict[str, Any] = dict(DEFAULT_LLM_SETTINGS)
         self._expanded = False
         self._busy = False
         self._pulling = False
@@ -103,9 +94,16 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self._pending_description: str | None = None
         self._pending_model: str | None = None
         self._stop_event: threading.Event | None = None
-        # Set once the host campaign was successfully created; a late
-        # extraction must not write into the now-locked form (see lock()).
-        self._locked = False
+        # Verified (base_url, model) -> availability results, so repeated
+        # "Fill from description" presses don't re-hit /api/tags every time
+        # (issue #65). Keyed by model too, so switching models never serves a
+        # stale result; refreshed on a successful pull (see _pull_done).
+        self._model_availability_cache: dict[tuple[str, str], bool] = {}
+        # Positive-only cache of the hosted-consent setting, so repeat runs
+        # skip the synchronous SQLite read in action_run (issue #65). Only a
+        # confirmed True is ever cached — absence/False always re-reads the
+        # DB, so the fail-closed gate (issue #63) is byte-identical.
+        self._hosted_consent_ack = False
 
     # ── compose ───────────────────────────────────────────────────────────
 
@@ -161,7 +159,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self._db_manager = getattr(self.app, "db_manager", None)
         settings = getattr(self.app, "settings", None)
         self._llm_settings = (
-            settings.get_llm_settings() if settings else dict(_DEFAULT_LLM_SETTINGS)
+            settings.get_llm_settings() if settings else dict(DEFAULT_LLM_SETTINGS)
         )
 
         self.query_one("#ai-assist-body").display = False
@@ -173,7 +171,9 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self.query_one("#missing-model-command", Static).display = False
         self.query_one("#ai-assist-privacy-notice").display = False
 
-        cap = self._llm_settings.get("max_input_chars", 4000)
+        cap = self._llm_settings.get(
+            "max_input_chars", DEFAULT_LLM_SETTINGS["max_input_chars"]
+        )
         self.query_one("#ai-assist-counter", Static).update(f"0 / {cap} characters")
 
         if self._llm_settings.get("mode") == "local":
@@ -210,7 +210,9 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         return extract_campaign_fields(
             description,
             client,
-            max_input_chars=llm_settings.get("max_input_chars", 4000),
+            max_input_chars=llm_settings.get(
+                "max_input_chars", DEFAULT_LLM_SETTINGS["max_input_chars"]
+            ),
             progress=progress,
             should_stop=should_stop,
         )
@@ -218,8 +220,20 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
     def check_model_available(self, llm_settings: dict[str, Any], model: str) -> bool:
         if llm_settings.get("mode") != "local":
             return True
+        base_url = llm_settings.get("base_url", DEFAULT_LLM_SETTINGS["base_url"])
+        cache_key = (base_url, model)
+        if self._model_availability_cache.get(cache_key):
+            return True
         client = self._build_client(llm_settings, model)
-        return client.is_model_available(model)
+        available = client.is_model_available(model)
+        if available:
+            # Positive-only cache: a "not found" is never remembered, so a
+            # model pulled OUTSIDE this panel (the "Show me the command
+            # instead" path, or any external `ollama pull`) is picked up by
+            # the next run's fresh probe instead of dead-ending on a stale
+            # False for the panel's lifetime.
+            self._model_availability_cache[cache_key] = True
+        return available
 
     def perform_pull(
         self, llm_settings: dict[str, Any], model: str, on_progress, should_stop
@@ -234,9 +248,11 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
                 base_url=llm_settings["base_url"],
                 api_key=llm_settings.get("api_key"),
                 model=model,
-                timeout_s=llm_settings.get("timeout_s", 60),
-                pull_timeout_s=llm_settings.get("pull_timeout_s", 1800),
-                max_tokens=llm_settings.get("max_tokens", 1024),
+                timeout_s=llm_settings.get("timeout_s", DEFAULT_LLM_SETTINGS["timeout_s"]),
+                pull_timeout_s=llm_settings.get(
+                    "pull_timeout_s", DEFAULT_LLM_SETTINGS["pull_timeout_s"]
+                ),
+                max_tokens=llm_settings.get("max_tokens", DEFAULT_LLM_SETTINGS["max_tokens"]),
             )
         )
 
@@ -287,7 +303,9 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id != "ai-assist-input":
             return
-        cap = self._llm_settings.get("max_input_chars", 4000)
+        cap = self._llm_settings.get(
+            "max_input_chars", DEFAULT_LLM_SETTINGS["max_input_chars"]
+        )
         self.query_one("#ai-assist-counter", Static).update(
             f"{len(event.text_area.text)} / {cap} characters"
         )
@@ -323,9 +341,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
             if not self._llm_settings.get("model"):
                 self._set_status("Hosted mode needs LLM_MODEL set.", "error")
                 return
-            if self._db_manager is None or not self._db_manager.get_setting(
-                "llm_hosted_consent_ack", False
-            ):
+            if not self._consent_acknowledged():
                 self._pending_description = text
                 self.query_one("#ai-assist-privacy-notice").display = True
                 self.query_one("#ai-assist-privacy-confirm", ConfirmBar).arm()
@@ -333,6 +349,26 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
                 return
 
         self._start_extraction(text)
+
+    def _consent_acknowledged(self) -> bool:
+        """Whether the hosted-consent gate is satisfied — fail-closed.
+
+        No ``db_manager`` or no persisted ack means NOT consented (issue #63).
+        A confirmed True is cached on the instance so repeat runs skip the
+        synchronous SQLite read (issue #65); False is never cached, so the
+        gate re-reads the DB until consent actually exists. Caveat: the True
+        is sticky for this panel's lifetime — if an in-app "revoke consent"
+        path is ever added, it must also clear ``_hosted_consent_ack`` (or
+        this caching must go back to reading the DB every run).
+        """
+        if self._hosted_consent_ack:
+            return True
+        if self._db_manager is None:
+            return False
+        if self._db_manager.get_setting("llm_hosted_consent_ack", False):
+            self._hosted_consent_ack = True
+            return True
+        return False
 
     def _selected_model(self) -> str:
         if self._llm_settings.get("mode") != "local":
@@ -435,6 +471,7 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
     def _confirm_privacy_and_run(self) -> None:
         if self._db_manager is not None:
             self._db_manager.set_setting("llm_hosted_consent_ack", True)
+            self._hosted_consent_ack = True  # mirror the persisted ack
         self.query_one("#ai-assist-privacy-notice").display = False
         text, self._pending_description = self._pending_description, None
         if text:
@@ -489,6 +526,10 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         if cancelled:
             self._set_status("Pull cancelled — no model was installed.")
             return
+        # The model is now verified available; refresh the cache entry so a
+        # later run doesn't serve the stale pre-pull "not found" result.
+        base_url = self._llm_settings.get("base_url", DEFAULT_LLM_SETTINGS["base_url"])
+        self._model_availability_cache[(base_url, model)] = True
         self._dismiss_missing_model()
         self._set_status(f"'{model}' downloaded — filling in the form…")
         text = self.query_one("#ai-assist-input", TextArea).text.strip()
@@ -544,7 +585,6 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         and disabling the panel's own controls additionally blocks a new run
         from ever starting.
         """
-        self._locked = True
         for widget in self.query("Button, Input, Select, TextArea"):
             widget.disabled = True
 
@@ -569,6 +609,4 @@ class CampaignAIAssistPanel(WorkerGuardMixin, Vertical):
         self.query_one("#ai-assist-log", RichLog).write(message)
 
     def _set_status(self, message: str, kind: str = "") -> None:
-        status = self.query_one("#ai-assist-status", Static)
-        status.set_classes(f"status-line {('-' + kind) if kind else ''}".strip())
-        status.update(Text(message))
+        render_status_line(self.query_one("#ai-assist-status", Static), message, kind)

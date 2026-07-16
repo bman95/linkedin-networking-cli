@@ -480,6 +480,38 @@ class TestRunNoninteractive:
         err = capsys.readouterr().err
         assert "CAPTCHA" in err
 
+    def test_cancelled_stop_exits_zero_with_partial_summary(self, capsys):
+        """A user-requested stop is a normal partial completion (issue #65):
+        exit 0 with the partial summary — never the CAPTCHA safety-stop error.
+        (Unreachable from linkedin-run until stop wiring exists, but the shared
+        mapper can emit it; the branch must not misreport when it does.)"""
+        campaign = SimpleNamespace(id=7, name="Growth", daily_limit=12)
+        runner = _bare_runner()
+        runner.db_manager = _FakeDB([campaign])
+        runner.settings = _settings(valid=True)
+        runner._run_campaign_automation = MagicMock(name="core")
+
+        with patch.object(
+            runner_module.asyncio,
+            "run",
+            side_effect=lambda coro: {
+                "status": "cancelled",
+                "stopped_reason": "cancelled",
+                "sent": 2,
+                "possibly_sent": 1,
+                "scanned": 5,
+                "profiles": 5,
+            },
+        ):
+            rc = runner.run_noninteractive("7")
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "stopped at your request" in captured.out
+        assert "sent 2" in captured.out
+        assert "possibly sent 1" in captured.out
+        assert "CAPTCHA" not in captured.err
+
     def test_login_failure_exits_nonzero(self):
         campaign = SimpleNamespace(id=7, name="Growth", daily_limit=12)
         runner = _bare_runner()

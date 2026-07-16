@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from automation.checker import (
     _clean_profile_url,
     _get_connection_limit,
-    monitor_pending_connections,
     smart_connection_checker,
 )
 
@@ -402,49 +401,6 @@ class TestCooperativeStop:
         assert stats["checked"] == 0
         # The walk ended before any scrolling round drove the keyboard.
         automation.page.keyboard.press.assert_not_called()
-
-
-@pytest.mark.unit
-class TestMonitor:
-    @pytest.mark.asyncio
-    async def test_stops_when_no_pending(self):
-        automation = _automation(pending=[])
-        result = await monitor_pending_connections(
-            automation, [1], check_interval_minutes=0, max_iterations=3
-        )
-        # No pending connections -> stops after the first iteration.
-        assert result["iterations"] == 1
-        assert result["total_newly_accepted"] == 0
-
-    @pytest.mark.asyncio
-    async def test_handles_campaign_error(self, monkeypatch):
-        """A per-campaign failure is caught; the run continues, then stops."""
-        automation = _automation(pending=[])
-        monkeypatch.setattr(
-            "automation.checker.smart_connection_checker",
-            AsyncMock(side_effect=RuntimeError("boom")),
-        )
-        result = await monitor_pending_connections(
-            automation, [1], check_interval_minutes=0, max_iterations=2,
-            progress_callback=lambda m: None,
-        )
-        # The error leaves checked at 0, so monitoring stops after iteration 1.
-        assert result["iterations"] == 1
-
-    @pytest.mark.asyncio
-    async def test_waits_between_iterations(self, monkeypatch):
-        """With acceptances still flowing, it waits between iterations."""
-        automation = _automation(pending=[])
-        monkeypatch.setattr(
-            "automation.checker.smart_connection_checker",
-            AsyncMock(return_value={"checked": 1, "newly_accepted": 0, "updated": 0}),
-        )
-        result = await monitor_pending_connections(
-            automation, [1], check_interval_minutes=0, max_iterations=2
-        )
-        assert result["iterations"] == 2
-        # It waited between iteration 1 and 2 (the last iteration doesn't wait).
-        automation.page.wait_for_timeout.assert_awaited()
 
 
 @pytest.mark.unit

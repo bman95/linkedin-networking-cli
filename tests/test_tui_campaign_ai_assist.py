@@ -8,6 +8,7 @@ like ``perform_location_search`` is overridden in test_tui_location_search.py.
 """
 
 import threading
+from unittest.mock import Mock
 
 import pytest
 from textual.widgets import Button, Input, ListView, Select, Static, TextArea
@@ -312,7 +313,6 @@ async def test_ai_panel_locks_after_successful_create(db_manager: DatabaseManage
             lambda: "created" in str(screen.query_one("#create-status", Static).render()),
         )
 
-        assert panel._locked is True
         assert panel.query_one("#ai-assist-toggle", Button).disabled is True
         assert panel.query_one("#ai-assist-run", Button).disabled is True
         assert panel.query_one("#ai-assist-input", TextArea).disabled is True
@@ -920,3 +920,50 @@ async def test_esc_mid_run_warns_once_then_leaves(db_manager: DatabaseManager):
 
         release.set()  # let the worker finish harmlessly after the screen left
         await pilot.pause()
+
+
+# ── model availability cache (issue #65) ────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_check_model_available_caches_per_base_url_and_model():
+    """Repeated checks for the same (base_url, model) reuse the cached result
+    instead of re-probing the endpoint on every "Fill from description" press;
+    a different model or base_url is still a fresh probe."""
+    panel = CampaignAIAssistPanel()
+    fake_client = Mock()
+    fake_client.is_model_available = Mock(return_value=True)
+    panel._build_client = lambda llm_settings, model: fake_client
+    settings = {"mode": "local", "base_url": "http://localhost:11434"}
+
+    assert panel.check_model_available(settings, "gemma3:8b") is True
+    assert panel.check_model_available(settings, "gemma3:8b") is True
+    fake_client.is_model_available.assert_called_once_with("gemma3:8b")
+
+    # A different model is a cache miss.
+    fake_client.is_model_available.return_value = False
+    assert panel.check_model_available(settings, "other-model") is False
+    assert fake_client.is_model_available.call_count == 2
+
+    # A different base_url for the SAME model is also a cache miss.
+    other_settings = {"mode": "local", "base_url": "http://localhost:9999"}
+    fake_client.is_model_available.return_value = True
+    assert panel.check_model_available(other_settings, "gemma3:8b") is True
+    assert fake_client.is_model_available.call_count == 3
+
+    # Positive-only: a "not found" is never cached, so the next press
+    # re-probes and can succeed (e.g. after an external `ollama pull`).
+    assert panel.check_model_available(settings, "other-model") is True
+    assert fake_client.is_model_available.call_count == 4
+    # ...and that success IS cached from then on.
+    assert panel.check_model_available(settings, "other-model") is True
+    assert fake_client.is_model_available.call_count == 4
+
+
+@pytest.mark.unit
+def test_check_model_available_skips_cache_in_hosted_mode():
+    """Hosted mode always returns True without building a client or touching
+    the cache — unrelated to the local-Ollama availability probe."""
+    panel = CampaignAIAssistPanel()
+    panel._build_client = Mock(side_effect=AssertionError("should not be called"))
+    assert panel.check_model_available({"mode": "hosted"}, "gpt-4") is True

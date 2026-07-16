@@ -10,7 +10,4 @@ from __future__ import annotations
 
 from cli.automation_errors import describe_automation_error, evidence_reference
 
-# Backwards-compatible alias for this module's previous private helper.
-_evidence_reference = evidence_reference
-
 __all__ = ["describe_automation_error", "evidence_reference"]
