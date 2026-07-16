@@ -248,12 +248,16 @@ class BrowserProfileBusyError(LinkedInAutomationError):
     """Exception raised when another live process already holds the
     persistent Chrome profile lock.
 
-    Raised when ``start_browser`` finds ``browser_profile.lock`` naming a PID
-    that is still alive: killing that process' Chrome (as the ordinary
+    Raised when ``start_browser`` finds ``browser_profile.lock`` naming a
+    live foreign holder — a live PID belonging to another process, or our own
+    PID with a token some live sibling ``LinkedInAutomation`` instance in
+    this process holds: killing that holder's Chrome (as the ordinary
     stale-lock cleanup would) could corrupt a legitimate concurrent run —
     e.g. the TUI and a cron-scheduled ``linkedin-run`` both targeting the
-    same profile. A dead-PID (stale) lock is cleaned up silently instead;
-    this is only raised for a live owner.
+    same profile. A stale lock — dead PID, or our own PID with a token no
+    live instance here holds (a dead predecessor under our recycled PID
+    number) — is cleaned up silently instead; this is only raised for a live
+    holder (or when the atomic claim keeps losing its bounded retry race).
 
     Example:
         raise BrowserProfileBusyError(
