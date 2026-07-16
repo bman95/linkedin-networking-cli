@@ -187,6 +187,16 @@ class DatabaseManager:
         """Get database session"""
         return Session(self.engine)
 
+    def close(self) -> None:
+        """Dispose the engine, closing all pooled SQLite connections.
+
+        SQLAlchemy's pool keeps the underlying ``sqlite3.Connection`` objects
+        open until they are garbage-collected, which surfaces as
+        ``ResourceWarning: unclosed database`` at interpreter/pytest teardown.
+        Call this when the manager is no longer needed.
+        """
+        self.engine.dispose()
+
     # Campaign operations
     def create_campaign(self, campaign_data: dict[str, Any]) -> Campaign:
         """Create a new campaign"""

@@ -27,18 +27,25 @@ class TestDatabaseManagerInit:
         # repo root (the Path assertion is cwd-independent).
         monkeypatch.chdir(tmp_path)
         db_manager = DatabaseManager()
-        assert db_manager.db_path == Path("linkedin_networking.db")
-        assert db_manager.engine is not None
+        try:
+            assert db_manager.db_path == Path("linkedin_networking.db")
+            assert db_manager.engine is not None
+        finally:
+            db_manager.close()
 
     def test_init_with_custom_path(self, temp_db_path):
         """Test initialization with custom database path."""
         db_manager = DatabaseManager(str(temp_db_path))
-        assert db_manager.db_path == temp_db_path
-        assert db_manager.engine is not None
+        try:
+            assert db_manager.db_path == temp_db_path
+            assert db_manager.engine is not None
+        finally:
+            db_manager.close()
 
     def test_create_tables(self, temp_db_path):
         """Test that tables are created on initialization."""
         db_manager = DatabaseManager(str(temp_db_path))
+        db_manager.close()
         # Verify database file was created
         assert temp_db_path.exists()
 
@@ -47,6 +54,31 @@ class TestDatabaseManagerInit:
         session = db_manager.get_session()
         assert session is not None
         session.close()
+
+    def test_close_disposes_pooled_connections(self, temp_db_path):
+        """close() must dispose the engine, releasing pooled connections.
+
+        Nothing else asserts this directly — close() is otherwise only
+        exercised via fixture teardown, where a regression (an engine left
+        undisposed) would surface only as a GC-time ResourceWarning that a
+        plain test run silently swallows (issue #69).
+        """
+        import sqlite3
+
+        db_manager = DatabaseManager(str(temp_db_path))
+        # Hold a reference to a pooled DBAPI connection: dispose() replaces
+        # the pool either way, so only the raw connection's state can prove
+        # the old connections were CLOSED rather than merely dereferenced
+        # (engine.dispose(close=False) would leave them for GC — the exact
+        # leak this issue is about).
+        raw = db_manager.engine.raw_connection()
+        dbapi_conn = raw.dbapi_connection
+        raw.close()  # return it to the pool, still open
+        assert db_manager.engine.pool.checkedin() >= 1
+        db_manager.close()
+        assert db_manager.engine.pool.checkedin() == 0
+        with pytest.raises(sqlite3.ProgrammingError):
+            dbapi_conn.execute("SELECT 1")
 
 
 # ============================================================================
@@ -762,6 +794,26 @@ class TestContactUniqueness:
 class TestContactDedupeMigration:
     """Existing duplicate contact rows are de-duped, then uniqueness applies."""
 
+    @pytest.fixture
+    def make_manager(self, temp_db_path):
+        """Build DatabaseManagers over the temp DB, closing them all at teardown.
+
+        These tests intentionally construct several managers over the same
+        file (each run triggers the startup migration); disposing every engine
+        afterwards keeps pooled sqlite3 connections from leaking past the test
+        (ResourceWarning at pytest teardown).
+        """
+        managers = []
+
+        def _make():
+            manager = DatabaseManager(str(temp_db_path))
+            managers.append(manager)
+            return manager
+
+        yield _make
+        for manager in managers:
+            manager.close()
+
     def _seed_duplicates(self, db_path, campaign_id, url, statuses):
         """Reconstruct a legacy DB state: a contact table WITHOUT uniqueness.
 
@@ -811,14 +863,14 @@ class TestContactDedupeMigration:
                 )
         engine.dispose()
 
-    def test_migration_dedupes_existing_duplicates(self, temp_db_path):
+    def test_migration_dedupes_existing_duplicates(self, temp_db_path, make_manager):
         """A DB carrying duplicate rows is collapsed to one canonical row.
 
         The keeper is the safest skip-key: a finalized outcome (an invite that
         is or may be out) wins over a pre-send reservation, so the surviving row
         is the one that prevents re-contact.
         """
-        manager = DatabaseManager(str(temp_db_path))
+        manager = make_manager()
         campaign = manager.create_campaign({"name": "Migrate"})
         url = "https://linkedin.com/in/dup"
         # Reconstruct a legacy state: three rows for one profile, the middle a
@@ -829,7 +881,7 @@ class TestContactDedupeMigration:
         )
 
         # A fresh manager over the same file runs the startup migration.
-        migrated = DatabaseManager(str(temp_db_path))
+        migrated = make_manager()
         # The additive migration added the reservation_token column to the
         # legacy table (the dedupe's ORM read would otherwise fail).
         from sqlalchemy import inspect as sa_inspect
@@ -840,22 +892,24 @@ class TestContactDedupeMigration:
         # The finalized row (the invite-may-be-out marker) is the keeper.
         assert rows[0].status == "possibly_sent"
 
-    def test_migration_keeps_highest_id_when_no_finalized(self, temp_db_path):
+    def test_migration_keeps_highest_id_when_no_finalized(
+        self, temp_db_path, make_manager
+    ):
         """With no finalized row, the most recent (highest id) write wins."""
-        manager = DatabaseManager(str(temp_db_path))
+        manager = make_manager()
         campaign = manager.create_campaign({"name": "Migrate"})
         url = "https://linkedin.com/in/dup"
         self._seed_duplicates(
             temp_db_path, campaign.id, url, ["found", "reserved"],
         )
-        migrated = DatabaseManager(str(temp_db_path))
+        migrated = make_manager()
         rows = migrated.get_contacts(campaign.id)
         assert len(rows) == 1
         # Both clobberable; the later insert (reserved, higher id) is kept.
         assert rows[0].status == "reserved"
 
     def test_migration_preserves_terminal_status_over_later_send(
-        self, temp_db_path
+        self, temp_db_path, make_manager
     ):
         """#39: a terminal accepted/declined wins over a later but weaker row.
 
@@ -865,29 +919,29 @@ class TestContactDedupeMigration:
         migration would regress an accepted contact back to pending and skew
         stats.
         """
-        manager = DatabaseManager(str(temp_db_path))
+        manager = make_manager()
         campaign = manager.create_campaign({"name": "Migrate"})
         url = "https://linkedin.com/in/dup"
         # accepted first (lower id), then a stale sent + pending (higher ids).
         self._seed_duplicates(
             temp_db_path, campaign.id, url, ["accepted", "sent", "pending"],
         )
-        migrated = DatabaseManager(str(temp_db_path))
+        migrated = make_manager()
         rows = migrated.get_contacts(campaign.id)
         assert len(rows) == 1
         assert rows[0].status == "accepted"
 
-    def test_migration_applies_unique_index(self, temp_db_path):
+    def test_migration_applies_unique_index(self, temp_db_path, make_manager):
         """After migration the unique index rejects a fresh duplicate insert."""
         from sqlalchemy.exc import IntegrityError
 
-        manager = DatabaseManager(str(temp_db_path))
+        manager = make_manager()
         campaign = manager.create_campaign({"name": "Migrate"})
         url = "https://linkedin.com/in/dup"
         self._seed_duplicates(
             temp_db_path, campaign.id, url, ["reserved", "reserved"],
         )
-        migrated = DatabaseManager(str(temp_db_path))
+        migrated = make_manager()
         # The de-duped DB now enforces uniqueness on new writes.
         with pytest.raises(IntegrityError):
             migrated.create_contact({
@@ -895,18 +949,18 @@ class TestContactDedupeMigration:
                 "profile_url": url, "status": "found",
             })
 
-    def test_migration_is_idempotent_on_rerun(self, temp_db_path):
+    def test_migration_is_idempotent_on_rerun(self, temp_db_path, make_manager):
         """Re-running the migration on an already-clean DB changes nothing."""
-        manager = DatabaseManager(str(temp_db_path))
+        manager = make_manager()
         campaign = manager.create_campaign({"name": "Migrate"})
         url = "https://linkedin.com/in/dup"
         self._seed_duplicates(
             temp_db_path, campaign.id, url, ["reserved", "possibly_sent"],
         )
         # First migration de-dupes.
-        DatabaseManager(str(temp_db_path))
+        make_manager()
         # Second migration over the now-clean DB is a no-op (no raise, one row).
-        again = DatabaseManager(str(temp_db_path))
+        again = make_manager()
         rows = again.get_contacts(campaign.id)
         assert len(rows) == 1
         assert rows[0].status == "possibly_sent"

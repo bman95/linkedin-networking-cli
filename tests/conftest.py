@@ -75,7 +75,10 @@ def db_manager(temp_db_path) -> Generator[DatabaseManager]:
     """Create a DatabaseManager instance for testing."""
     manager = DatabaseManager(str(temp_db_path))
     yield manager
-    # Cleanup is automatic when temp directory is removed
+    # Dispose the engine so no pooled sqlite3.Connection outlives the test
+    # (an undisposed engine surfaces as "ResourceWarning: unclosed database"
+    # at pytest teardown). The temp directory removal only deletes the file.
+    manager.close()
 
 
 # ============================================================================
