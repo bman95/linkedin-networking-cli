@@ -84,7 +84,7 @@ side effects); write and automation flows follow.
 
 | Classic flow | TUI screen | Data / deps | Side effects | Status |
 | --- | --- | --- | --- | --- |
-| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
+| Dashboard | `DashboardScreen` | `get_dashboard_stats`, `get_campaigns`, `get_all_campaign_contact_stats`, `get_weekly_connection_count` | none (read-only) | **done (this PR)** |
 | Settings | `SettingsScreen` | `AppSettings`, `get_daily_connection_count`, `get_weekly_connection_count` | `config.json` write (2026-07-11: the Rate Limiting values are editable in-app and persist as overrides via `AppSettings.save_overrides`; precedence config.json > env > default) | **done (this PR)** (the classic CLI's standalone "Look up location code (online)" utility was not ported — its purpose, finding a geoUrn to paste elsewhere, is superseded by Create/Edit Campaign's own inline online location search, which turns a result directly into a usable option instead of a code to copy; dropped in the issue #47 cutover) |
 | Manage Campaigns | `CampaignsScreen` → `CampaignDetailScreen` / `CampaignEditScreen` | `get_campaigns`, `get_campaign`, `update_campaign`, `delete_campaign`, `get_contacts` | DB write + CSV export | **done** (view / edit / toggle / export / delete) |
 | Create Campaign | `CreateCampaignScreen` | `create_campaign` | DB write | **done**, incl. online location search + custom geoUrn |

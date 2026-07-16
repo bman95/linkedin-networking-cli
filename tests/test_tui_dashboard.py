@@ -386,6 +386,35 @@ async def test_dashboard_error_state(db_manager: DatabaseManager):
 
 
 @pytest.mark.unit
+async def test_dashboard_recent_stats_error_is_surfaced_in_place(
+    seeded_db_manager: DatabaseManager, monkeypatch,
+):
+    """The recent-table stats read (issue #66) fails inside the load guard.
+
+    ``_recent_rows`` queries the DB too; if that read raises outside the
+    worker's try/except, the uncaught exception crashes the whole app
+    (``WorkerFailed``) instead of degrading to the in-place error banner.
+    Everything before it succeeds here, so this pins the guard on the one
+    call this PR added.
+    """
+
+    def _boom():
+        raise RuntimeError("simulated locked database")
+
+    monkeypatch.setattr(
+        seeded_db_manager, "get_all_campaign_contact_stats", _boom
+    )
+    app = LinkedInTUI(db_manager=seeded_db_manager)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await open_menu_item(pilot, "dashboard")
+        screen = app.screen
+        text = await wait_for_status(pilot, screen, "#dashboard-status", "Error loading dashboard")
+        assert "Error loading dashboard" in text
+        assert "simulated locked database" in text
+
+
+@pytest.mark.unit
 async def test_dashboard_stale_load_is_dropped(seeded_db_manager: DatabaseManager):
     """A superseded (older-generation) result must not overwrite a newer one."""
     app = LinkedInTUI(db_manager=seeded_db_manager)

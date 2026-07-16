@@ -129,6 +129,9 @@ class DashboardScreen(BaseScreen):
         try:
             stats = self._db_manager.get_dashboard_stats()
             campaigns = self._db_manager.get_campaigns(active_only=False)
+            # Inside the guard: _recent_rows queries the DB too, and an
+            # uncaught worker exception would crash the app, not degrade.
+            recent = self._recent_rows(campaigns)
             used_week = self._load_week_usage()
         except Exception as exc:  # surface in-place, never crash the UI
             self.marshal_load(
@@ -136,7 +139,6 @@ class DashboardScreen(BaseScreen):
             )
             return
 
-        recent = self._recent_rows(campaigns)
         data = DashboardData(stats=stats, recent=recent, used_week=used_week)
         self.marshal_load(app, generation, self._populate, data, None)
 
