@@ -55,6 +55,23 @@ class TestDatabaseManagerInit:
         assert session is not None
         session.close()
 
+    def test_close_disposes_pooled_connections(self, temp_db_path):
+        """close() must dispose the engine, releasing pooled connections.
+
+        Nothing else asserts this directly — close() is otherwise only
+        exercised via fixture teardown, where a regression (an engine left
+        undisposed) would surface only as a GC-time ResourceWarning that a
+        plain test run silently swallows (issue #69).
+        """
+        db_manager = DatabaseManager(str(temp_db_path))
+        # __init__'s create_tables/migration already checked a connection out
+        # and back in, so the pool holds at least one live connection.
+        assert db_manager.engine.pool.checkedin() >= 1
+        db_manager.close()
+        # dispose() replaces the pool; a fresh, empty pool proves the old
+        # connections were closed rather than left for garbage collection.
+        assert db_manager.engine.pool.checkedin() == 0
+
 
 # ============================================================================
 # Campaign Operations Tests

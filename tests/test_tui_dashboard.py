@@ -121,16 +121,16 @@ async def test_navigate_to_dashboard_and_back(db_manager: DatabaseManager):
         await pilot.pause()
         await open_menu_item(pilot, "dashboard")
         assert isinstance(app.screen, DashboardScreen)
+        # Let the thread-worker load finish BEFORE popping the screen: the pop
+        # cancels the worker's wrapping task and drops it from app.workers, but
+        # cannot interrupt the OS thread — which could then check a connection
+        # out of the engine while (or after) the db_manager fixture disposes
+        # it, leaking the very sqlite3.Connection the teardown exists to close
+        # (issue #69). Waiting for "Updated" guarantees the load completed.
+        await wait_for_status(pilot, app.screen, "#dashboard-status", "Updated")
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
-        # The dashboard's thread-worker load may still be running (this test
-        # never waits for the "Updated" status like its siblings do). Textual
-        # does not join thread workers on shutdown, so without this wait the
-        # db_manager fixture could dispose the engine while the worker checks
-        # out a fresh connection — leaking the very sqlite3.Connection this
-        # fixture's teardown exists to close (issue #69).
-        await app.workers.wait_for_complete()
 
 
 @pytest.mark.unit
@@ -173,6 +173,10 @@ async def test_command_palette_navigates(db_manager: DatabaseManager):
         next(h for h in discovered if str(h.display) == "Dashboard").command()
         await pilot.pause()
         assert isinstance(app.screen, DashboardScreen)
+        # The dashboard stays mounted, so its thread-worker load is still
+        # tracked by app.workers; wait for it so the db_manager fixture never
+        # disposes the engine mid-load (issue #69).
+        await app.workers.wait_for_complete()
 
 
 @pytest.mark.unit
@@ -449,6 +453,10 @@ async def test_dashboard_app_ref_captured_on_ui_thread(db_manager: DatabaseManag
         screen.load_dashboard()
         assert captured["app"] is app
         assert captured["generation"] == screen._load_generation
+        # The on_mount load ran the REAL _run_load (the spy replaced it after
+        # mount) on a thread worker; wait for it so the db_manager fixture
+        # never disposes the engine mid-load (issue #69).
+        await app.workers.wait_for_complete()
 
 
 # ── settings masking & states ────────────────────────────────────────────────
